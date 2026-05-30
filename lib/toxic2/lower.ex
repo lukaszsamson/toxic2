@@ -73,20 +73,42 @@ defmodule Toxic2.Lower do
     end
   end
 
-  defp lower_node(cst, view, opts, acc, nid) do
-    children = CST.children(cst)
+  # One trivial clause per node kind (keeps each clause's cyclomatic complexity at 1).
+  defp lower_node(cst, view, opts, acc, nid),
+    do: lower_kind(CST.node_kind(cst), CST.children(cst), cst, view, opts, acc, nid)
 
-    case CST.node_kind(cst) do
-      :expr_list -> lower_block(children, view, opts, acc, nid)
-      :paren -> lower_paren(children, view, opts, acc, nid)
-      :binary_op -> lower_binary(children, view, opts, acc, nid)
-      :unary_op -> lower_unary(children, view, opts, acc, nid)
-      :list -> lower_list(children, view, opts, acc, nid)
-      :tuple -> lower_tuple(children, view, opts, acc, nid)
-      :call -> lower_call(children, view, opts, acc, nid)
-      _ -> {error_ast(cst, view), acc, nid}
-    end
-  end
+  defp lower_kind(:expr_list, ch, _cst, view, opts, acc, nid),
+    do: lower_block(ch, view, opts, acc, nid)
+
+  defp lower_kind(:paren, ch, _cst, view, opts, acc, nid),
+    do: lower_paren(ch, view, opts, acc, nid)
+
+  defp lower_kind(:binary_op, ch, _cst, view, opts, acc, nid),
+    do: lower_binary(ch, view, opts, acc, nid)
+
+  defp lower_kind(:unary_op, ch, _cst, view, opts, acc, nid),
+    do: lower_unary(ch, view, opts, acc, nid)
+
+  defp lower_kind(:list, ch, _cst, view, opts, acc, nid), do: lower_list(ch, view, opts, acc, nid)
+
+  defp lower_kind(:tuple, ch, _cst, view, opts, acc, nid),
+    do: lower_tuple(ch, view, opts, acc, nid)
+
+  defp lower_kind(:call, ch, _cst, view, opts, acc, nid), do: lower_call(ch, view, opts, acc, nid)
+
+  defp lower_kind(:alias, ch, _cst, view, opts, acc, nid),
+    do: lower_alias(ch, view, opts, acc, nid)
+
+  defp lower_kind(:remote_call, ch, _cst, view, opts, acc, nid),
+    do: lower_remote_call(ch, view, opts, acc, nid)
+
+  defp lower_kind(:anon_call, ch, _cst, view, opts, acc, nid),
+    do: lower_anon_call(ch, view, opts, acc, nid)
+
+  defp lower_kind(:kw_pair, ch, _cst, view, opts, acc, nid),
+    do: lower_kw_pair(ch, view, opts, acc, nid)
+
+  defp lower_kind(_other, _ch, cst, view, _opts, acc, nid), do: {error_ast(cst, view), acc, nid}
 
   defp lower_block([], _view, _opts, acc, nid), do: {{:__block__, [], []}, acc, nid}
   defp lower_block([only], view, opts, acc, nid), do: lower(only, view, opts, acc, nid)
@@ -128,7 +150,7 @@ defmodule Toxic2.Lower do
 
   # `f(args)` => `{fun_atom, meta, lowered_args}`. The callee name respects the atom policy.
   defp lower_call([callee | arg_children], view, opts, acc, nid) do
-    {args, acc, nid} = lower_each(arg_children, view, opts, acc, nid)
+    {args, acc, nid} = lower_args(arg_children, view, opts, acc, nid)
     idx = CST.token_index(callee)
     name = Tokens.value(view, idx)
 
@@ -151,6 +173,89 @@ defmodule Toxic2.Lower do
         {{:__error__, tmeta(view, idx), %{diag_ids: [id]}}, acc, nid}
     end
   end
+
+  # Alias chain: `{:__aliases__, meta, segments}`. A leading alias segment contributes its atom;
+  # a leading non-alias base (e.g. `foo.Bar`) contributes its lowered AST as the first segment.
+  # (Alias segment atoms are not gated by `existing_atoms_only` — module names are a controlled
+  # namespace, not arbitrary user atoms.)
+  defp lower_alias([first | rest], view, opts, acc, nid) do
+    rest_atoms =
+      Enum.map(rest, fn leaf -> String.to_atom(Tokens.value(view, CST.token_index(leaf))) end)
+
+    meta = error_meta(first, view)
+
+    if CST.tag(first) == :token and Tokens.kind(view, CST.token_index(first)) == :alias do
+      seg0 = String.to_atom(Tokens.value(view, CST.token_index(first)))
+      {{:__aliases__, meta, [seg0 | rest_atoms]}, acc, nid}
+    else
+      {base_ast, acc, nid} = lower(first, view, opts, acc, nid)
+      {{:__aliases__, meta, [base_ast | rest_atoms]}, acc, nid}
+    end
+  end
+
+  # `a.b` / `a.b(args)` => `{{:., m, [base, name]}, m, args}` (zero-arg form is just `args = []`).
+  defp lower_remote_call([base, name_leaf | arg_children], view, opts, acc, nid) do
+    {base_ast, acc, nid} = lower(base, view, opts, acc, nid)
+    {args, acc, nid} = lower_args(arg_children, view, opts, acc, nid)
+    idx = CST.token_index(name_leaf)
+    meta = tmeta(view, idx)
+
+    case to_atom(Tokens.value(view, idx), opts) do
+      {:ok, name} -> {{{:., meta, [base_ast, name]}, meta, args}, acc, nid}
+      :error -> name_error(name_leaf, view, acc, nid)
+    end
+  end
+
+  # `a.(args)` => `{{:., m, [base]}, m, args}`.
+  defp lower_anon_call([base | arg_children], view, opts, acc, nid) do
+    {base_ast, acc, nid} = lower(base, view, opts, acc, nid)
+    {args, acc, nid} = lower_args(arg_children, view, opts, acc, nid)
+    meta = error_meta(base, view)
+    {{{:., meta, [base_ast]}, meta, args}, acc, nid}
+  end
+
+  defp name_error(name_leaf, view, acc, nid) do
+    idx = CST.token_index(name_leaf)
+
+    {id, acc, nid} =
+      Diagnostics.emit(
+        acc,
+        nid,
+        :lowerer,
+        :error,
+        :nonexistent_atom,
+        name_span(name_leaf, view),
+        %{
+          name: Tokens.value(view, idx)
+        }
+      )
+
+    {{:__error__, tmeta(view, idx), %{diag_ids: [id]}}, acc, nid}
+  end
+
+  # A keyword pair `k: v` => `{key_atom, lowered_value}`. (Keyword key atoms are not gated.)
+  defp lower_kw_pair([key_leaf, val], view, opts, acc, nid) do
+    {v, acc, nid} = lower(val, view, opts, acc, nid)
+    {{String.to_atom(Tokens.value(view, CST.token_index(key_leaf))), v}, acc, nid}
+  end
+
+  # Call arguments: a trailing run of keyword pairs is collected into one keyword-list arg
+  # (`f(1, a: 2)` => `[1, [a: 2]]`); regular args lower normally.
+  defp lower_args(children, view, opts, acc, nid) do
+    {kw_rev, regular_rev} = Enum.split_while(:lists.reverse(children), &kw_pair?/1)
+    {reg, acc, nid} = lower_each(:lists.reverse(regular_rev), view, opts, acc, nid)
+
+    case :lists.reverse(kw_rev) do
+      [] ->
+        {reg, acc, nid}
+
+      kw ->
+        {kw_list, acc, nid} = lower_each(kw, view, opts, acc, nid)
+        {Enum.concat(reg, [kw_list]), acc, nid}
+    end
+  end
+
+  defp kw_pair?(cst), do: CST.tag(cst) == :node and CST.node_kind(cst) == :kw_pair
 
   # Thread the accumulator while lowering a list of children.
   defp lower_each(children, view, opts, acc, nid) do

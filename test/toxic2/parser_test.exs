@@ -27,11 +27,11 @@ defmodule Toxic2.ParserTest do
       assert diags == []
     end
 
-    test "identifiers, aliases, atoms, true/false/nil are leaves" do
-      {_view, es, []} = exprs("foo Bar :sym")
-      # three separate top-level expressions (no calls yet)
-      assert length(es) == 3
-      assert Enum.all?(es, &(CST.tag(&1) == :token))
+    test "identifier/atom are leaves; an alias is a 1-segment alias node" do
+      {_view, [id, alias_node, atom], []} = exprs("foo Bar :sym")
+      assert CST.tag(id) == :token
+      assert CST.tag(atom) == :token
+      assert CST.node_kind(alias_node) == :alias
     end
   end
 
@@ -162,6 +162,30 @@ defmodule Toxic2.ParserTest do
     test "missing closer is tolerant, not a crash" do
       {_v, _es, diags} = exprs("[1, 2")
       assert Enum.any?(diags, fn d -> elem(d, 3) == :expected_comma_or_close end)
+    end
+  end
+
+  describe "dot / alias chains / keywords (phase 7 slice 2)" do
+    test "AST conformance for dot forms" do
+      assert {{{:., _, [{:a, _, nil}, :b]}, _, []}, []} = Toxic2.parse_to_ast("a.b")
+      assert {{{:., _, [{:a, _, nil}, :b]}, _, [1, 2]}, []} = Toxic2.parse_to_ast("a.b(1, 2)")
+      assert {{{:., _, [{:a, _, nil}]}, _, [1]}, []} = Toxic2.parse_to_ast("a.(1)")
+      assert {{:__aliases__, _, [:Foo, :Bar]}, []} = Toxic2.parse_to_ast("Foo.Bar")
+
+      assert {{{:., _, [{:__aliases__, _, [:Foo]}, :bar]}, _, [1]}, []} =
+               Toxic2.parse_to_ast("Foo.bar(1)")
+    end
+
+    test "dot chains nest left-associatively" do
+      assert {{{:., _, [{{:., _, [{:a, _, nil}, :b]}, _, []}, :c]}, _, []}, []} =
+               Toxic2.parse_to_ast("a.b.c")
+    end
+
+    test "keyword pairs: inline in lists, collected as a trailing list in calls" do
+      assert {[a: 1, b: 2], []} = Toxic2.parse_to_ast("[a: 1, b: 2]")
+      assert {[1, {:a, 2}], []} = Toxic2.parse_to_ast("[1, a: 2]")
+      assert {{:f, _, [[a: 1]]}, []} = Toxic2.parse_to_ast("f(a: 1)")
+      assert {{:f, _, [1, [a: 2]]}, []} = Toxic2.parse_to_ast("f(1, a: 2)")
     end
   end
 

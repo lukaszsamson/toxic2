@@ -3,9 +3,10 @@ defmodule Toxic2.Parser do
   Parser core (see `TOXIC_2.md` → Parser; Migration Phases #5–#7).
 
   Covers a top-level **expression list** of literals, identifiers/aliases, atoms, prefix/infix
-  **operators**, parentheses, **lists `[...]`**, **tuples `{...}`**, and **paren calls `f(...)`**.
-  It builds a **green CST only** (`Toxic2.CST`) — never the Elixir AST, and no AST quirks (those
-  belong to lowering, phase 6).
+  **operators**, parentheses, **lists `[...]`** (incl. keyword pairs), **tuples `{...}`**, **paren
+  calls `f(...)`**, **dot/remote/anon calls** (`a.b`, `Foo.bar(...)`, `a.(...)`), and **alias
+  chains** (`Foo.Bar`). It builds a **green CST only** (`Toxic2.CST`) — never the Elixir AST, and
+  no AST quirks (those belong to lowering, phase 6).
 
   Design (per the spec):
 
@@ -23,16 +24,16 @@ defmodule Toxic2.Parser do
   **not** skipped when looking for the next infix operator — a newline there ends the expression
   (matching Elixir). EOE (`:eol` / `:";"`) separates top-level expressions.
 
-  Not yet handled (later slices/phases): keyword lists, dot/remote calls, access `a[b]`, maps,
-  structs, bitstrings, no-parens calls, stabs/blocks, strings/sigils, `&` capture, multi-statement
-  parens. Encountering those yields error/leaf nodes rather than crashing.
+  Not yet handled (later slices/phases): access `a[b]`, maps, structs, bitstrings, no-parens
+  calls, stabs/blocks, strings/sigils, `&` capture, multi-statement parens. Encountering those
+  yields error/leaf nodes rather than crashing.
   """
 
   alias Toxic2.{CST, Diagnostics, LexError, Precedence, Tokens}
 
   @fuel_base 1_000
 
-  @atomic_kinds [:int, :flt, :char, :atom, :literal, :identifier, :alias]
+  @atomic_kinds [:int, :flt, :char, :atom, :literal, :identifier]
 
   @type result :: {CST.t(), [Toxic2.Diagnostic.t()]}
 
@@ -88,18 +89,29 @@ defmodule Toxic2.Parser do
     led(t, i, lhs, min_bp, ctx, diags, nid, fuel)
   end
 
-  # Postfix operations bind tightest (yecc 310): a paren call `f(...)` when `(` is adjacent to an
-  # identifier callee. (Dot/remote calls and access are a later phase-7 slice.)
+  # Postfix operations bind tightest (yecc 310): a paren call `f(...)` (adjacent `(`), and dot
+  # forms `a.b` / `a.b(...)` / `a.(...)` / `Foo.Bar` (alias chain).
   defp postfix(t, i, lhs, ctx, diags, nid, fuel) do
-    if paren_call?(t, lhs, i) do
-      {args, j, diags, nid, fuel} = parse_seq(t, i + 1, :")", diags, nid, fuel)
+    cond do
+      paren_call?(t, lhs, i) ->
+        {args, j, diags, nid, fuel} = parse_seq(t, i + 1, :")", diags, nid, fuel)
 
-      call =
-        CST.node(:call, merge(cst_span(t, lhs), tok_span(t, j - 1)), [lhs | args], :matched, nil)
+        call =
+          CST.node(
+            :call,
+            merge(cst_span(t, lhs), tok_span(t, j - 1)),
+            [lhs | args],
+            :matched,
+            nil
+          )
 
-      postfix(t, j, call, ctx, diags, nid, fuel)
-    else
-      {lhs, i, diags, nid, fuel}
+        postfix(t, j, call, ctx, diags, nid, fuel)
+
+      Tokens.kind(t, i) == :dot ->
+        dot(t, i, lhs, ctx, diags, nid, fuel)
+
+      true ->
+        {lhs, i, diags, nid, fuel}
     end
   end
 
@@ -107,6 +119,100 @@ defmodule Toxic2.Parser do
     CST.tag(lhs) == :token and Tokens.kind(t, CST.token_index(lhs)) == :identifier and
       Tokens.kind(t, i) == :"(" and Tokens.adjacent?(t, CST.token_index(lhs), i)
   end
+
+  # `.` after a primary: alias-chain extension (`.Alias`), remote call (`.name` / `.name(...)`),
+  # or anonymous call (`.(...)`). A newline is allowed after the dot.
+  defp dot(t, dot_i, lhs, ctx, diags, nid, fuel) do
+    j = skip_eols(t, dot_i + 1)
+
+    case Tokens.kind(t, j) do
+      :alias ->
+        segs = if alias_node?(lhs), do: CST.children(lhs), else: [lhs]
+
+        node =
+          CST.node(
+            :alias,
+            merge(cst_span(t, lhs), tok_span(t, j)),
+            Enum.concat(segs, [CST.token(j)]),
+            :matched,
+            nil
+          )
+
+        postfix(t, j + 1, node, ctx, diags, nid, fuel)
+
+      :identifier ->
+        remote_call(t, j, lhs, ctx, diags, nid, fuel)
+
+      :"(" ->
+        {args, k, diags, nid, fuel} = parse_seq(t, j + 1, :")", diags, nid, fuel)
+
+        node =
+          CST.node(
+            :anon_call,
+            merge(cst_span(t, lhs), tok_span(t, k - 1)),
+            [lhs | args],
+            :matched,
+            nil
+          )
+
+        postfix(t, k, node, ctx, diags, nid, fuel)
+
+      _ ->
+        {id, diags, nid} =
+          Diagnostics.emit(
+            diags,
+            nid,
+            :parser,
+            :error,
+            :unexpected_after_dot,
+            tok_span(t, j),
+            %{}
+          )
+
+        node =
+          CST.node(
+            :remote_call,
+            merge(cst_span(t, lhs), tok_span(t, dot_i)),
+            [lhs, CST.missing(:identifier, j, diag: id)],
+            :matched,
+            nil
+          )
+
+        {node, j, diags, nid, fuel}
+    end
+  end
+
+  defp remote_call(t, name_i, lhs, ctx, diags, nid, fuel) do
+    name = CST.token(name_i)
+
+    if Tokens.kind(t, name_i + 1) == :"(" and Tokens.adjacent?(t, name_i, name_i + 1) do
+      {args, k, diags, nid, fuel} = parse_seq(t, name_i + 2, :")", diags, nid, fuel)
+
+      node =
+        CST.node(
+          :remote_call,
+          merge(cst_span(t, lhs), tok_span(t, k - 1)),
+          [lhs, name | args],
+          :matched,
+          nil
+        )
+
+      postfix(t, k, node, ctx, diags, nid, fuel)
+    else
+      node =
+        CST.node(
+          :remote_call,
+          merge(cst_span(t, lhs), tok_span(t, name_i)),
+          [lhs, name],
+          :matched,
+          nil
+        )
+
+      postfix(t, name_i + 1, node, ctx, diags, nid, fuel)
+    end
+  end
+
+  defp alias_node?(cst), do: CST.tag(cst) == :node and CST.node_kind(cst) == :alias
 
   defp led(_t, i, lhs, _min_bp, _ctx, diags, nid, fuel) when fuel <= 0,
     do: {lhs, i, diags, nid, fuel}
@@ -142,6 +248,10 @@ defmodule Toxic2.Parser do
     cond do
       kind in @atomic_kinds ->
         {CST.token(i), i + 1, diags, nid, fuel}
+
+      # An alias is a 1-segment alias node; `.Alias` postfixes extend its segments.
+      kind == :alias ->
+        {CST.node(:alias, tok_span(t, i), [CST.token(i)], :matched, nil), i + 1, diags, nid, fuel}
 
       kind == :error ->
         {id, diags, nid} = emit_lex_error(t, i, diags, nid)
@@ -186,8 +296,23 @@ defmodule Toxic2.Parser do
     end
   end
 
+  # A sequence element is a `key: value` keyword pair when it starts with `:kw_identifier`,
+  # otherwise an ordinary expression. Keyword collection (list-inline vs call-arg list) is a
+  # lowering concern.
+  defp parse_element(t, i, diags, nid, fuel) do
+    if Tokens.kind(t, i) == :kw_identifier do
+      key = CST.token(i)
+      {val, j, diags, nid, fuel} = parse_expr(t, i + 1, 0, :matched, diags, nid, fuel - 1)
+
+      {CST.node(:kw_pair, merge(tok_span(t, i), cst_span(t, val)), [key, val], :matched, nil), j,
+       diags, nid, fuel}
+    else
+      parse_expr(t, i, 0, :matched, diags, nid, fuel)
+    end
+  end
+
   defp seq_elems(t, i, acc, close, diags, nid, fuel) do
-    {el, i, diags, nid, fuel} = parse_expr(t, i, 0, :matched, diags, nid, fuel - 1)
+    {el, i, diags, nid, fuel} = parse_element(t, i, diags, nid, fuel)
     i2 = skip_eols(t, i)
 
     cond do
