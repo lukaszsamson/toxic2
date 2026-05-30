@@ -96,6 +96,10 @@ defmodule Toxic2.Lower do
 
   defp lower_kind(:call, ch, _cst, view, opts, acc, nid), do: lower_call(ch, view, opts, acc, nid)
 
+  # A no-parens call lowers identically to a paren call (`f a` and `f(a)` produce the same AST).
+  defp lower_kind(:np_call, ch, _cst, view, opts, acc, nid),
+    do: lower_call(ch, view, opts, acc, nid)
+
   defp lower_kind(:alias, ch, _cst, view, opts, acc, nid),
     do: lower_alias(ch, view, opts, acc, nid)
 

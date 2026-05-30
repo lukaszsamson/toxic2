@@ -31,8 +31,8 @@ defmodule Toxic2.Parser do
   (matching Elixir). EOE (`:eol` / `:";"`) separates top-level expressions.
 
   Not yet handled (later phases): stabs/blocks (`fn`, `do`/`end`, `case`…), strings/sigils,
-  `&` capture, multi-statement parens, and the no-parens-after-comma container error
-  (`[f a, b]`). Encountering those yields error/leaf nodes rather than crashing.
+  `&` capture, multi-statement parens. Encountering those yields error/leaf nodes rather than
+  crashing.
   """
 
   alias Toxic2.{CST, Diagnostics, LexError, Precedence, Tokens}
@@ -111,30 +111,41 @@ defmodule Toxic2.Parser do
   # themselves parsed in `:no_parens`, so `f g a, b` makes the inner call absorb the commas
   # (`f(g(a, b))`, outer arity 1).
   defp maybe_no_parens(t, i, lhs, ctx, diags, nid, fuel) do
-    if no_parens_callee?(lhs, t) and np_arg_start?(t, lhs, i) do
+    if np_callee?(lhs, t) and np_arg_start?(t, lhs, i) do
       {arg, j, diags, nid, fuel} = parse_np_arg(t, i, diags, nid, fuel)
 
-      if ctx == :no_parens do
-        np_more_args(t, j, [arg], lhs, diags, nid, fuel)
-      else
-        {np_call(t, lhs, [arg], j), j, diags, nid, fuel}
-      end
+      {args, k, diags, nid, fuel} =
+        if ctx == :no_parens,
+          do: np_more_args(t, j, [arg], diags, nid, fuel),
+          else: {[arg], j, diags, nid, fuel}
+
+      {build_np_call(t, lhs, args, k), k, diags, nid, fuel}
     else
       {lhs, i, diags, nid, fuel}
     end
   end
 
-  defp np_more_args(t, i, args, lhs, diags, nid, fuel) do
+  defp np_more_args(t, i, args, diags, nid, fuel) do
     if Tokens.kind(t, i) == :"," do
       {arg, j, diags, nid, fuel} = parse_np_arg(t, i + 1, diags, nid, fuel)
-      np_more_args(t, j, [arg | args], lhs, diags, nid, fuel)
+      np_more_args(t, j, [arg | args], diags, nid, fuel)
     else
-      {np_call(t, lhs, :lists.reverse(args), i), i, diags, nid, fuel}
+      {:lists.reverse(args), i, diags, nid, fuel}
     end
   end
 
-  defp np_call(t, lhs, args, end_i) do
-    CST.node(:call, merge(cst_span(t, lhs), tok_span(t, end_i - 1)), [lhs | args], :matched, nil)
+  # Build the no-parens call, marking it `:no_parens` (so a container can detect the ambiguous
+  # `[f a, b]`). A plain identifier callee becomes `:np_call`; a bare remote (`a.b`) gains args.
+  defp build_np_call(t, lhs, args, end_i) do
+    span = merge(cst_span(t, lhs), tok_span(t, end_i - 1))
+
+    case lhs do
+      {:node, :remote_call, _sp, [base, name], _f, _d} ->
+        CST.node(:remote_call, span, [base, name | args], :no_parens, nil)
+
+      _ ->
+        CST.node(:np_call, span, [lhs | args], :no_parens, nil)
+    end
   end
 
   # A no-parens argument is a keyword pair or a full expression, parsed in `:no_parens`.
@@ -150,20 +161,24 @@ defmodule Toxic2.Parser do
     end
   end
 
-  defp no_parens_callee?(lhs, t) do
-    CST.tag(lhs) == :token and Tokens.kind(t, CST.token_index(lhs)) == :identifier
-  end
+  # A no-parens callee is a bare identifier, or a bare remote (`a.b` with no args yet).
+  defp np_callee?({:token, idx, _f, _d}, t), do: Tokens.kind(t, idx) == :identifier
+  defp np_callee?({:node, :remote_call, _sp, [_base, _name], _f, _d}, _t), do: true
+  defp np_callee?(_lhs, _t), do: false
 
   # Can a no-parens argument start at `i`, given the callee `lhs`? Requires a space after the
   # callee (same line). `f -1` is a call (op adjacent to operand); `f - 1` is binary subtraction.
   defp np_arg_start?(t, lhs, i) do
-    callee = CST.token_index(lhs)
+    case {cst_span(t, lhs), Tokens.span(t, i)} do
+      {{_, _, el, ec}, {sl, sc, _, _}} when el == sl and ec < sc ->
+        case Tokens.kind(t, i) do
+          :dual_op -> Tokens.adjacent?(t, i, i + 1) and np_first_kind?(Tokens.kind(t, i + 1))
+          k -> np_first_kind?(k)
+        end
 
-    Tokens.separated_on_same_line?(t, callee, i) and
-      case Tokens.kind(t, i) do
-        :dual_op -> Tokens.adjacent?(t, i, i + 1) and np_first_kind?(Tokens.kind(t, i + 1))
-        k -> np_first_kind?(k)
-      end
+      _ ->
+        false
+    end
   end
 
   defp np_first_kind?(kind) do
@@ -666,6 +681,7 @@ defmodule Toxic2.Parser do
         {:lists.reverse(acc), i2 + 1, diags, nid, fuel}
 
       Tokens.kind(t, i2) == :"," ->
+        {diags, nid} = check_np_comma(mode, el, t, i2, diags, nid)
         seq_after_comma(t, i2, acc, seen_kw or is_kw, close, mode, diags, nid, fuel)
 
       true ->
@@ -733,6 +749,30 @@ defmodule Toxic2.Parser do
       {expr, j, false, diags, nid, fuel}
     end
   end
+
+  # A no-parens call as a non-last container element (`[f a, b]`) is ambiguous — Elixir requires
+  # parens. (In call args the comma is absorbed by the inner call, so this only fires in
+  # list/tuple/bitstring.)
+  defp check_np_comma(mode, el, t, comma_i, diags, nid) when mode != :call do
+    if CST.category(el) == :no_parens do
+      {_id, diags, nid} =
+        Diagnostics.emit(
+          diags,
+          nid,
+          :parser,
+          :error,
+          :ambiguous_no_parens,
+          tok_span(t, comma_i),
+          %{}
+        )
+
+      {diags, nid}
+    else
+      {diags, nid}
+    end
+  end
+
+  defp check_np_comma(_mode, _el, _t, _comma_i, diags, nid), do: {diags, nid}
 
   # A non-keyword element after a keyword pair: keyword lists must come last.
   defp check_kw_last(true, false, t, el, diags, nid) do

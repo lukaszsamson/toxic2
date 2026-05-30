@@ -147,6 +147,14 @@ defmodule Toxic2.Conformance.Corpus do
     {"rem 5, 2", [:no_parens]},
     {"[f a]", [:no_parens]},
     {"f(g a, b)", [:no_parens]},
+    {"[b, f a]", [:no_parens]},
+    {"[a.b c]", [:no_parens]},
+    {"a.b c", [:no_parens]},
+    {"a.b c, d", [:no_parens]},
+    {"Foo.bar a", [:no_parens]},
+    {"Foo.bar a, b", [:no_parens]},
+    {"x.y z", [:no_parens]},
+    {"a.b c.d", [:no_parens]},
     # layout
     {"a\nb", [:layout]},
     {"a; b; c", [:layout]},
@@ -176,7 +184,11 @@ defmodule Toxic2.Conformance.Corpus do
     {"%{a: 1, b => 2}", [:keyword]},
     {"%{m |}", [:map]},
     {"%Foo{m |}", [:struct]},
-    {"{a: 1}", [:keyword]}
+    {"{a: 1}", [:keyword]},
+    # no-parens call as a non-last container element (oracle rejects; parens required)
+    {"[f a, b]", [:no_parens]},
+    {"{f a, b}", [:no_parens]},
+    {"[f a, g b]", [:no_parens]}
   ]
 
   @spec valid() :: [entry()]

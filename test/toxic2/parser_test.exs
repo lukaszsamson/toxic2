@@ -294,6 +294,20 @@ defmodule Toxic2.ParserTest do
       assert {{:f, _, [{:a, _, nil}, [b: 1]]}, []} = Toxic2.parse_to_ast("f a, b: 1")
       assert {[{:f, _, [{:a, _, nil}]}], []} = Toxic2.parse_to_ast("[f a]")
     end
+
+    test "remote no-parens calls" do
+      assert {{{:., _, [{:a, _, nil}, :b]}, _, [{:c, _, nil}]}, []} = Toxic2.parse_to_ast("a.b c")
+
+      assert {{{:., _, [{:a, _, nil}, :b]}, _, [{:c, _, nil}, {:d, _, nil}]}, []} =
+               Toxic2.parse_to_ast("a.b c, d")
+    end
+
+    test "a no-parens call as a non-last container element is ambiguous (error)" do
+      {_v, _es, diags} = exprs("[f a, b]")
+      assert Enum.any?(diags, &(elem(&1, 3) == :ambiguous_no_parens))
+      # but as the last element it is fine
+      assert {[{:b, _, nil}, {:f, _, [{:a, _, nil}]}], []} = Toxic2.parse_to_ast("[b, f a]")
+    end
   end
 
   describe "tolerant behavior (P1: never crash; one diagnostic per error)" do
