@@ -124,6 +124,47 @@ defmodule Toxic2.ParserTest do
     end
   end
 
+  describe "containers and paren calls (phase 7 slice)" do
+    test "list, tuple, and empty forms" do
+      assert {_v, [list], []} = exprs("[1, 2, 3]")
+      assert CST.node_kind(list) == :list
+      assert length(CST.children(list)) == 3
+
+      assert {_v, [tup], []} = exprs("{1, 2}")
+      assert CST.node_kind(tup) == :tuple
+
+      assert {_v, [empty], []} = exprs("[]")
+      assert CST.children(empty) == []
+    end
+
+    test "paren call only when ( is adjacent to the callee" do
+      {_v, [call], []} = exprs("f(1, 2)")
+      assert CST.node_kind(call) == :call
+      # children = [callee | args]
+      assert length(CST.children(call)) == 3
+    end
+
+    test "nested calls" do
+      {_v, [call], []} = exprs("foo(bar(1))")
+      assert CST.node_kind(call) == :call
+      arg = Enum.at(CST.children(call), 1)
+      assert CST.node_kind(arg) == :call
+    end
+
+    test "AST conformance for the slice" do
+      assert {[1, 2, 3], []} = Toxic2.parse_to_ast("[1, 2, 3]")
+      assert {{1, 2}, []} = Toxic2.parse_to_ast("{1, 2}")
+      assert {{:{}, _, [1, 2, 3]}, []} = Toxic2.parse_to_ast("{1, 2, 3}")
+      assert {{:f, _, [1, 2]}, []} = Toxic2.parse_to_ast("f(1, 2)")
+      assert {{:foo, _, [{:bar, _, [1]}]}, []} = Toxic2.parse_to_ast("foo(bar(1))")
+    end
+
+    test "missing closer is tolerant, not a crash" do
+      {_v, _es, diags} = exprs("[1, 2")
+      assert Enum.any?(diags, fn d -> elem(d, 3) == :expected_comma_or_close end)
+    end
+  end
+
   describe "tolerant behavior (P1: never crash; one diagnostic per error)" do
     test "a trailing operator yields a binary_op with a missing RHS + one diagnostic" do
       {_view, [e], diags} = exprs("1 +")

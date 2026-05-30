@@ -81,6 +81,9 @@ defmodule Toxic2.Lower do
       :paren -> lower_paren(children, view, opts, acc, nid)
       :binary_op -> lower_binary(children, view, opts, acc, nid)
       :unary_op -> lower_unary(children, view, opts, acc, nid)
+      :list -> lower_list(children, view, opts, acc, nid)
+      :tuple -> lower_tuple(children, view, opts, acc, nid)
+      :call -> lower_call(children, view, opts, acc, nid)
       _ -> {error_ast(cst, view), acc, nid}
     end
   end
@@ -108,6 +111,45 @@ defmodule Toxic2.Lower do
   defp lower_unary([op_leaf, operand], view, opts, acc, nid) do
     {o, acc, nid} = lower(operand, view, opts, acc, nid)
     {{op_atom(op_leaf, view), op_meta(op_leaf, view), [o]}, acc, nid}
+  end
+
+  # A list literal lowers to the Elixir list of its lowered elements.
+  defp lower_list(children, view, opts, acc, nid), do: lower_each(children, view, opts, acc, nid)
+
+  # 2-tuples are literal `{a, b}`; all other arities use `{:{}, [], elems}`.
+  defp lower_tuple(children, view, opts, acc, nid) do
+    {asts, acc, nid} = lower_each(children, view, opts, acc, nid)
+
+    case asts do
+      [a, b] -> {{a, b}, acc, nid}
+      _ -> {{:{}, [], asts}, acc, nid}
+    end
+  end
+
+  # `f(args)` => `{fun_atom, meta, lowered_args}`. The callee name respects the atom policy.
+  defp lower_call([callee | arg_children], view, opts, acc, nid) do
+    {args, acc, nid} = lower_each(arg_children, view, opts, acc, nid)
+    idx = CST.token_index(callee)
+    name = Tokens.value(view, idx)
+
+    case to_atom(name, opts) do
+      {:ok, fun} ->
+        {{fun, tmeta(view, idx), args}, acc, nid}
+
+      :error ->
+        {id, acc, nid} =
+          Diagnostics.emit(
+            acc,
+            nid,
+            :lowerer,
+            :error,
+            :nonexistent_atom,
+            name_span(callee, view),
+            %{name: name}
+          )
+
+        {{:__error__, tmeta(view, idx), %{diag_ids: [id]}}, acc, nid}
+    end
   end
 
   # Thread the accumulator while lowering a list of children.

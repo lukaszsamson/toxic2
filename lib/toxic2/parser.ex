@@ -1,10 +1,11 @@
 defmodule Toxic2.Parser do
   @moduledoc """
-  Phase-5 parser core (see `TOXIC_2.md` → Parser; Migration Phases #5).
+  Parser core (see `TOXIC_2.md` → Parser; Migration Phases #5–#7).
 
-  Scope is deliberately narrow: a top-level **expression list** of literals, identifiers/aliases,
-  atoms, prefix/infix **operators**, and parenthesised expressions. It builds a **green CST only**
-  (`Toxic2.CST`) — never the Elixir AST, and no AST quirks (those belong to lowering, phase 6).
+  Covers a top-level **expression list** of literals, identifiers/aliases, atoms, prefix/infix
+  **operators**, parentheses, **lists `[...]`**, **tuples `{...}`**, and **paren calls `f(...)`**.
+  It builds a **green CST only** (`Toxic2.CST`) — never the Elixir AST, and no AST quirks (those
+  belong to lowering, phase 6).
 
   Design (per the spec):
 
@@ -22,9 +23,9 @@ defmodule Toxic2.Parser do
   **not** skipped when looking for the next infix operator — a newline there ends the expression
   (matching Elixir). EOE (`:eol` / `:";"`) separates top-level expressions.
 
-  Not yet handled (later phases): calls, no-parens, dot, containers, bitstrings, stabs/blocks,
-  strings/sigils, `&` capture, multi-statement parens. Encountering those yields error/leaf nodes
-  rather than crashing.
+  Not yet handled (later slices/phases): keyword lists, dot/remote calls, access `a[b]`, maps,
+  structs, bitstrings, no-parens calls, stabs/blocks, strings/sigils, `&` capture, multi-statement
+  parens. Encountering those yields error/leaf nodes rather than crashing.
   """
 
   alias Toxic2.{CST, Diagnostics, LexError, Precedence, Tokens}
@@ -83,7 +84,28 @@ defmodule Toxic2.Parser do
 
   defp parse_expr(t, i, min_bp, ctx, diags, nid, fuel) do
     {lhs, i, diags, nid, fuel} = parse_prefix(t, i, ctx, diags, nid, fuel)
+    {lhs, i, diags, nid, fuel} = postfix(t, i, lhs, ctx, diags, nid, fuel)
     led(t, i, lhs, min_bp, ctx, diags, nid, fuel)
+  end
+
+  # Postfix operations bind tightest (yecc 310): a paren call `f(...)` when `(` is adjacent to an
+  # identifier callee. (Dot/remote calls and access are a later phase-7 slice.)
+  defp postfix(t, i, lhs, ctx, diags, nid, fuel) do
+    if paren_call?(t, lhs, i) do
+      {args, j, diags, nid, fuel} = parse_seq(t, i + 1, :")", diags, nid, fuel)
+
+      call =
+        CST.node(:call, merge(cst_span(t, lhs), tok_span(t, j - 1)), [lhs | args], :matched, nil)
+
+      postfix(t, j, call, ctx, diags, nid, fuel)
+    else
+      {lhs, i, diags, nid, fuel}
+    end
+  end
+
+  defp paren_call?(t, lhs, i) do
+    CST.tag(lhs) == :token and Tokens.kind(t, CST.token_index(lhs)) == :identifier and
+      Tokens.kind(t, i) == :"(" and Tokens.adjacent?(t, CST.token_index(lhs), i)
   end
 
   defp led(_t, i, lhs, _min_bp, _ctx, diags, nid, fuel) when fuel <= 0,
@@ -131,8 +153,63 @@ defmodule Toxic2.Parser do
       kind == :"(" ->
         parse_paren(t, i, ctx, diags, nid, fuel)
 
+      kind == :"[" ->
+        parse_container(t, i, :"]", :list, diags, nid, fuel)
+
+      kind == :"{" ->
+        parse_container(t, i, :"}", :tuple, diags, nid, fuel)
+
       true ->
         parse_unexpected(t, i, diags, nid, fuel)
+    end
+  end
+
+  # `[ ... ]` / `{ ... }`: a comma-separated sequence of expressions. `|` (cons) and keyword
+  # pairs are ordinary expression content handled by the Pratt loop / lowering.
+  defp parse_container(t, open, close, kind, diags, nid, fuel) do
+    {elems, j, diags, nid, fuel} = parse_seq(t, open + 1, close, diags, nid, fuel)
+
+    {CST.node(kind, merge(tok_span(t, open), tok_span(t, j - 1)), elems, :matched, nil), j, diags,
+     nid, fuel}
+  end
+
+  # Comma-separated expressions up to `close` (shared by lists, tuples, and call args). Returns
+  # `{elements, index_after_close, ...}`. Tolerant: a missing closer yields a `:missing` element
+  # and one diagnostic.
+  defp parse_seq(t, i, close, diags, nid, fuel) do
+    i = skip_eols(t, i)
+
+    if Tokens.kind(t, i) == close do
+      {[], i + 1, diags, nid, fuel}
+    else
+      seq_elems(t, i, [], close, diags, nid, fuel)
+    end
+  end
+
+  defp seq_elems(t, i, acc, close, diags, nid, fuel) do
+    {el, i, diags, nid, fuel} = parse_expr(t, i, 0, :matched, diags, nid, fuel - 1)
+    i2 = skip_eols(t, i)
+
+    cond do
+      Tokens.kind(t, i2) == close ->
+        {:lists.reverse([el | acc]), i2 + 1, diags, nid, fuel}
+
+      Tokens.kind(t, i2) == :"," ->
+        seq_elems(t, skip_eols(t, i2 + 1), [el | acc], close, diags, nid, fuel)
+
+      true ->
+        {id, diags, nid} =
+          Diagnostics.emit(
+            diags,
+            nid,
+            :parser,
+            :error,
+            :expected_comma_or_close,
+            tok_span(t, i2),
+            %{close: close}
+          )
+
+        {:lists.reverse([CST.missing(close, i2, diag: id), el | acc]), i2, diags, nid, fuel}
     end
   end
 

@@ -57,6 +57,23 @@ defmodule Toxic2.Conformance.Corpus do
     # parens
     {"(1 + 2) * 3", [:operator]},
     {"(a)", [:operator]},
+    # lists
+    {"[1, 2, 3]", [:container]},
+    {"[]", [:container]},
+    {"[1]", [:container]},
+    {"[a | b]", [:container]},
+    {"[1, 2 | t]", [:container]},
+    {"[1 + 2, foo(3)]", [:container]},
+    # tuples
+    {"{1, 2}", [:container]},
+    {"{}", [:container]},
+    {"{1}", [:container]},
+    {"{1, 2, 3}", [:container]},
+    # paren calls
+    {"f()", [:call]},
+    {"f(1, 2)", [:call]},
+    {"foo(bar(1))", [:call]},
+    {"foo(1 + 2, 3)", [:call]},
     # layout
     {"a\nb", [:layout]},
     {"a; b; c", [:layout]},
@@ -70,7 +87,10 @@ defmodule Toxic2.Conformance.Corpus do
     {"1 +", [:recovery]},
     {")", [:recovery]},
     {"(1 + 2", [:recovery]},
-    {"0x", [:recovery]}
+    {"0x", [:recovery]},
+    {"[1, 2", [:recovery]},
+    {"f(1, 2", [:recovery]},
+    {"{1, ", [:recovery]}
   ]
 
   @spec valid() :: [entry()]
