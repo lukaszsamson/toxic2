@@ -28,7 +28,8 @@ defmodule Toxic2.ParserTest do
     end
 
     test "identifier/atom are leaves; an alias is a 1-segment alias node" do
-      {_view, [id, alias_node, atom], []} = exprs("foo Bar :sym")
+      # newline-separated so each is its own statement (adjacent would be a no-parens call)
+      {_view, [id, alias_node, atom], []} = exprs("foo\nBar\n:sym")
       assert CST.tag(id) == :token
       assert CST.tag(atom) == :token
       assert CST.node_kind(alias_node) == :alias
@@ -258,6 +259,40 @@ defmodule Toxic2.ParserTest do
     test "maps allow assoc-then-keyword (keyword last)" do
       assert {{:%{}, _, [{{:a, _, nil}, 1}, {:b, 2}]}, []} =
                Toxic2.parse_to_ast("%{a => 1, b: 2}")
+    end
+  end
+
+  describe "no-parens calls (phase 8)" do
+    test "single and multiple args at statement position" do
+      assert {{:f, _, [{:a, _, nil}]}, []} = Toxic2.parse_to_ast("f a")
+      assert {{:f, _, [{:a, _, nil}, {:b, _, nil}]}, []} = Toxic2.parse_to_ast("f a, b")
+
+      assert {{:f, _, [{:+, _, [{:a, _, nil}, {:b, _, nil}]}]}, []} =
+               Toxic2.parse_to_ast("f a + b")
+    end
+
+    test "f g a, b makes the inner call absorb the commas (outer arity 1)" do
+      assert {{:f, _, [{:g, _, [{:a, _, nil}, {:b, _, nil}]}]}, []} =
+               Toxic2.parse_to_ast("f g a, b")
+
+      assert {{:g, _, [{:f, _, [{:a, _, nil}]}]}, []} = Toxic2.parse_to_ast("g f a")
+    end
+
+    test "`f -1` is a call with a unary arg; `f - 1` is binary subtraction" do
+      assert {{:f, _, [{:-, _, [1]}]}, []} = Toxic2.parse_to_ast("f -1")
+      assert {{:-, _, [{:f, _, nil}, 1]}, []} = Toxic2.parse_to_ast("f - 1")
+    end
+
+    test "no-parens as an operator operand and after `=`" do
+      assert {{:+, _, [1, {:f, _, [{:a, _, nil}]}]}, []} = Toxic2.parse_to_ast("1 + f a")
+
+      assert {{:=, _, [{:x, _, nil}, {:f, _, [{:a, _, nil}]}]}, []} =
+               Toxic2.parse_to_ast("x = f a")
+    end
+
+    test "trailing keyword args collect into a list; single-arg call as a list element" do
+      assert {{:f, _, [{:a, _, nil}, [b: 1]]}, []} = Toxic2.parse_to_ast("f a, b: 1")
+      assert {[{:f, _, [{:a, _, nil}]}], []} = Toxic2.parse_to_ast("[f a]")
     end
   end
 

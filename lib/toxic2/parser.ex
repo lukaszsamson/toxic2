@@ -1,13 +1,18 @@
 defmodule Toxic2.Parser do
   @moduledoc """
-  Parser core (see `TOXIC_2.md` → Parser; Migration Phases #5–#7).
+  Parser core (see `TOXIC_2.md` → Parser; Migration Phases #5–#8).
 
   Covers a top-level **expression list** of literals, identifiers/aliases, atoms, prefix/infix
   **operators**, parentheses, **lists `[...]`** (incl. keyword pairs), **tuples `{...}`**, **paren
   calls `f(...)`**, **dot/remote/anon calls** (`a.b`, `Foo.bar(...)`, `a.(...)`), **alias chains**
   (`Foo.Bar`), **maps/structs** (`%{...}`, `%Name{...}`, incl. `|` update), **bitstrings**
-  (`<<...>>`), and **access** (`a[b]`). It builds a **green CST only** (`Toxic2.CST`) — never the
-  Elixir AST, and no AST quirks (those belong to lowering, phase 6).
+  (`<<...>>`), **access** (`a[b]`), and **no-parens calls** (`f a, b`, `f g a, b` → `f(g(a,b))`,
+  `f -1` vs `f - 1`). It builds a **green CST only** (`Toxic2.CST`) — never the Elixir AST, and no
+  AST quirks (those belong to lowering, phase 6).
+
+  Expression-class context (`ctx`) is load-bearing for no-parens calls: `:no_parens` (statement /
+  paren-call arg) permits many comma-separated args; `:matched` (operator operands, container
+  elements) permits a single arg.
 
   Design (per the spec):
 
@@ -25,8 +30,9 @@ defmodule Toxic2.Parser do
   **not** skipped when looking for the next infix operator — a newline there ends the expression
   (matching Elixir). EOE (`:eol` / `:";"`) separates top-level expressions.
 
-  Not yet handled (later phases): no-parens calls, stabs/blocks, strings/sigils, `&` capture,
-  multi-statement parens. Encountering those yields error/leaf nodes rather than crashing.
+  Not yet handled (later phases): stabs/blocks (`fn`, `do`/`end`, `case`…), strings/sigils,
+  `&` capture, multi-statement parens, and the no-parens-after-comma container error
+  (`[f a, b]`). Encountering those yields error/leaf nodes rather than crashing.
   """
 
   alias Toxic2.{CST, Diagnostics, LexError, Precedence, Tokens}
@@ -83,7 +89,8 @@ defmodule Toxic2.Parser do
   end
 
   defp collect_one(t, i, acc, diags, nid, fuel) do
-    {expr, i2, diags, nid, fuel} = parse_expr(t, i, 0, :matched, diags, nid, fuel - 1)
+    # Statement position is a `:no_parens` context: `f a, b` is a multi-arg no-parens call.
+    {expr, i2, diags, nid, fuel} = parse_expr(t, i, 0, :no_parens, diags, nid, fuel - 1)
     # Forward-progress guard: parse_expr always advances on real input, but never loop.
     i2 = if i2 > i, do: i2, else: i + 1
     collect(t, skip_eoe(t, i2), [expr | acc], diags, nid, fuel)
@@ -94,7 +101,90 @@ defmodule Toxic2.Parser do
   defp parse_expr(t, i, min_bp, ctx, diags, nid, fuel) do
     {lhs, i, diags, nid, fuel} = parse_prefix(t, i, ctx, diags, nid, fuel)
     {lhs, i, diags, nid, fuel} = postfix(t, i, lhs, ctx, diags, nid, fuel)
+    {lhs, i, diags, nid, fuel} = maybe_no_parens(t, i, lhs, ctx, diags, nid, fuel)
     led(t, i, lhs, min_bp, ctx, diags, nid, fuel)
+  end
+
+  # No-parens call: a bare identifier callee followed (with a space, same line) by an argument.
+  # In a `:no_parens` context (statement / paren-call arg) it takes many comma-separated args;
+  # elsewhere (`:matched`: operator operands, container elements) it takes a single arg. Args are
+  # themselves parsed in `:no_parens`, so `f g a, b` makes the inner call absorb the commas
+  # (`f(g(a, b))`, outer arity 1).
+  defp maybe_no_parens(t, i, lhs, ctx, diags, nid, fuel) do
+    if no_parens_callee?(lhs, t) and np_arg_start?(t, lhs, i) do
+      {arg, j, diags, nid, fuel} = parse_np_arg(t, i, diags, nid, fuel)
+
+      if ctx == :no_parens do
+        np_more_args(t, j, [arg], lhs, diags, nid, fuel)
+      else
+        {np_call(t, lhs, [arg], j), j, diags, nid, fuel}
+      end
+    else
+      {lhs, i, diags, nid, fuel}
+    end
+  end
+
+  defp np_more_args(t, i, args, lhs, diags, nid, fuel) do
+    if Tokens.kind(t, i) == :"," do
+      {arg, j, diags, nid, fuel} = parse_np_arg(t, i + 1, diags, nid, fuel)
+      np_more_args(t, j, [arg | args], lhs, diags, nid, fuel)
+    else
+      {np_call(t, lhs, :lists.reverse(args), i), i, diags, nid, fuel}
+    end
+  end
+
+  defp np_call(t, lhs, args, end_i) do
+    CST.node(:call, merge(cst_span(t, lhs), tok_span(t, end_i - 1)), [lhs | args], :matched, nil)
+  end
+
+  # A no-parens argument is a keyword pair or a full expression, parsed in `:no_parens`.
+  defp parse_np_arg(t, i, diags, nid, fuel) do
+    if Tokens.kind(t, i) == :kw_identifier do
+      key = CST.token(i)
+      {val, j, diags, nid, fuel} = parse_expr(t, i + 1, 0, :no_parens, diags, nid, fuel - 1)
+
+      {CST.node(:kw_pair, merge(tok_span(t, i), cst_span(t, val)), [key, val], :matched, nil), j,
+       diags, nid, fuel}
+    else
+      parse_expr(t, i, 0, :no_parens, diags, nid, fuel - 1)
+    end
+  end
+
+  defp no_parens_callee?(lhs, t) do
+    CST.tag(lhs) == :token and Tokens.kind(t, CST.token_index(lhs)) == :identifier
+  end
+
+  # Can a no-parens argument start at `i`, given the callee `lhs`? Requires a space after the
+  # callee (same line). `f -1` is a call (op adjacent to operand); `f - 1` is binary subtraction.
+  defp np_arg_start?(t, lhs, i) do
+    callee = CST.token_index(lhs)
+
+    Tokens.separated_on_same_line?(t, callee, i) and
+      case Tokens.kind(t, i) do
+        :dual_op -> Tokens.adjacent?(t, i, i + 1) and np_first_kind?(Tokens.kind(t, i + 1))
+        k -> np_first_kind?(k)
+      end
+  end
+
+  defp np_first_kind?(kind) do
+    kind in [
+      :int,
+      :flt,
+      :char,
+      :atom,
+      :literal,
+      :identifier,
+      :alias,
+      :"(",
+      :"[",
+      :"{",
+      :"<<",
+      :percent,
+      :at_op,
+      :capture_op,
+      :unary_op,
+      :kw_identifier
+    ]
   end
 
   # Postfix operations bind tightest (yecc 310): a paren call `f(...)` (adjacent `(`), and dot
@@ -271,7 +361,9 @@ defmodule Toxic2.Parser do
         op_leaf = CST.token(i)
         next_min = if assoc == :left, do: prec + 1, else: prec
         rhs_start = skip_eols(t, i + 1)
-        {rhs, k, diags, nid, fuel} = parse_expr(t, rhs_start, next_min, ctx, diags, nid, fuel - 1)
+        # Operands are `matched_expr`: a no-parens call here may take only a single argument.
+        {rhs, k, diags, nid, fuel} =
+          parse_expr(t, rhs_start, next_min, :matched, diags, nid, fuel - 1)
 
         node =
           CST.node(
@@ -623,9 +715,13 @@ defmodule Toxic2.Parser do
   # An element is a `key: value` keyword pair (only in lists/calls) or an expression. Returns the
   # node, the next index, and whether it was a keyword pair (for keyword-last enforcement).
   defp parse_element(t, i, mode, diags, nid, fuel) do
+    # Call args are a `:no_parens` context (so `f(g a, b)` makes `g` absorb the commas, arity 1);
+    # list/tuple/bitstring elements are `:matched` (a no-parens element may take only one arg).
+    ctx = if mode == :call, do: :no_parens, else: :matched
+
     if Tokens.kind(t, i) == :kw_identifier do
       key = CST.token(i)
-      {val, j, diags, nid, fuel} = parse_expr(t, i + 1, 0, :matched, diags, nid, fuel - 1)
+      {val, j, diags, nid, fuel} = parse_expr(t, i + 1, 0, ctx, diags, nid, fuel - 1)
 
       node =
         CST.node(:kw_pair, merge(tok_span(t, i), cst_span(t, val)), [key, val], :matched, nil)
@@ -633,7 +729,7 @@ defmodule Toxic2.Parser do
       {diags, nid} = check_kw_allowed(mode, t, i, diags, nid)
       {node, j, true, diags, nid, fuel}
     else
-      {expr, j, diags, nid, fuel} = parse_expr(t, i, 0, :matched, diags, nid, fuel)
+      {expr, j, diags, nid, fuel} = parse_expr(t, i, 0, ctx, diags, nid, fuel)
       {expr, j, false, diags, nid, fuel}
     end
   end
@@ -668,12 +764,12 @@ defmodule Toxic2.Parser do
     {diags, nid}
   end
 
-  defp parse_unary(t, i, prefix_bp, ctx, diags, nid, fuel) do
+  defp parse_unary(t, i, prefix_bp, _ctx, diags, nid, fuel) do
     op_leaf = CST.token(i)
     operand_start = skip_eols(t, i + 1)
-
+    # A unary operand is `matched_expr` (no-parens here takes a single argument).
     {operand, k, diags, nid, fuel} =
-      parse_expr(t, operand_start, prefix_bp, ctx, diags, nid, fuel - 1)
+      parse_expr(t, operand_start, prefix_bp, :matched, diags, nid, fuel - 1)
 
     node =
       CST.node(
