@@ -132,6 +132,17 @@ defmodule Toxic2.Lower do
   defp lower_kind(:not_in_op, ch, _cst, view, opts, acc, nid),
     do: lower_not_in(ch, view, opts, acc, nid)
 
+  defp lower_kind(:fn, ch, _cst, view, opts, acc, nid) do
+    {clauses, acc, nid} = lower_each(ch, view, opts, acc, nid)
+    {{:fn, [], clauses}, acc, nid}
+  end
+
+  defp lower_kind(:stab, [args_node, body_node], _cst, view, opts, acc, nid) do
+    {args, acc, nid} = lower_stab_args(args_node, view, opts, acc, nid)
+    {body, acc, nid} = lower_stab_body(body_node, view, opts, acc, nid)
+    {{:->, [], [args, body]}, acc, nid}
+  end
+
   defp lower_kind(_other, _ch, cst, view, _opts, acc, nid), do: {error_ast(cst, view), acc, nid}
 
   defp lower_block([], _view, _opts, acc, nid), do: {{:__block__, [], []}, acc, nid}
@@ -313,6 +324,29 @@ defmodule Toxic2.Lower do
     {map_ast, acc, nid} = lower(map_node, view, opts, acc, nid)
     {{:%, [], [name_ast, map_ast]}, acc, nid}
   end
+
+  # Stab clause head -> the arg list. A `when` guard wraps the patterns: `[{:when, [], [pats, g]}]`.
+  defp lower_stab_args(args_node, view, opts, acc, nid) do
+    case CST.children(args_node) do
+      [{:node, :stab_when, _sp, when_ch, _f, _d}] ->
+        {parts, acc, nid} = lower_each(when_ch, view, opts, acc, nid)
+        {[{:when, [], parts}], acc, nid}
+
+      children ->
+        lower_each(children, view, opts, acc, nid)
+    end
+  end
+
+  # Stab clause body -> nil (empty), the expression (one), or a `__block__` (many).
+  defp lower_stab_body(body_node, view, opts, acc, nid) do
+    case CST.children(body_node) do
+      [] -> {nil, acc, nid}
+      [one] -> lower(one, view, opts, acc, nid)
+      many -> wrap_block(lower_each(many, view, opts, acc, nid))
+    end
+  end
+
+  defp wrap_block({asts, acc, nid}), do: {{:__block__, [], asts}, acc, nid}
 
   # `a not in b` => `{:not, [], [{:in, [], [a, b]}]}` (the canonical Elixir shape; the rewrite
   # lives here, not in the parser — P5).

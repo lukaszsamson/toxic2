@@ -159,6 +159,16 @@ defmodule Toxic2.Conformance.Corpus do
     {"f a,\n b", [:no_parens]},
     {"f a,\n b: 1", [:no_parens]},
     {"a not in b", [:operator]},
+    # fn / stab clauses (phase 9)
+    {"fn -> :ok end", [:fn]},
+    {"fn x -> x end", [:fn]},
+    {"fn x, y -> x + y end", [:fn]},
+    {"fn -> end", [:fn]},
+    {"fn x when x > 0 -> x end", [:fn]},
+    {"fn a -> 1\n b -> 2 end", [:fn]},
+    {"fn 1 -> :one\n 2 -> :two end", [:fn]},
+    {"f(fn x -> x end)", [:fn]},
+    {"fn x -> y = x\n y end", [:fn]},
     # layout
     {"a\nb", [:layout]},
     {"a; b; c", [:layout]},

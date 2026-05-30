@@ -30,9 +30,12 @@ defmodule Toxic2.Parser do
   **not** skipped when looking for the next infix operator — a newline there ends the expression
   (matching Elixir). EOE (`:eol` / `:";"`) separates top-level expressions.
 
-  Not yet handled (later phases): stabs/blocks (`fn`, `do`/`end`, `case`…), strings/sigils,
-  `&` capture, multi-statement parens. Encountering those yields error/leaf nodes rather than
-  crashing.
+  Also covers anonymous functions **`fn ... -> ... end`** (multi-clause, `when` guards,
+  multi-statement bodies).
+
+  Not yet handled (later phases): `do`/`end` blocks and `case`/`cond`/`receive`/`try`/`with`,
+  strings/sigils, `&` capture, multi-statement parens. Encountering those yields error/leaf nodes
+  rather than crashing.
   """
 
   alias Toxic2.{CST, Diagnostics, LexError, Precedence, Tokens}
@@ -48,6 +51,9 @@ defmodule Toxic2.Parser do
   # A struct name is a primary (alias chain / var); parse it above all operator precedences so
   # only nud + dot postfixes apply, never a trailing binary op or the `{`.
   @struct_name_bp 1_000
+
+  # A clause pattern is parsed stopping before `when` (when_op 50), so the guard isn't swallowed.
+  @clause_pattern_bp 51
 
   @type result :: {CST.t(), [Toxic2.Diagnostic.t()]}
 
@@ -500,10 +506,156 @@ defmodule Toxic2.Parser do
       kind == :percent ->
         parse_percent(t, i, diags, nid, fuel)
 
+      kind == :fn ->
+        parse_fn(t, i, diags, nid, fuel)
+
       true ->
         parse_unexpected(t, i, diags, nid, fuel)
     end
   end
+
+  # --- fn / stab clauses -------------------------------------------------
+
+  # `fn <clause>+ end`, each clause `<patterns> [when guard] -> <body>`.
+  defp parse_fn(t, fn_i, diags, nid, fuel) do
+    {clauses, j, diags, nid, fuel} = parse_clauses(t, fn_i + 1, [], diags, nid, fuel)
+
+    {CST.node(:fn, merge(tok_span(t, fn_i), tok_span(t, j - 1)), clauses, :matched, nil), j,
+     diags, nid, fuel}
+  end
+
+  defp parse_clauses(t, i, acc, diags, nid, fuel) do
+    i = skip_eoe(t, i)
+
+    cond do
+      Tokens.kind(t, i) == :end ->
+        {:lists.reverse(acc), i + 1, diags, nid, fuel}
+
+      Tokens.at_eof?(t, i) ->
+        {id, diags, nid} =
+          Diagnostics.emit(diags, nid, :parser, :error, :expected_end, eof_span(t), %{})
+
+        {:lists.reverse([CST.missing(:end, i, diag: id) | acc]), i, diags, nid, fuel}
+
+      true ->
+        {clause, j, diags, nid, fuel} = parse_clause(t, i, diags, nid, fuel)
+        j = if j > i, do: j, else: i + 1
+        parse_clauses(t, j, [clause | acc], diags, nid, fuel)
+    end
+  end
+
+  defp parse_clause(t, i, diags, nid, fuel) do
+    {head, arrow_i, diags, nid, fuel} = parse_clause_head(t, i, diags, nid, fuel)
+
+    if Tokens.kind(t, arrow_i) == :stab_op do
+      {body, k, diags, nid, fuel} = parse_clause_body(t, arrow_i + 1, [], diags, nid, fuel)
+
+      {CST.node(:stab, merge(cst_span(t, head), cst_span(t, body)), [head, body], :matched, nil),
+       k, diags, nid, fuel}
+    else
+      {id, diags, nid} =
+        Diagnostics.emit(diags, nid, :parser, :error, :expected_stab, tok_span(t, arrow_i), %{})
+
+      {CST.node(
+         :stab,
+         cst_span(t, head),
+         [head, CST.missing(:->, arrow_i, diag: id)],
+         :matched,
+         nil
+       ), arrow_i, diags, nid, fuel}
+    end
+  end
+
+  # Returns {head_node, arrow_index, ...}. The head is the patterns (with optional `when` guard);
+  # `arrow_index` is where the `->` should be.
+  defp parse_clause_head(t, i, diags, nid, fuel) do
+    i = skip_eols(t, i)
+
+    if Tokens.kind(t, i) == :stab_op do
+      {CST.node(:stab_args, tok_span(t, i), [], :matched, nil), i, diags, nid, fuel}
+    else
+      {patterns, j, diags, nid, fuel} = head_patterns(t, i, [], diags, nid, fuel)
+      jj = skip_eols(t, j)
+      clause_head_guard(t, jj, patterns, diags, nid, fuel)
+    end
+  end
+
+  defp clause_head_guard(t, i, patterns, diags, nid, fuel) do
+    if Tokens.kind(t, i) == :when_op do
+      {guard, j, diags, nid, fuel} =
+        parse_expr(t, skip_eols(t, i + 1), 0, :matched, diags, nid, fuel - 1)
+
+      when_node =
+        CST.node(
+          :stab_when,
+          head_span(t, patterns, guard),
+          Enum.concat(patterns, [guard]),
+          :matched,
+          nil
+        )
+
+      {CST.node(:stab_args, cst_span(t, when_node), [when_node], :matched, nil), skip_eols(t, j),
+       diags, nid, fuel}
+    else
+      {CST.node(:stab_args, head_span(t, patterns, nil), patterns, :matched, nil), i, diags, nid,
+       fuel}
+    end
+  end
+
+  # Comma-separated patterns, each parsed stopping before `when` (50) and `->` (not infix).
+  defp head_patterns(t, i, acc, diags, nid, fuel) do
+    i = skip_eols(t, i)
+
+    {pat, j, diags, nid, fuel} =
+      parse_expr(t, i, @clause_pattern_bp, :matched, diags, nid, fuel - 1)
+
+    j = if j > i, do: j, else: i + 1
+    jj = skip_eols(t, j)
+
+    if Tokens.kind(t, jj) == :"," do
+      head_patterns(t, jj + 1, [pat | acc], diags, nid, fuel)
+    else
+      {:lists.reverse([pat | acc]), j, diags, nid, fuel}
+    end
+  end
+
+  # Clause body: statements until `end`, EOF, or the next clause head (a `->` on the line ahead).
+  defp parse_clause_body(t, i, acc, diags, nid, fuel) do
+    i = skip_eoe(t, i)
+
+    cond do
+      Tokens.kind(t, i) == :end or Tokens.at_eof?(t, i) or clause_head_ahead?(t, i, 0) ->
+        {CST.node(
+           :stab_body,
+           list_span(t, :lists.reverse(acc)),
+           :lists.reverse(acc),
+           :matched,
+           nil
+         ), i, diags, nid, fuel}
+
+      true ->
+        {stmt, j, diags, nid, fuel} = parse_expr(t, i, 0, :no_parens, diags, nid, fuel - 1)
+        j = if j > i, do: j, else: i + 1
+        parse_clause_body(t, j, [stmt | acc], diags, nid, fuel)
+    end
+  end
+
+  # Is the upcoming line a clause head? True if a depth-0 `->` precedes the next EOE / `end` / EOF.
+  defp clause_head_ahead?(t, i, depth) do
+    case Tokens.kind(t, i) do
+      :eof -> false
+      :stab_op when depth == 0 -> true
+      :end when depth == 0 -> false
+      k when depth == 0 and k in [:eol, :";"] -> false
+      k when k in [:"(", :"[", :"{", :"<<", :fn, :do] -> clause_head_ahead?(t, i + 1, depth + 1)
+      k when k in [:")", :"]", :"}", :">>", :end] -> clause_head_ahead?(t, i + 1, depth - 1)
+      _ -> clause_head_ahead?(t, i + 1, depth)
+    end
+  end
+
+  # `head_patterns` always returns at least one pattern, so `patterns` is non-empty here.
+  defp head_span(t, patterns, nil), do: list_span(t, patterns)
+  defp head_span(t, patterns, guard), do: merge(cst_span(t, hd(patterns)), cst_span(t, guard))
 
   # `%{...}` map or `%Name{...}` struct.
   defp parse_percent(t, i, diags, nid, fuel) do

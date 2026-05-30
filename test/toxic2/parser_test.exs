@@ -335,6 +335,40 @@ defmodule Toxic2.ParserTest do
     end
   end
 
+  describe "fn / stab clauses (phase 9)" do
+    test "single clause, args, body" do
+      assert {{:fn, _, [{:->, _, [[], :ok]}]}, []} = Toxic2.parse_to_ast("fn -> :ok end")
+
+      assert {{:fn, _, [{:->, _, [[{:x, _, nil}], {:x, _, nil}]}]}, []} =
+               Toxic2.parse_to_ast("fn x -> x end")
+
+      assert {{:fn, _, [{:->, _, [[{:x, _, nil}, {:y, _, nil}], {:+, _, _}]}]}, []} =
+               Toxic2.parse_to_ast("fn x, y -> x + y end")
+    end
+
+    test "multiple clauses" do
+      assert {{:fn, _, [{:->, _, [[1], :one]}, {:->, _, [[2], :two]}]}, []} =
+               Toxic2.parse_to_ast("fn 1 -> :one\n 2 -> :two end")
+    end
+
+    test "when guard wraps the patterns; empty body is nil" do
+      assert {{:fn, _, [{:->, _, [[{:when, _, [{:x, _, nil}, {:>, _, _}]}], {:x, _, nil}]}]}, []} =
+               Toxic2.parse_to_ast("fn x when x > 0 -> x end")
+
+      assert {{:fn, _, [{:->, _, [[], nil]}]}, []} = Toxic2.parse_to_ast("fn -> end")
+    end
+
+    test "multi-statement body lowers to a block" do
+      assert {{:fn, _, [{:->, _, [[{:x, _, nil}], {:__block__, _, [_, _]}]}]}, []} =
+               Toxic2.parse_to_ast("fn x -> y = x\n y end")
+    end
+
+    test "fn missing end is tolerant" do
+      {_v, _es, diags} = exprs("fn x -> x")
+      assert Enum.any?(diags, &(elem(&1, 3) == :expected_end))
+    end
+  end
+
   describe "tolerant behavior (P1: never crash; one diagnostic per error)" do
     test "a trailing operator yields a binary_op with a missing RHS + one diagnostic" do
       {_view, [e], diags} = exprs("1 +")
