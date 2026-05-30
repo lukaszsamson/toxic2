@@ -118,6 +118,15 @@ defmodule Toxic2.Conformance.Corpus do
     {"a[b]", [:access]},
     {"a[b][c]", [:access]},
     {"m[:k]", [:access]},
+    # permissive edges (valid)
+    {"[1,]", [:trailing_comma]},
+    {"{1,}", [:trailing_comma]},
+    {"<<1,>>", [:trailing_comma]},
+    {"[1, 2,]", [:trailing_comma]},
+    {"%{a => 1, b: 2}", [:keyword]},
+    {"[1, 2, a: 1, b: 2]", [:keyword]},
+    {"a\n.b", [:dot]},
+    {"a\n.b.c", [:dot]},
     # layout
     {"a\nb", [:layout]},
     {"a; b; c", [:layout]},
@@ -137,7 +146,17 @@ defmodule Toxic2.Conformance.Corpus do
     {"{1, ", [:recovery]},
     {"%{a =>", [:recovery]},
     {"<<1, 2", [:recovery]},
-    {"a[b", [:recovery]}
+    {"a[b", [:recovery]},
+    # keyword-last / trailing-comma / update / kw-in-tuple violations (oracle rejects)
+    {"f(1,)", [:recovery]},
+    {"f(a: 1, 2)", [:keyword]},
+    {"f(1, a: 2, 3)", [:keyword]},
+    {"[a: 1, 2]", [:keyword]},
+    {"[1, a: 2, 3]", [:keyword]},
+    {"%{a: 1, b => 2}", [:keyword]},
+    {"%{m |}", [:map]},
+    {"%Foo{m |}", [:struct]},
+    {"{a: 1}", [:keyword]}
   ]
 
   @spec valid() :: [entry()]

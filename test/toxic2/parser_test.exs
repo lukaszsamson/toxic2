@@ -222,6 +222,45 @@ defmodule Toxic2.ParserTest do
     end
   end
 
+  describe "permissive-grammar edges" do
+    test "trailing commas are valid in lists/tuples/bitstrings, but not calls" do
+      assert {[1], []} = Toxic2.parse_to_ast("[1,]")
+      assert {{:{}, _, [1]}, []} = Toxic2.parse_to_ast("{1,}")
+      assert {{:<<>>, _, [1]}, []} = Toxic2.parse_to_ast("<<1,>>")
+
+      {_v, _es, diags} = exprs("f(1,)")
+      assert Enum.any?(diags, &(elem(&1, 3) == :unexpected_trailing_comma))
+    end
+
+    test "keyword-last is enforced" do
+      for src <- ["f(a: 1, 2)", "[a: 1, 2]", "[1, a: 2, 3]"] do
+        {_v, _es, diags} = exprs(src)
+
+        assert Enum.any?(diags, &(elem(&1, 3) == :keyword_not_last)),
+               "#{src} must flag keyword_not_last"
+      end
+    end
+
+    test "keywords are not allowed inside tuples/bitstrings" do
+      {_v, _es, diags} = exprs("{a: 1}")
+      assert Enum.any?(diags, &(elem(&1, 3) == :keyword_not_allowed))
+    end
+
+    test "empty map/struct update is an error" do
+      {_v, _es, d1} = exprs("%{m |}")
+      assert Enum.any?(d1, &(elem(&1, 3) == :empty_map_update))
+    end
+
+    test "a dot may continue on the next line (a\\n.b)" do
+      assert {{{:., _, [{:a, _, nil}, :b]}, _, []}, []} = Toxic2.parse_to_ast("a\n.b")
+    end
+
+    test "maps allow assoc-then-keyword (keyword last)" do
+      assert {{:%{}, _, [{{:a, _, nil}, 1}, {:b, 2}]}, []} =
+               Toxic2.parse_to_ast("%{a => 1, b: 2}")
+    end
+  end
+
   describe "tolerant behavior (P1: never crash; one diagnostic per error)" do
     test "a trailing operator yields a binary_op with a missing RHS + one diagnostic" do
       {_view, [e], diags} = exprs("1 +")

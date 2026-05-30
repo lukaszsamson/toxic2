@@ -102,7 +102,7 @@ defmodule Toxic2.Parser do
   defp postfix(t, i, lhs, ctx, diags, nid, fuel) do
     cond do
       paren_call?(t, lhs, i) ->
-        {args, j, diags, nid, fuel} = parse_seq(t, i + 1, :")", diags, nid, fuel)
+        {args, j, diags, nid, fuel} = parse_seq(t, i + 1, :")", :call, diags, nid, fuel)
 
         call =
           CST.node(
@@ -115,16 +115,19 @@ defmodule Toxic2.Parser do
 
         postfix(t, j, call, ctx, diags, nid, fuel)
 
-      Tokens.kind(t, i) == :dot ->
-        dot(t, i, lhs, ctx, diags, nid, fuel)
-
       access?(t, lhs, i) ->
         access(t, i, lhs, ctx, diags, nid, fuel)
+
+      # A dot may follow on the next line (`a\n.b`); skip eols only to reach a dot, not past one.
+      dot_continuation?(t, i) ->
+        dot(t, skip_eols(t, i), lhs, ctx, diags, nid, fuel)
 
       true ->
         {lhs, i, diags, nid, fuel}
     end
   end
+
+  defp dot_continuation?(t, i), do: Tokens.kind(t, skip_eols(t, i)) == :dot
 
   # `a[b]` access when `[` is adjacent to the primary (spaced `a [b]` is a no-parens call, phase 8).
   defp access?(t, lhs, i) do
@@ -189,7 +192,7 @@ defmodule Toxic2.Parser do
         remote_call(t, j, lhs, ctx, diags, nid, fuel)
 
       :"(" ->
-        {args, k, diags, nid, fuel} = parse_seq(t, j + 1, :")", diags, nid, fuel)
+        {args, k, diags, nid, fuel} = parse_seq(t, j + 1, :")", :call, diags, nid, fuel)
 
         node =
           CST.node(
@@ -231,7 +234,7 @@ defmodule Toxic2.Parser do
     name = CST.token(name_i)
 
     if Tokens.kind(t, name_i + 1) == :"(" and Tokens.adjacent?(t, name_i, name_i + 1) do
-      {args, k, diags, nid, fuel} = parse_seq(t, name_i + 2, :")", diags, nid, fuel)
+      {args, k, diags, nid, fuel} = parse_seq(t, name_i + 2, :")", :call, diags, nid, fuel)
 
       node =
         CST.node(
@@ -386,7 +389,7 @@ defmodule Toxic2.Parser do
          diags, nid, fuel}
 
       Tokens.kind(t, i) == :kw_identifier ->
-        {entries, j, diags, nid, fuel} = map_entries(t, i, [], diags, nid, fuel)
+        {entries, j, diags, nid, fuel} = map_entries(t, i, [], false, diags, nid, fuel)
 
         {CST.node(
            :map,
@@ -409,7 +412,25 @@ defmodule Toxic2.Parser do
     cond do
       Tokens.kind(t, jj) == :pipe_op ->
         {entries, k, diags, nid, fuel} =
-          map_entries(t, skip_eols(t, jj + 1), [], diags, nid, fuel)
+          map_entries(t, skip_eols(t, jj + 1), [], false, diags, nid, fuel)
+
+        {diags, nid} =
+          if entries == [] do
+            {_id, d, n} =
+              Diagnostics.emit(
+                diags,
+                nid,
+                :parser,
+                :error,
+                :empty_map_update,
+                tok_span(t, jj),
+                %{}
+              )
+
+            {d, n}
+          else
+            {diags, nid}
+          end
 
         {CST.node(
            :map_update,
@@ -426,7 +447,7 @@ defmodule Toxic2.Parser do
         first =
           CST.node(:assoc, merge(cst_span(t, key), cst_span(t, val)), [key, val], :matched, nil)
 
-        {entries, m, diags, nid, fuel} = map_rest(t, k, [first], diags, nid, fuel)
+        {entries, m, diags, nid, fuel} = map_rest(t, k, [first], false, diags, nid, fuel)
 
         {CST.node(
            :map,
@@ -450,26 +471,33 @@ defmodule Toxic2.Parser do
     end
   end
 
-  # After the first assoc entry: continue at `,` or finish at `}`.
-  defp map_rest(t, i, acc, diags, nid, fuel) do
+  # After an entry: finish at `}` (trailing comma allowed), continue at `,`, else unterminated.
+  defp map_rest(t, i, acc, seen_kw, diags, nid, fuel) do
     i2 = skip_eols(t, i)
 
     cond do
-      Tokens.kind(t, i2) == :"}" -> {:lists.reverse(acc), i2 + 1, diags, nid, fuel}
-      Tokens.kind(t, i2) == :"," -> map_entries(t, skip_eols(t, i2 + 1), acc, diags, nid, fuel)
-      true -> map_unterminated(t, i2, acc, diags, nid, fuel)
+      Tokens.kind(t, i2) == :"}" ->
+        {:lists.reverse(acc), i2 + 1, diags, nid, fuel}
+
+      Tokens.kind(t, i2) == :"," ->
+        map_entries(t, skip_eols(t, i2 + 1), acc, seen_kw, diags, nid, fuel)
+
+      true ->
+        map_unterminated(t, i2, acc, diags, nid, fuel)
     end
   end
 
-  # Comma-separated map entries (assoc or keyword pair) until `}`.
-  defp map_entries(t, i, acc, diags, nid, fuel) do
+  # Comma-separated map entries (assoc or keyword pair) until `}`; keyword pairs must come last.
+  defp map_entries(t, i, acc, seen_kw, diags, nid, fuel) do
     i = skip_eols(t, i)
 
     if Tokens.kind(t, i) == :"}" do
       {:lists.reverse(acc), i + 1, diags, nid, fuel}
     else
       {entry, j, diags, nid, fuel} = parse_map_entry(t, i, diags, nid, fuel)
-      map_rest(t, j, [entry | acc], diags, nid, fuel)
+      is_kw = CST.node_kind(entry) == :kw_pair
+      {diags, nid} = check_kw_last(seen_kw, is_kw, t, entry, diags, nid)
+      map_rest(t, j, [entry | acc], seen_kw or is_kw, diags, nid, fuel)
     end
   end
 
@@ -514,53 +542,39 @@ defmodule Toxic2.Parser do
     {:lists.reverse([CST.missing(:"}", i, diag: id) | acc]), i, diags, nid, fuel}
   end
 
-  # `[ ... ]` / `{ ... }`: a comma-separated sequence of expressions. `|` (cons) and keyword
-  # pairs are ordinary expression content handled by the Pratt loop / lowering.
+  # `[ ... ]` / `{ ... }` / `<< ... >>`: a comma-separated sequence; `kind` is also the seq `mode`.
   defp parse_container(t, open, close, kind, diags, nid, fuel) do
-    {elems, j, diags, nid, fuel} = parse_seq(t, open + 1, close, diags, nid, fuel)
+    {elems, j, diags, nid, fuel} = parse_seq(t, open + 1, close, kind, diags, nid, fuel)
 
     {CST.node(kind, merge(tok_span(t, open), tok_span(t, j - 1)), elems, :matched, nil), j, diags,
      nid, fuel}
   end
 
-  # Comma-separated expressions up to `close` (shared by lists, tuples, and call args). Returns
-  # `{elements, index_after_close, ...}`. Tolerant: a missing closer yields a `:missing` element
-  # and one diagnostic.
-  defp parse_seq(t, i, close, diags, nid, fuel) do
+  # Comma-separated elements up to `close`. `mode` (`:list | :tuple | :bitstring | :call`) controls
+  # the permissive-grammar edges: a trailing comma is allowed everywhere except calls; keyword
+  # pairs are allowed only in lists and calls; and keyword pairs must come last.
+  defp parse_seq(t, i, close, mode, diags, nid, fuel) do
     i = skip_eols(t, i)
 
     if Tokens.kind(t, i) == close do
       {[], i + 1, diags, nid, fuel}
     else
-      seq_elems(t, i, [], close, diags, nid, fuel)
+      seq_elems(t, i, [], false, close, mode, diags, nid, fuel)
     end
   end
 
-  # A sequence element is a `key: value` keyword pair when it starts with `:kw_identifier`,
-  # otherwise an ordinary expression. Keyword collection (list-inline vs call-arg list) is a
-  # lowering concern.
-  defp parse_element(t, i, diags, nid, fuel) do
-    if Tokens.kind(t, i) == :kw_identifier do
-      key = CST.token(i)
-      {val, j, diags, nid, fuel} = parse_expr(t, i + 1, 0, :matched, diags, nid, fuel - 1)
-
-      {CST.node(:kw_pair, merge(tok_span(t, i), cst_span(t, val)), [key, val], :matched, nil), j,
-       diags, nid, fuel}
-    else
-      parse_expr(t, i, 0, :matched, diags, nid, fuel)
-    end
-  end
-
-  defp seq_elems(t, i, acc, close, diags, nid, fuel) do
-    {el, i, diags, nid, fuel} = parse_element(t, i, diags, nid, fuel)
+  defp seq_elems(t, i, acc, seen_kw, close, mode, diags, nid, fuel) do
+    {el, i, is_kw, diags, nid, fuel} = parse_element(t, i, mode, diags, nid, fuel)
+    {diags, nid} = check_kw_last(seen_kw, is_kw, t, el, diags, nid)
+    acc = [el | acc]
     i2 = skip_eols(t, i)
 
     cond do
       Tokens.kind(t, i2) == close ->
-        {:lists.reverse([el | acc]), i2 + 1, diags, nid, fuel}
+        {:lists.reverse(acc), i2 + 1, diags, nid, fuel}
 
       Tokens.kind(t, i2) == :"," ->
-        seq_elems(t, skip_eols(t, i2 + 1), [el | acc], close, diags, nid, fuel)
+        seq_after_comma(t, i2, acc, seen_kw or is_kw, close, mode, diags, nid, fuel)
 
       true ->
         {id, diags, nid} =
@@ -574,8 +588,84 @@ defmodule Toxic2.Parser do
             %{close: close}
           )
 
-        {:lists.reverse([CST.missing(close, i2, diag: id), el | acc]), i2, diags, nid, fuel}
+        {:lists.reverse([CST.missing(close, i2, diag: id) | acc]), i2, diags, nid, fuel}
     end
+  end
+
+  # After a comma: a trailing comma before `close` is allowed in lists/tuples/bitstrings, but is
+  # an error in calls (`f(1,)`). Otherwise parse the next element.
+  defp seq_after_comma(t, comma_i, acc, seen_kw, close, mode, diags, nid, fuel) do
+    nxt = skip_eols(t, comma_i + 1)
+
+    cond do
+      Tokens.kind(t, nxt) != close ->
+        seq_elems(t, nxt, acc, seen_kw, close, mode, diags, nid, fuel)
+
+      mode != :call ->
+        {:lists.reverse(acc), nxt + 1, diags, nid, fuel}
+
+      true ->
+        {id, diags, nid} =
+          Diagnostics.emit(
+            diags,
+            nid,
+            :parser,
+            :error,
+            :unexpected_trailing_comma,
+            tok_span(t, comma_i),
+            %{}
+          )
+
+        {:lists.reverse([CST.missing(close, nxt, diag: id) | acc]), nxt + 1, diags, nid, fuel}
+    end
+  end
+
+  # An element is a `key: value` keyword pair (only in lists/calls) or an expression. Returns the
+  # node, the next index, and whether it was a keyword pair (for keyword-last enforcement).
+  defp parse_element(t, i, mode, diags, nid, fuel) do
+    if Tokens.kind(t, i) == :kw_identifier do
+      key = CST.token(i)
+      {val, j, diags, nid, fuel} = parse_expr(t, i + 1, 0, :matched, diags, nid, fuel - 1)
+
+      node =
+        CST.node(:kw_pair, merge(tok_span(t, i), cst_span(t, val)), [key, val], :matched, nil)
+
+      {diags, nid} = check_kw_allowed(mode, t, i, diags, nid)
+      {node, j, true, diags, nid, fuel}
+    else
+      {expr, j, diags, nid, fuel} = parse_expr(t, i, 0, :matched, diags, nid, fuel)
+      {expr, j, false, diags, nid, fuel}
+    end
+  end
+
+  # A non-keyword element after a keyword pair: keyword lists must come last.
+  defp check_kw_last(true, false, t, el, diags, nid) do
+    {_id, diags, nid} =
+      Diagnostics.emit(
+        diags,
+        nid,
+        :parser,
+        :error,
+        :keyword_not_last,
+        cst_span(t, el) || {1, 1, 1, 1},
+        %{}
+      )
+
+    {diags, nid}
+  end
+
+  defp check_kw_last(_seen, _is_kw, _t, _el, diags, nid), do: {diags, nid}
+
+  # Keyword pairs are not allowed inside tuples / bitstrings.
+  defp check_kw_allowed(mode, _t, _i, diags, nid) when mode in [:list, :call], do: {diags, nid}
+
+  defp check_kw_allowed(mode, t, i, diags, nid) do
+    {_id, diags, nid} =
+      Diagnostics.emit(diags, nid, :parser, :error, :keyword_not_allowed, tok_span(t, i), %{
+        in: mode
+      })
+
+    {diags, nid}
   end
 
   defp parse_unary(t, i, prefix_bp, ctx, diags, nid, fuel) do
