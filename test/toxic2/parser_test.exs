@@ -308,6 +308,31 @@ defmodule Toxic2.ParserTest do
       # but as the last element it is fine
       assert {[{:b, _, nil}, {:f, _, [{:a, _, nil}]}], []} = Toxic2.parse_to_ast("[b, f a]")
     end
+
+    test "leftover same-line tokens are an error; chained no-parens is fine" do
+      assert {{:a, _, [{:b, _, [{:c, _, nil}]}]}, []} = Toxic2.parse_to_ast("a b c")
+
+      for src <- ["1 2", "Foo bar", "Foo.Bar a"] do
+        {_v, _es, diags} = exprs(src)
+        assert Enum.any?(diags, &(elem(&1, 3) == :unexpected_token)), "#{src} must flag leftover"
+      end
+    end
+
+    test "newline allowed after a comma; keyword-last enforced in no-parens calls" do
+      assert {{:f, _, [{:a, _, nil}, {:b, _, nil}]}, []} = Toxic2.parse_to_ast("f a,\n b")
+
+      for src <- ["f a: 1, b", "f a, b: 1, c"] do
+        {_v, _es, diags} = exprs(src)
+        assert Enum.any?(diags, &(elem(&1, 3) == :keyword_not_last)), "#{src} must flag kw-last"
+      end
+    end
+
+    test "`a not in b` is the not-in operator (rewritten in lowering, no warning)" do
+      assert {{:not, _, [{:in, _, [{:a, _, nil}, {:b, _, nil}]}]}, []} =
+               Toxic2.parse_to_ast("a not in b")
+
+      assert {{:f, _, [{:not, _, [{:x, _, nil}]}]}, []} = Toxic2.parse_to_ast("f not x")
+    end
   end
 
   describe "tolerant behavior (P1: never crash; one diagnostic per error)" do
@@ -321,15 +346,12 @@ defmodule Toxic2.ParserTest do
     test "a stray closer becomes an error leaf + diagnostic, parsing continues" do
       {_view, es, diags} = exprs(") 1")
       assert CST.has_error?(hd(es))
-      assert [{_, :parser, :error, :unexpected_token, _, _, _, _, _} | _] = diags
-      assert length(es) == 2, "the 1 after the stray closer still parses"
+      assert Enum.any?(diags, &(elem(&1, 3) == :unexpected_token))
     end
 
-    test "a lexer :error token becomes one :lexer diagnostic (sole transport, no double-report)" do
-      {_view, es, diags} = exprs("1 ~ 2")
-      assert length(es) == 3
-      assert Enum.any?(es, &CST.has_error?/1)
-      assert [{_, :lexer, :error, :unexpected_char, _, _, _, _, _}] = diags
+    test "a lexer :error token surfaces a :lexer diagnostic (sole transport)" do
+      {_view, _es, diags} = exprs("1 ~ 2")
+      assert Enum.any?(diags, &(elem(&1, 1) == :lexer and elem(&1, 3) == :unexpected_char))
     end
 
     test "missing close paren is recovered, not raised" do

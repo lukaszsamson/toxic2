@@ -93,7 +93,41 @@ defmodule Toxic2.Parser do
     {expr, i2, diags, nid, fuel} = parse_expr(t, i, 0, :no_parens, diags, nid, fuel - 1)
     # Forward-progress guard: parse_expr always advances on real input, but never loop.
     i2 = if i2 > i, do: i2, else: i + 1
-    collect(t, skip_eoe(t, i2), [expr | acc], diags, nid, fuel)
+    {i3, diags, nid} = end_statement(t, i2, diags, nid)
+    collect(t, i3, [expr | acc], diags, nid, fuel)
+  end
+
+  # A statement must end at EOE / EOF. Anything else is a leftover token on the same line that
+  # no grammar routine consumed (`1 2`, `Foo bar`) — an error; skip to the next boundary.
+  defp end_statement(t, i, diags, nid) do
+    case Tokens.kind(t, i) do
+      k when k in [:eol, :";"] ->
+        {skip_eoe(t, i), diags, nid}
+
+      :eof ->
+        {i, diags, nid}
+
+      # A leftover lexer error token: report the lexer error (sole transport, P3), don't restate.
+      :error ->
+        {_id, diags, nid} = emit_lex_error(t, i, diags, nid)
+        {skip_to_eoe(t, i + 1), diags, nid}
+
+      k ->
+        {_id, diags, nid} =
+          Diagnostics.emit(diags, nid, :parser, :error, :unexpected_token, tok_span(t, i), %{
+            kind: k
+          })
+
+        {skip_to_eoe(t, i + 1), diags, nid}
+    end
+  end
+
+  defp skip_to_eoe(t, i) do
+    case Tokens.kind(t, i) do
+      k when k in [:eol, :";"] -> skip_eoe(t, i)
+      :eof -> i
+      _ -> skip_to_eoe(t, i + 1)
+    end
   end
 
   # --- Pratt ------------------------------------------------------------
@@ -112,11 +146,11 @@ defmodule Toxic2.Parser do
   # (`f(g(a, b))`, outer arity 1).
   defp maybe_no_parens(t, i, lhs, ctx, diags, nid, fuel) do
     if np_callee?(lhs, t) and np_arg_start?(t, lhs, i) do
-      {arg, j, diags, nid, fuel} = parse_np_arg(t, i, diags, nid, fuel)
+      {arg, j, is_kw, diags, nid, fuel} = parse_np_arg(t, i, diags, nid, fuel)
 
       {args, k, diags, nid, fuel} =
         if ctx == :no_parens,
-          do: np_more_args(t, j, [arg], diags, nid, fuel),
+          do: np_more_args(t, j, [arg], is_kw, diags, nid, fuel),
           else: {[arg], j, diags, nid, fuel}
 
       {build_np_call(t, lhs, args, k), k, diags, nid, fuel}
@@ -125,10 +159,13 @@ defmodule Toxic2.Parser do
     end
   end
 
-  defp np_more_args(t, i, args, diags, nid, fuel) do
+  # Additional comma-separated args. A newline is allowed after the comma (`f a,\n b`), and
+  # keyword pairs must come last.
+  defp np_more_args(t, i, args, seen_kw, diags, nid, fuel) do
     if Tokens.kind(t, i) == :"," do
-      {arg, j, diags, nid, fuel} = parse_np_arg(t, i + 1, diags, nid, fuel)
-      np_more_args(t, j, [arg | args], diags, nid, fuel)
+      {arg, j, is_kw, diags, nid, fuel} = parse_np_arg(t, skip_eols(t, i + 1), diags, nid, fuel)
+      {diags, nid} = check_kw_last(seen_kw, is_kw, t, arg, diags, nid)
+      np_more_args(t, j, [arg | args], seen_kw or is_kw, diags, nid, fuel)
     else
       {:lists.reverse(args), i, diags, nid, fuel}
     end
@@ -148,16 +185,20 @@ defmodule Toxic2.Parser do
     end
   end
 
-  # A no-parens argument is a keyword pair or a full expression, parsed in `:no_parens`.
+  # A no-parens argument is a keyword pair or a full expression, parsed in `:no_parens`. Returns
+  # the node, next index, and whether it was a keyword pair (for keyword-last enforcement).
   defp parse_np_arg(t, i, diags, nid, fuel) do
     if Tokens.kind(t, i) == :kw_identifier do
       key = CST.token(i)
       {val, j, diags, nid, fuel} = parse_expr(t, i + 1, 0, :no_parens, diags, nid, fuel - 1)
 
-      {CST.node(:kw_pair, merge(tok_span(t, i), cst_span(t, val)), [key, val], :matched, nil), j,
-       diags, nid, fuel}
+      node =
+        CST.node(:kw_pair, merge(tok_span(t, i), cst_span(t, val)), [key, val], :matched, nil)
+
+      {node, j, true, diags, nid, fuel}
     else
-      parse_expr(t, i, 0, :no_parens, diags, nid, fuel - 1)
+      {expr, j, diags, nid, fuel} = parse_expr(t, i, 0, :no_parens, diags, nid, fuel - 1)
+      {expr, j, false, diags, nid, fuel}
     end
   end
 
@@ -173,12 +214,19 @@ defmodule Toxic2.Parser do
       {{_, _, el, ec}, {sl, sc, _, _}} when el == sl and ec < sc ->
         case Tokens.kind(t, i) do
           :dual_op -> Tokens.adjacent?(t, i, i + 1) and np_first_kind?(Tokens.kind(t, i + 1))
+          # `not` starts an arg (`f not x`) unless it is the `not in` operator (`a not in b`).
+          :unary_op -> not not_in?(t, i)
           k -> np_first_kind?(k)
         end
 
       _ ->
         false
     end
+  end
+
+  defp not_in?(t, i) do
+    Tokens.kind(t, i) == :unary_op and Tokens.value(t, i) == :not and
+      Tokens.kind(t, skip_eols(t, i + 1)) == :in_op
   end
 
   defp np_first_kind?(kind) do
@@ -371,6 +419,28 @@ defmodule Toxic2.Parser do
     do: {lhs, i, diags, nid, fuel}
 
   defp led(t, i, lhs, min_bp, ctx, diags, nid, fuel) do
+    # `a not in b`: the two-token `not in` operator (in_op precedence 170, left-assoc). Built as a
+    # faithful :not_in_op CST; the rewrite to `not(a in b)` happens only in lowering (P: no
+    # rewrite-ish work in Pratt).
+    if not_in?(t, i) and 170 >= min_bp do
+      led_not_in(t, i, lhs, min_bp, ctx, diags, nid, fuel)
+    else
+      led_infix(t, i, lhs, min_bp, ctx, diags, nid, fuel)
+    end
+  end
+
+  defp led_not_in(t, not_i, lhs, min_bp, ctx, diags, nid, fuel) do
+    in_i = skip_eols(t, not_i + 1)
+    rhs_start = skip_eols(t, in_i + 1)
+    {rhs, k, diags, nid, fuel} = parse_expr(t, rhs_start, 171, :matched, diags, nid, fuel - 1)
+
+    node =
+      CST.node(:not_in_op, merge(cst_span(t, lhs), cst_span(t, rhs)), [lhs, rhs], :matched, nil)
+
+    led(t, k, node, min_bp, ctx, diags, nid, fuel)
+  end
+
+  defp led_infix(t, i, lhs, min_bp, ctx, diags, nid, fuel) do
     case Precedence.infix(Tokens.kind(t, i)) do
       {prec, assoc} when prec >= min_bp ->
         op_leaf = CST.token(i)

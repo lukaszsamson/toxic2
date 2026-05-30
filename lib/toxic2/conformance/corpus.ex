@@ -155,6 +155,10 @@ defmodule Toxic2.Conformance.Corpus do
     {"Foo.bar a, b", [:no_parens]},
     {"x.y z", [:no_parens]},
     {"a.b c.d", [:no_parens]},
+    {"a b c d", [:no_parens]},
+    {"f a,\n b", [:no_parens]},
+    {"f a,\n b: 1", [:no_parens]},
+    {"a not in b", [:operator]},
     # layout
     {"a\nb", [:layout]},
     {"a; b; c", [:layout]},
@@ -188,7 +192,15 @@ defmodule Toxic2.Conformance.Corpus do
     # no-parens call as a non-last container element (oracle rejects; parens required)
     {"[f a, b]", [:no_parens]},
     {"{f a, b}", [:no_parens]},
-    {"[f a, g b]", [:no_parens]}
+    {"[f a, g b]", [:no_parens]},
+    # leftover same-line tokens (no grammar routine consumed them)
+    {"1 2", [:recovery]},
+    {"Foo bar", [:recovery]},
+    {"Foo.Bar a", [:recovery]},
+    {"foo :bar baz", [:recovery]},
+    # keyword-last in no-parens calls
+    {"f a: 1, b", [:no_parens]},
+    {"f a, b: 1, c", [:no_parens]}
   ]
 
   @spec valid() :: [entry()]

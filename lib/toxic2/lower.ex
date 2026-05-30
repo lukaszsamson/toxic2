@@ -129,6 +129,9 @@ defmodule Toxic2.Lower do
   defp lower_kind(:assoc, ch, _cst, view, opts, acc, nid),
     do: lower_assoc(ch, view, opts, acc, nid)
 
+  defp lower_kind(:not_in_op, ch, _cst, view, opts, acc, nid),
+    do: lower_not_in(ch, view, opts, acc, nid)
+
   defp lower_kind(_other, _ch, cst, view, _opts, acc, nid), do: {error_ast(cst, view), acc, nid}
 
   defp lower_block([], _view, _opts, acc, nid), do: {{:__block__, [], []}, acc, nid}
@@ -309,6 +312,14 @@ defmodule Toxic2.Lower do
     {name_ast, acc, nid} = lower(name, view, opts, acc, nid)
     {map_ast, acc, nid} = lower(map_node, view, opts, acc, nid)
     {{:%, [], [name_ast, map_ast]}, acc, nid}
+  end
+
+  # `a not in b` => `{:not, [], [{:in, [], [a, b]}]}` (the canonical Elixir shape; the rewrite
+  # lives here, not in the parser — P5).
+  defp lower_not_in([lhs, rhs], view, opts, acc, nid) do
+    {l, acc, nid} = lower(lhs, view, opts, acc, nid)
+    {r, acc, nid} = lower(rhs, view, opts, acc, nid)
+    {{:not, [], [{:in, [], [l, r]}]}, acc, nid}
   end
 
   # `key => value` map entry => `{key, value}` 2-tuple.
