@@ -4,9 +4,10 @@ defmodule Toxic2.Parser do
 
   Covers a top-level **expression list** of literals, identifiers/aliases, atoms, prefix/infix
   **operators**, parentheses, **lists `[...]`** (incl. keyword pairs), **tuples `{...}`**, **paren
-  calls `f(...)`**, **dot/remote/anon calls** (`a.b`, `Foo.bar(...)`, `a.(...)`), and **alias
-  chains** (`Foo.Bar`). It builds a **green CST only** (`Toxic2.CST`) — never the Elixir AST, and
-  no AST quirks (those belong to lowering, phase 6).
+  calls `f(...)`**, **dot/remote/anon calls** (`a.b`, `Foo.bar(...)`, `a.(...)`), **alias chains**
+  (`Foo.Bar`), **maps/structs** (`%{...}`, `%Name{...}`, incl. `|` update), **bitstrings**
+  (`<<...>>`), and **access** (`a[b]`). It builds a **green CST only** (`Toxic2.CST`) — never the
+  Elixir AST, and no AST quirks (those belong to lowering, phase 6).
 
   Design (per the spec):
 
@@ -24,9 +25,8 @@ defmodule Toxic2.Parser do
   **not** skipped when looking for the next infix operator — a newline there ends the expression
   (matching Elixir). EOE (`:eol` / `:";"`) separates top-level expressions.
 
-  Not yet handled (later slices/phases): access `a[b]`, maps, structs, bitstrings, no-parens
-  calls, stabs/blocks, strings/sigils, `&` capture, multi-statement parens. Encountering those
-  yields error/leaf nodes rather than crashing.
+  Not yet handled (later phases): no-parens calls, stabs/blocks, strings/sigils, `&` capture,
+  multi-statement parens. Encountering those yields error/leaf nodes rather than crashing.
   """
 
   alias Toxic2.{CST, Diagnostics, LexError, Precedence, Tokens}
@@ -34,6 +34,14 @@ defmodule Toxic2.Parser do
   @fuel_base 1_000
 
   @atomic_kinds [:int, :flt, :char, :atom, :literal, :identifier]
+
+  # A map key / update base is parsed stopping before `|` (pipe_op 70) so the update separator
+  # isn't swallowed as a binary operator.
+  @map_key_bp 71
+
+  # A struct name is a primary (alias chain / var); parse it above all operator precedences so
+  # only nud + dot postfixes apply, never a trailing binary op or the `{`.
+  @struct_name_bp 1_000
 
   @type result :: {CST.t(), [Toxic2.Diagnostic.t()]}
 
@@ -110,8 +118,45 @@ defmodule Toxic2.Parser do
       Tokens.kind(t, i) == :dot ->
         dot(t, i, lhs, ctx, diags, nid, fuel)
 
+      access?(t, lhs, i) ->
+        access(t, i, lhs, ctx, diags, nid, fuel)
+
       true ->
         {lhs, i, diags, nid, fuel}
+    end
+  end
+
+  # `a[b]` access when `[` is adjacent to the primary (spaced `a [b]` is a no-parens call, phase 8).
+  defp access?(t, lhs, i) do
+    Tokens.kind(t, i) == :"[" and adjacent_after?(cst_span(t, lhs), Tokens.span(t, i))
+  end
+
+  defp adjacent_after?({_, _, el, ec}, {sl, sc, _, _}), do: el == sl and ec == sc
+  defp adjacent_after?(_, _), do: false
+
+  defp access(t, open, lhs, ctx, diags, nid, fuel) do
+    {idx, j, diags, nid, fuel} = parse_expr(t, open + 1, 0, :matched, diags, nid, fuel - 1)
+    jj = skip_eols(t, j)
+
+    if Tokens.kind(t, jj) == :"]" do
+      node =
+        CST.node(:access, merge(cst_span(t, lhs), tok_span(t, jj)), [lhs, idx], :matched, nil)
+
+      postfix(t, jj + 1, node, ctx, diags, nid, fuel)
+    else
+      {id, diags, nid} =
+        Diagnostics.emit(diags, nid, :parser, :error, :expected_rbracket, tok_span(t, jj), %{})
+
+      node =
+        CST.node(
+          :access,
+          merge(cst_span(t, lhs), tok_span(t, jj)),
+          [lhs, idx, CST.missing(:"]", jj, diag: id)],
+          :matched,
+          nil
+        )
+
+      {node, jj, diags, nid, fuel}
     end
   end
 
@@ -269,9 +314,204 @@ defmodule Toxic2.Parser do
       kind == :"{" ->
         parse_container(t, i, :"}", :tuple, diags, nid, fuel)
 
+      kind == :"<<" ->
+        parse_container(t, i, :">>", :bitstring, diags, nid, fuel)
+
+      kind == :percent ->
+        parse_percent(t, i, diags, nid, fuel)
+
       true ->
         parse_unexpected(t, i, diags, nid, fuel)
     end
+  end
+
+  # `%{...}` map or `%Name{...}` struct.
+  defp parse_percent(t, i, diags, nid, fuel) do
+    j = i + 1
+
+    cond do
+      Tokens.kind(t, j) == :"{" ->
+        parse_map_body(t, j, i, diags, nid, fuel)
+
+      Tokens.kind(t, j) in [:alias, :identifier] ->
+        parse_struct(t, i, diags, nid, fuel)
+
+      true ->
+        {id, diags, nid} =
+          Diagnostics.emit(
+            diags,
+            nid,
+            :parser,
+            :error,
+            :expected_map_or_struct,
+            tok_span(t, j),
+            %{}
+          )
+
+        {CST.token(i, error: true, diag: id), i + 1, diags, nid, fuel}
+    end
+  end
+
+  defp parse_struct(t, pct, diags, nid, fuel) do
+    {name, j, diags, nid, fuel} =
+      parse_expr(t, pct + 1, @struct_name_bp, :matched, diags, nid, fuel - 1)
+
+    if Tokens.kind(t, j) == :"{" do
+      {map, k, diags, nid, fuel} = parse_map_body(t, j, j, diags, nid, fuel)
+
+      {CST.node(:struct, merge(tok_span(t, pct), cst_span(t, map)), [name, map], :matched, nil),
+       k, diags, nid, fuel}
+    else
+      {id, diags, nid} =
+        Diagnostics.emit(diags, nid, :parser, :error, :expected_struct_body, tok_span(t, j), %{})
+
+      {CST.node(
+         :struct,
+         merge(tok_span(t, pct), cst_span(t, name)),
+         [name, CST.missing(:"{", j, diag: id)],
+         :matched,
+         nil
+       ), j, diags, nid, fuel}
+    end
+  end
+
+  # Map body after `{`. Detects `%{base | ...}` update; otherwise a comma-separated list of
+  # `key => value` assoc entries and `key: value` keyword pairs.
+  defp parse_map_body(t, brace, span_start, diags, nid, fuel) do
+    i = skip_eols(t, brace + 1)
+
+    cond do
+      Tokens.kind(t, i) == :"}" ->
+        {CST.node(:map, merge(tok_span(t, span_start), tok_span(t, i)), [], :matched, nil), i + 1,
+         diags, nid, fuel}
+
+      Tokens.kind(t, i) == :kw_identifier ->
+        {entries, j, diags, nid, fuel} = map_entries(t, i, [], diags, nid, fuel)
+
+        {CST.node(
+           :map,
+           merge(tok_span(t, span_start), tok_span(t, j - 1)),
+           entries,
+           :matched,
+           nil
+         ), j, diags, nid, fuel}
+
+      true ->
+        map_lead(t, i, span_start, diags, nid, fuel)
+    end
+  end
+
+  # First non-keyword segment: an update base (`base | ...`) or the first `=>` assoc entry.
+  defp map_lead(t, i, span_start, diags, nid, fuel) do
+    {key, j, diags, nid, fuel} = parse_expr(t, i, @map_key_bp, :matched, diags, nid, fuel - 1)
+    jj = skip_eols(t, j)
+
+    cond do
+      Tokens.kind(t, jj) == :pipe_op ->
+        {entries, k, diags, nid, fuel} =
+          map_entries(t, skip_eols(t, jj + 1), [], diags, nid, fuel)
+
+        {CST.node(
+           :map_update,
+           merge(tok_span(t, span_start), tok_span(t, k - 1)),
+           [key | entries],
+           :matched,
+           nil
+         ), k, diags, nid, fuel}
+
+      Tokens.kind(t, jj) == :assoc_op ->
+        {val, k, diags, nid, fuel} =
+          parse_expr(t, skip_eols(t, jj + 1), 0, :matched, diags, nid, fuel - 1)
+
+        first =
+          CST.node(:assoc, merge(cst_span(t, key), cst_span(t, val)), [key, val], :matched, nil)
+
+        {entries, m, diags, nid, fuel} = map_rest(t, k, [first], diags, nid, fuel)
+
+        {CST.node(
+           :map,
+           merge(tok_span(t, span_start), tok_span(t, m - 1)),
+           entries,
+           :matched,
+           nil
+         ), m, diags, nid, fuel}
+
+      true ->
+        {id, diags, nid} =
+          Diagnostics.emit(diags, nid, :parser, :error, :expected_assoc, tok_span(t, jj), %{})
+
+        {CST.node(
+           :map,
+           merge(tok_span(t, span_start), tok_span(t, jj)),
+           [key, CST.missing(:"=>", jj, diag: id)],
+           :matched,
+           nil
+         ), jj, diags, nid, fuel}
+    end
+  end
+
+  # After the first assoc entry: continue at `,` or finish at `}`.
+  defp map_rest(t, i, acc, diags, nid, fuel) do
+    i2 = skip_eols(t, i)
+
+    cond do
+      Tokens.kind(t, i2) == :"}" -> {:lists.reverse(acc), i2 + 1, diags, nid, fuel}
+      Tokens.kind(t, i2) == :"," -> map_entries(t, skip_eols(t, i2 + 1), acc, diags, nid, fuel)
+      true -> map_unterminated(t, i2, acc, diags, nid, fuel)
+    end
+  end
+
+  # Comma-separated map entries (assoc or keyword pair) until `}`.
+  defp map_entries(t, i, acc, diags, nid, fuel) do
+    i = skip_eols(t, i)
+
+    if Tokens.kind(t, i) == :"}" do
+      {:lists.reverse(acc), i + 1, diags, nid, fuel}
+    else
+      {entry, j, diags, nid, fuel} = parse_map_entry(t, i, diags, nid, fuel)
+      map_rest(t, j, [entry | acc], diags, nid, fuel)
+    end
+  end
+
+  defp parse_map_entry(t, i, diags, nid, fuel) do
+    if Tokens.kind(t, i) == :kw_identifier do
+      key = CST.token(i)
+      {val, j, diags, nid, fuel} = parse_expr(t, i + 1, 0, :matched, diags, nid, fuel - 1)
+
+      {CST.node(:kw_pair, merge(tok_span(t, i), cst_span(t, val)), [key, val], :matched, nil), j,
+       diags, nid, fuel}
+    else
+      {key, j, diags, nid, fuel} = parse_expr(t, i, @map_key_bp, :matched, diags, nid, fuel - 1)
+      jj = skip_eols(t, j)
+
+      if Tokens.kind(t, jj) == :assoc_op do
+        {val, k, diags, nid, fuel} =
+          parse_expr(t, skip_eols(t, jj + 1), 0, :matched, diags, nid, fuel - 1)
+
+        {CST.node(:assoc, merge(cst_span(t, key), cst_span(t, val)), [key, val], :matched, nil),
+         k, diags, nid, fuel}
+      else
+        {id, diags, nid} =
+          Diagnostics.emit(diags, nid, :parser, :error, :expected_assoc, tok_span(t, jj), %{})
+
+        {CST.node(
+           :assoc,
+           merge(cst_span(t, key), tok_span(t, jj)),
+           [key, CST.missing(:"=>", jj, diag: id)],
+           :matched,
+           nil
+         ), jj, diags, nid, fuel}
+      end
+    end
+  end
+
+  defp map_unterminated(t, i, acc, diags, nid, fuel) do
+    {id, diags, nid} =
+      Diagnostics.emit(diags, nid, :parser, :error, :expected_comma_or_close, tok_span(t, i), %{
+        close: :"}"
+      })
+
+    {:lists.reverse([CST.missing(:"}", i, diag: id) | acc]), i, diags, nid, fuel}
   end
 
   # `[ ... ]` / `{ ... }`: a comma-separated sequence of expressions. `|` (cons) and keyword

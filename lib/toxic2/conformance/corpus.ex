@@ -94,6 +94,30 @@ defmodule Toxic2.Conformance.Corpus do
     {"f(a: 1)", [:keyword]},
     {"f(1, a: 2)", [:keyword]},
     {"f(x, y, a: 1, b: 2)", [:keyword]},
+    # maps
+    {"%{a => b}", [:map]},
+    {"%{}", [:map]},
+    {"%{a => b, c => d}", [:map]},
+    {"%{a: 1, b: 2}", [:map]},
+    {"%{1 => 2}", [:map]},
+    {"%{m | k => v}", [:map]},
+    {"%{m | a: 1}", [:map]},
+    # structs
+    {"%Foo{a: 1}", [:struct]},
+    {"%Foo{}", [:struct]},
+    {"%Foo{m | a: 1}", [:struct]},
+    {"%Foo.Bar{x: 1}", [:struct]},
+    {"%__MODULE__{}", [:struct]},
+    # bitstrings
+    {"<<1, 2>>", [:bitstring]},
+    {"<<>>", [:bitstring]},
+    {"<<1::8>>", [:bitstring]},
+    {"<<x::binary>>", [:bitstring]},
+    {"<<1, 2::8>>", [:bitstring]},
+    # access
+    {"a[b]", [:access]},
+    {"a[b][c]", [:access]},
+    {"m[:k]", [:access]},
     # layout
     {"a\nb", [:layout]},
     {"a; b; c", [:layout]},
@@ -110,7 +134,10 @@ defmodule Toxic2.Conformance.Corpus do
     {"0x", [:recovery]},
     {"[1, 2", [:recovery]},
     {"f(1, 2", [:recovery]},
-    {"{1, ", [:recovery]}
+    {"{1, ", [:recovery]},
+    {"%{a =>", [:recovery]},
+    {"<<1, 2", [:recovery]},
+    {"a[b", [:recovery]}
   ]
 
   @spec valid() :: [entry()]

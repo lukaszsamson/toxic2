@@ -189,6 +189,39 @@ defmodule Toxic2.ParserTest do
     end
   end
 
+  describe "maps, structs, bitstrings, access (phase 7 slice 3)" do
+    test "maps: assoc, keyword, and update" do
+      assert {{:%{}, _, [{{:a, _, nil}, {:b, _, nil}}]}, []} = Toxic2.parse_to_ast("%{a => b}")
+      assert {{:%{}, _, [a: 1, b: 2]}, []} = Toxic2.parse_to_ast("%{a: 1, b: 2}")
+      assert {{:%{}, _, []}, []} = Toxic2.parse_to_ast("%{}")
+
+      assert {{:%{}, _, [{:|, _, [{:m, _, nil}, [{{:k, _, nil}, {:v, _, nil}}]]}]}, []} =
+               Toxic2.parse_to_ast("%{m | k => v}")
+    end
+
+    test "structs (incl. update)" do
+      assert {{:%, _, [{:__aliases__, _, [:Foo]}, {:%{}, _, [a: 1]}]}, []} =
+               Toxic2.parse_to_ast("%Foo{a: 1}")
+
+      assert {{:%, _, [{:__MODULE__, _, nil}, {:%{}, _, []}]}, []} =
+               Toxic2.parse_to_ast("%__MODULE__{}")
+    end
+
+    test "bitstrings (segments via ::)" do
+      assert {{:<<>>, _, [1, 2]}, []} = Toxic2.parse_to_ast("<<1, 2>>")
+      assert {{:<<>>, _, []}, []} = Toxic2.parse_to_ast("<<>>")
+      assert {{:<<>>, _, [{:"::", _, [1, 8]}]}, []} = Toxic2.parse_to_ast("<<1::8>>")
+    end
+
+    test "access lowers to Access.get and nests" do
+      assert {{{:., _, [Access, :get]}, _, [{:a, _, nil}, {:b, _, nil}]}, []} =
+               Toxic2.parse_to_ast("a[b]")
+
+      assert {{{:., _, [Access, :get]}, _, [{{:., _, [Access, :get]}, _, _}, {:c, _, nil}]}, []} =
+               Toxic2.parse_to_ast("a[b][c]")
+    end
+  end
+
   describe "tolerant behavior (P1: never crash; one diagnostic per error)" do
     test "a trailing operator yields a binary_op with a missing RHS + one diagnostic" do
       {_view, [e], diags} = exprs("1 +")

@@ -108,6 +108,23 @@ defmodule Toxic2.Lower do
   defp lower_kind(:kw_pair, ch, _cst, view, opts, acc, nid),
     do: lower_kw_pair(ch, view, opts, acc, nid)
 
+  defp lower_kind(:bitstring, ch, _cst, view, opts, acc, nid),
+    do: lower_bitstring(ch, view, opts, acc, nid)
+
+  defp lower_kind(:access, ch, _cst, view, opts, acc, nid),
+    do: lower_access(ch, view, opts, acc, nid)
+
+  defp lower_kind(:map, ch, _cst, view, opts, acc, nid), do: lower_map(ch, view, opts, acc, nid)
+
+  defp lower_kind(:map_update, ch, _cst, view, opts, acc, nid),
+    do: lower_map_update(ch, view, opts, acc, nid)
+
+  defp lower_kind(:struct, ch, _cst, view, opts, acc, nid),
+    do: lower_struct(ch, view, opts, acc, nid)
+
+  defp lower_kind(:assoc, ch, _cst, view, opts, acc, nid),
+    do: lower_assoc(ch, view, opts, acc, nid)
+
   defp lower_kind(_other, _ch, cst, view, _opts, acc, nid), do: {error_ast(cst, view), acc, nid}
 
   defp lower_block([], _view, _opts, acc, nid), do: {{:__block__, [], []}, acc, nid}
@@ -256,6 +273,46 @@ defmodule Toxic2.Lower do
   end
 
   defp kw_pair?(cst), do: CST.tag(cst) == :node and CST.node_kind(cst) == :kw_pair
+
+  # `<<...>>` => `{:<<>>, [], elems}` (segments incl. `::` are ordinary expressions).
+  defp lower_bitstring(children, view, opts, acc, nid) do
+    {asts, acc, nid} = lower_each(children, view, opts, acc, nid)
+    {{:<<>>, [], asts}, acc, nid}
+  end
+
+  # `a[b]` => `{{:., m, [Access, :get]}, m, [base, index]}`.
+  defp lower_access([base, idx | _missing], view, opts, acc, nid) do
+    {b, acc, nid} = lower(base, view, opts, acc, nid)
+    {k, acc, nid} = lower(idx, view, opts, acc, nid)
+    {{{:., [], [Access, :get]}, [], [b, k]}, acc, nid}
+  end
+
+  # `%{...}` => `{:%{}, [], entries}`; entries lower to `{key, value}` 2-tuples.
+  defp lower_map(children, view, opts, acc, nid) do
+    {entries, acc, nid} = lower_each(children, view, opts, acc, nid)
+    {{:%{}, [], entries}, acc, nid}
+  end
+
+  # `%{base | ...}` => `{:%{}, [], [{:|, [], [base, update_entries]}]}`.
+  defp lower_map_update([base | entry_children], view, opts, acc, nid) do
+    {base_ast, acc, nid} = lower(base, view, opts, acc, nid)
+    {entries, acc, nid} = lower_each(entry_children, view, opts, acc, nid)
+    {{:%{}, [], [{:|, [], [base_ast, entries]}]}, acc, nid}
+  end
+
+  # `%Name{...}` => `{:%, [], [name, map]}`.
+  defp lower_struct([name, map_node], view, opts, acc, nid) do
+    {name_ast, acc, nid} = lower(name, view, opts, acc, nid)
+    {map_ast, acc, nid} = lower(map_node, view, opts, acc, nid)
+    {{:%, [], [name_ast, map_ast]}, acc, nid}
+  end
+
+  # `key => value` map entry => `{key, value}` 2-tuple.
+  defp lower_assoc([key, val], view, opts, acc, nid) do
+    {k, acc, nid} = lower(key, view, opts, acc, nid)
+    {v, acc, nid} = lower(val, view, opts, acc, nid)
+    {{k, v}, acc, nid}
+  end
 
   # Thread the accumulator while lowering a list of children.
   defp lower_each(children, view, opts, acc, nid) do
