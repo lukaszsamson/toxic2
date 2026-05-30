@@ -35,7 +35,14 @@ defmodule Toxic2 do
   def parse_to_ast(source, opts \\ []) when is_binary(source) do
     {view, warnings} = Toxic2.Tokens.from_source(source, opts)
     {cst, parser_diags} = Toxic2.Parser.parse_tokens(view)
-    ast = Toxic2.Lower.to_ast(cst, view, opts)
-    {ast, Toxic2.Diagnostics.merge_sorted([warnings, parser_diags])}
+    # Lowerer ids continue past lexer/parser ids so the combined stream stays unique.
+    {ast, lowerer_diags} = Toxic2.Lower.to_ast(cst, view, opts, next_id(warnings, parser_diags))
+    {ast, Toxic2.Diagnostics.merge_sorted([warnings, parser_diags, lowerer_diags])}
+  end
+
+  defp next_id(warnings, parser_diags) do
+    Enum.concat(warnings, parser_diags)
+    |> Enum.reduce(0, fn d, max -> max(max, elem(d, 0)) end)
+    |> Kernel.+(1)
   end
 end

@@ -16,15 +16,20 @@ defmodule Toxic2.LowerTest do
       assert {{:__block__, _, [{:a, _, nil}, {:b, _, nil}]}, []} = Toxic2.parse_to_ast("a\nb")
     end
 
-    test "existing_atoms_only refuses to mint new atoms" do
+    test "existing_atoms_only: known atom lowers normally" do
       _ = :known_atom_xyz
 
       assert {:known_atom_xyz, []} =
                Toxic2.parse_to_ast(":known_atom_xyz", existing_atoms_only: true)
+    end
 
-      assert_raise ArgumentError, fn ->
+    test "existing_atoms_only: an unknown atom does NOT raise (totality, P5)" do
+      # lowers to an error node + a :lowerer :error diagnostic instead of raising
+      {ast, diags} =
         Toxic2.parse_to_ast(":definitely_not_an_existing_atom_42", existing_atoms_only: true)
-      end
+
+      assert {:__error__, _meta, %{diag_ids: [_ | _]}} = ast
+      assert [{_id, :lowerer, :error, :nonexistent_atom, _, _, _, _, _}] = diags
     end
   end
 

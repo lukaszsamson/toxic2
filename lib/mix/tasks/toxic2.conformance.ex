@@ -36,17 +36,25 @@ defmodule Mix.Tasks.Toxic2.Conformance do
 
     {opts, _, _} =
       OptionParser.parse(args,
-        switches: [json: :boolean, gate: :boolean, update_freeze: :boolean]
+        switches: [json: :boolean, gate: :boolean, update_freeze: :boolean, bucket: :string]
       )
 
+    # Always evaluate the full corpus — the freeze gate must see every source, regardless of
+    # any `--bucket` display filter (otherwise out-of-bucket frozen cases would look "missing").
     results = Enum.map(Corpus.all(), fn e -> Map.put(e, :status, evaluate(e.source)) end)
+    shown = bucket_filter(results, opts[:bucket])
 
-    if opts[:json], do: IO.puts(json_report(results)), else: print_summary(results)
+    if opts[:json], do: IO.puts(json_report(shown)), else: print_summary(shown)
     if opts[:update_freeze], do: update_freeze(results)
     if opts[:gate], do: check_gate(results)
 
     :ok
   end
+
+  defp bucket_filter(results, nil), do: results
+
+  defp bucket_filter(results, bucket),
+    do: Enum.filter(results, fn r -> bucket in Enum.map(r.tags, &Atom.to_string/1) end)
 
   # --- evaluation (oracle-backed; reused by the conformance ExUnit test) ---
 
@@ -59,11 +67,16 @@ defmodule Mix.Tasks.Toxic2.Conformance do
   end
 
   defp compare_valid(source, oracle_ast) do
-    {toxic_ast, _diags} = Toxic2.parse_to_ast(source)
+    {toxic_ast, diags} = Toxic2.parse_to_ast(source)
+    errors = Enum.filter(diags, &(elem(&1, 2) == :error))
 
-    if normalize(toxic_ast) == normalize(oracle_ast),
-      do: :pass,
-      else: {:fail, normalize(oracle_ast), normalize(toxic_ast)}
+    cond do
+      # Valid code must parse cleanly: AST equality AND no :error diagnostics (a parser/lowerer
+      # recovery on valid input is a conformance failure even if the AST happens to match).
+      errors != [] -> {:fail_diag, errors}
+      normalize(toxic_ast) == normalize(oracle_ast) -> :pass
+      true -> {:fail, normalize(oracle_ast), normalize(toxic_ast)}
+    end
   rescue
     e -> {:crash, Exception.message(e)}
   end
@@ -86,6 +99,7 @@ defmodule Mix.Tasks.Toxic2.Conformance do
   # --- reporting ---------------------------------------------------------
 
   defp label({:fail, _, _}), do: :fail
+  defp label({:fail_diag, _}), do: :fail
   defp label({:crash, _}), do: :crash
   defp label(status), do: status
 
@@ -108,6 +122,10 @@ defmodule Mix.Tasks.Toxic2.Conformance do
 
   defp summarize({:fail, o, t}),
     do: "AST mismatch\n      oracle: #{inspect(o)}\n      toxic:  #{inspect(t)}"
+
+  defp summarize({:fail_diag, errs}),
+    do:
+      "valid source produced #{length(errs)} error diagnostic(s): #{inspect(Enum.map(errs, &elem(&1, 3)))}"
 
   defp summarize({:crash, msg}), do: "CRASH: #{msg}"
   defp summarize(:unexpected_valid), do: "accepted invalid source without an :error diagnostic"
@@ -139,16 +157,33 @@ defmodule Mix.Tasks.Toxic2.Conformance do
 
   defp freeze_path, do: Path.join(File.cwd!(), "freeze.json")
 
+  defp read_freeze do
+    case File.read(freeze_path()) do
+      {:ok, bin} -> :json.decode(bin)
+      {:error, _} -> nil
+    end
+  end
+
+  # Forward-only ratchet: UNION existing frozen sources with newly-passing ones, never remove.
+  # A frozen source that now fails stays in the freeze (the gate will flag it) — you cannot drop
+  # an entry to go green, and removing a corpus entry cannot silently un-freeze it.
   defp update_freeze(results) do
+    existing = read_freeze() || []
     passing = for r <- results, label(r.status) in @passing, do: r.source
-    File.write!(freeze_path(), IO.iodata_to_binary(:json.encode(passing)))
-    Mix.shell().info("freeze.json ratcheted to #{length(passing)} passing sources")
+    union = Enum.concat(existing, passing) |> Enum.uniq() |> Enum.sort()
+    File.write!(freeze_path(), IO.iodata_to_binary(:json.encode(union)))
+
+    Mix.shell().info(
+      "freeze.json: #{length(union)} sources (+#{length(union) - length(existing)}; never removed)"
+    )
   end
 
   defp check_gate(results) do
-    case File.read(freeze_path()) do
-      {:ok, bin} ->
-        frozen = :json.decode(bin)
+    case read_freeze() do
+      nil ->
+        Mix.raise("no freeze.json — bootstrap it with `mix toxic2.conformance --update-freeze`")
+
+      frozen ->
         by_source = Map.new(results, &{&1.source, label(&1.status)})
         regressed = Enum.reject(frozen, &(Map.get(by_source, &1) in @passing))
 
@@ -160,9 +195,6 @@ defmodule Mix.Tasks.Toxic2.Conformance do
               Enum.map_join(regressed, "\n", &"  #{inspect(&1)}")
           )
         end
-
-      {:error, _} ->
-        Mix.shell().info("no freeze.json — run `mix toxic2.conformance --update-freeze`")
     end
   end
 end
