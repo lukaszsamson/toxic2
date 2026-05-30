@@ -1,0 +1,327 @@
+defmodule Toxic2.LexerTest do
+  use ExUnit.Case, async: true
+
+  alias Toxic2.Token
+
+  defp tokens(src) do
+    {toks, warnings} = Toxic2.tokenize(src)
+    assert warnings == [], "phase 2 lexer must not emit out-of-band warnings"
+    toks
+  end
+
+  # {kind, value} shapes, spans stripped.
+  defp shapes(src), do: src |> tokens() |> Enum.map(&{Token.kind(&1), Token.value(&1)})
+
+  describe "names carry BINARY values (review #1: no source atom interning)" do
+    test "identifiers and aliases are binaries, not atoms" do
+      assert shapes("foo Bar baz?") == [
+               {:identifier, "foo"},
+               {:alias, "Bar"},
+               {:identifier, "baz?"}
+             ]
+    end
+
+    test "atoms carry binary values (atomization is a lowering concern)" do
+      assert shapes(":foo :Bar :foo? :<>") == [
+               {:atom, "foo"},
+               {:atom, "Bar"},
+               {:atom, "foo?"},
+               {:atom, "<>"}
+             ]
+    end
+
+    test "keyword keys carry binary values" do
+      assert shapes("foo: bar") == [{:kw_identifier, "foo"}, {:identifier, "bar"}]
+    end
+  end
+
+  describe "closed-set lexemes carry atoms (safe to intern)" do
+    test "true/false/nil are :literal with atom values" do
+      assert shapes("true false nil") == [{:literal, true}, {:literal, false}, {:literal, nil}]
+    end
+
+    test "reserved word operators" do
+      assert shapes("x when y and z or not w in v") == [
+               {:identifier, "x"},
+               {:when_op, :when},
+               {:identifier, "y"},
+               {:and_op, :and},
+               {:identifier, "z"},
+               {:or_op, :or},
+               {:unary_op, :not},
+               {:identifier, "w"},
+               {:in_op, :in},
+               {:identifier, "v"}
+             ]
+    end
+
+    test "block labels and terminators" do
+      assert shapes("fn do else after end") == [
+               {:fn, nil},
+               {:do, nil},
+               {:block_label, :else},
+               {:block_label, :after},
+               {:end, nil}
+             ]
+    end
+  end
+
+  describe "no fused `not in` (P2)" do
+    test "`not in` stays two tokens; fusion is a parser/lowering concern" do
+      assert shapes("a not in b") == [
+               {:identifier, "a"},
+               {:unary_op, :not},
+               {:in_op, :in},
+               {:identifier, "b"}
+             ]
+    end
+  end
+
+  describe "`do:` keyword key vs `do` terminator" do
+    test "adjacent colon makes a keyword key, even for reserved words" do
+      assert shapes("do: end") == [{:kw_identifier, "do"}, {:end, nil}]
+    end
+
+    test "bare `do` is the terminator" do
+      assert shapes("do end") == [{:do, nil}, {:end, nil}]
+    end
+
+    test "`foo::bar` is identifier + type_op, not a keyword key" do
+      assert shapes("foo::bar") == [{:identifier, "foo"}, {:type_op, :"::"}, {:identifier, "bar"}]
+    end
+  end
+
+  describe "numbers" do
+    test "integers with underscores" do
+      assert shapes("1_000_000") == [{:int, 1_000_000}]
+    end
+
+    test "hex / octal / binary integers" do
+      assert shapes("0xFF 0o17 0b1010") == [{:int, 255}, {:int, 15}, {:int, 10}]
+    end
+
+    test "floats incl. exponents" do
+      assert shapes("1.0 1.25 1.0e3 1.5e-3") == [
+               {:flt, 1.0},
+               {:flt, 1.25},
+               {:flt, 1.0e3},
+               {:flt, 1.5e-3}
+             ]
+    end
+
+    test "`1.foo` is int then dot then identifier (dot needs a digit to be a float)" do
+      assert shapes("1.foo") == [{:int, 1}, {:dot, :.}, {:identifier, "foo"}]
+    end
+
+    test "a radix prefix with no digits is a tolerant error" do
+      assert [{:error, %Toxic2.LexError{code: :invalid_number}}] = shapes("0x")
+    end
+
+    test "only-underscore radix bodies are a tolerant error, never a crash (review #1)" do
+      for src <- ["0x_", "0o_", "0b_"] do
+        assert [{:error, %Toxic2.LexError{code: :invalid_number}}] = shapes(src),
+               "#{src} must be an error token, not an exception"
+      end
+    end
+
+    test "invalid underscore placement is an :error, not a silently-valid number (review #2)" do
+      for src <- ["1_", "1__2", "0x_F", "0xF_", "1.2_", "1_.2"] do
+        kinds = src |> tokens() |> Enum.map(&Token.kind/1)
+
+        assert :error in kinds and :int not in kinds and :flt not in kinds,
+               "#{src} must produce an :error token and no number token, got #{inspect(kinds)}"
+      end
+    end
+
+    test "valid underscores (incl. in the exponent) still parse" do
+      assert shapes("1_000 1_0.2_5 1.0e1_0") == [
+               {:int, 1000},
+               {:flt, 10.25},
+               {:flt, 1.0e10}
+             ]
+    end
+  end
+
+  describe "char literals" do
+    test "plain and escaped chars" do
+      assert shapes("?a ?\\n ?\\s") == [{:char, ?a}, {:char, ?\n}, {:char, ?\s}]
+    end
+  end
+
+  describe "operator families (tags ported from Toxic; precedence pinned in phase 5)" do
+    test "longest-match across 1/2/3-char operators" do
+      assert shapes("a +++ b == c <<< d ||| e") == [
+               {:identifier, "a"},
+               {:concat_op, :+++},
+               {:identifier, "b"},
+               {:comp_op, :==},
+               {:identifier, "c"},
+               {:arrow_op, :<<<},
+               {:identifier, "d"},
+               {:or_op, :|||},
+               {:identifier, "e"}
+             ]
+    end
+
+    test "<< and >> are bitstring delimiters, but <<< wins by length" do
+      assert shapes("<<x>>") == [{:"<<", nil}, {:identifier, "x"}, {:">>", nil}]
+      assert shapes("a <<< b") == [{:identifier, "a"}, {:arrow_op, :<<<}, {:identifier, "b"}]
+    end
+
+    test "assoc, stab, pipe, range, type, match" do
+      assert shapes("=> -> |> .. :: =") == [
+               {:assoc_op, :"=>"},
+               {:stab_op, :->},
+               {:arrow_op, :|>},
+               {:range_op, :..},
+               {:type_op, :"::"},
+               {:match_op, :=}
+             ]
+    end
+
+    test "capture op vs capture int" do
+      assert shapes("&foo &1") == [{:capture_op, :&}, {:identifier, "foo"}, {:capture_int, 1}]
+    end
+
+    test "at op and percent" do
+      assert shapes("@attr %{}") == [
+               {:at_op, :@},
+               {:identifier, "attr"},
+               {:percent, nil},
+               {:"{", nil},
+               {:"}", nil}
+             ]
+    end
+  end
+
+  describe "comments are dropped (phase 2)" do
+    test "a comment runs to end of line and produces no token" do
+      assert shapes("a # trailing\nb") == [{:identifier, "a"}, {:eol, 1}, {:identifier, "b"}]
+    end
+  end
+
+  describe "layout (P2: explicit eol, no newline swallowing)" do
+    test "blank lines coalesce into one :eol carrying the count" do
+      assert shapes("a\n\n\nb") == [{:identifier, "a"}, {:eol, 3}, {:identifier, "b"}]
+    end
+
+    test "operators never carry newline counts; the :eol is a separate token" do
+      assert shapes("a +\nb") == [
+               {:identifier, "a"},
+               {:dual_op, :+},
+               {:eol, 1},
+               {:identifier, "b"}
+             ]
+    end
+  end
+
+  describe "spans (flat tuple, end-exclusive)" do
+    test "single-line spans are precise and end-exclusive" do
+      [foo, plus, bar] = tokens("foo + bar")
+      assert Token.span(foo) == {1, 1, 1, 4}
+      assert Token.span(plus) == {1, 5, 1, 6}
+      assert Token.span(bar) == {1, 7, 1, 10}
+    end
+
+    test "keyword-key span includes the colon" do
+      [kw] = tokens("foo:")
+      assert Token.span(kw) == {1, 1, 1, 5}
+    end
+
+    test "adjacency vs separation drive call decisions (consumed by parser later)" do
+      [foo, popen | _] = tokens("foo(x)")
+      assert Token.adjacent?(foo, popen)
+
+      [bar, popen2 | _] = tokens("bar (x)")
+      refute Token.adjacent?(bar, popen2)
+      assert Token.separated_on_same_line?(bar, popen2)
+    end
+
+    test "tokens after an :eol get correct line/column" do
+      [_a, _eol, b] = tokens("a\n  b")
+      assert Token.span(b) == {2, 3, 2, 4}
+    end
+  end
+
+  describe "tolerant lexing (review #2: codepoint-aware; P3: :error is the sole transport)" do
+    test "an unknown but valid UTF-8 codepoint is ONE error advancing one column" do
+      toks = tokens("a √ b")
+
+      assert [
+               {:identifier, "a"},
+               {:error, %Toxic2.LexError{code: :unexpected_char}},
+               {:identifier, "b"}
+             ] = Enum.map(toks, &{Token.kind(&1), Token.value(&1)})
+
+      [_a, err, b] = toks
+
+      assert Token.span(err) == {1, 3, 1, 4},
+             "multibyte codepoint must advance exactly one column"
+
+      assert Token.span(b) == {1, 5, 1, 6}
+    end
+
+    test "invalid UTF-8 bytes fall back to a per-byte error" do
+      {toks, []} = Toxic2.tokenize(<<?a, 0xFF, ?b>>)
+
+      assert [
+               {:identifier, "a"},
+               {:error, %Toxic2.LexError{code: :invalid_byte}},
+               {:identifier, "b"}
+             ] =
+               Enum.map(toks, &{Token.kind(&1), Token.value(&1)})
+    end
+
+    test "no separate error list: tokenize/2 always returns {tokens, warnings}" do
+      assert {[_ | _], []} = Toxic2.tokenize("a ~ b ~ c")
+    end
+
+    test "never raises on malformed input — the core tolerant-lexer contract" do
+      nasty = [
+        "0x",
+        "0x_",
+        "0o_",
+        "0b_",
+        "1_",
+        "1__2",
+        "0xF_",
+        "1.2_",
+        "1.0e",
+        "1.0e_",
+        ":",
+        ":\"x",
+        "?",
+        "?\\",
+        "~",
+        "@",
+        "&",
+        "%",
+        "::",
+        "...",
+        "\\",
+        <<0xFF, 0xFE>>,
+        "héllo@wörld",
+        "  \t\n\n  ",
+        "}{)(",
+        "fn end do"
+      ]
+
+      for src <- nasty do
+        assert {toks, []} = Toxic2.tokenize(src)
+        assert is_list(toks)
+      end
+    end
+  end
+
+  describe "batch / source-order invariants" do
+    test "empty source yields no tokens" do
+      assert tokens("") == []
+    end
+
+    test "token start positions are non-decreasing in source order" do
+      toks = tokens("foo bar\nbaz = 1\n\nqux 0xAB ?z :sym")
+      starts = Enum.map(toks, &{Token.start_line(&1), Token.start_col(&1)})
+      assert starts == Enum.sort(starts)
+    end
+  end
+end
