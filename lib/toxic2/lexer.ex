@@ -10,7 +10,10 @@ defmodule Toxic2.Lexer do
   `:string_start`, `:string_fragment` (escapes processed), `:begin_interpolation` /
   `:end_interpolation` wrapping the interpolation's ordinary tokens, and `:string_end`. The
   interpolation-closing `}` is told apart from a brace-closing `}` by a small terminator stack
-  (`st`); see the note above `lex/6`. Heredocs, charlists, and sigils are still pending.
+  (`st`); see the note above `lex/6`. The same linear shape covers **charlists** `'...'`
+  (`read_quoted`), **sigils** `~name<delim>...<delim>mods` (`read_sigil`, raw content + optional
+  interpolation, trailing modifiers on `:sigil_end`), and **heredocs** `\"""`/`'''` (`read_heredoc`,
+  line-spanning with lexical indentation stripping), including sigil heredocs.
 
   Architecture invariants this locks in:
 
@@ -174,6 +177,13 @@ defmodule Toxic2.Lexer do
     lex(rest2, line, col + 1 + drop_len, acc, w, st)
   end
 
+  # --- heredocs: `"""` / `'''` (before the single-quote clauses) ---------
+  defp lex(<<?", ?", ?", rest::binary>>, line, col, acc, w, st),
+    do: open_heredoc(rest, line, col, acc, w, st, ?")
+
+  defp lex(<<?', ?', ?', rest::binary>>, line, col, acc, w, st),
+    do: open_heredoc(rest, line, col, acc, w, st, ?')
+
   # --- quoted literals: linear form (start, fragments, interp, end) ------
   defp lex(<<?", rest::binary>>, line, col, acc, w, st) do
     start = {:string_start, line, col, line, col + 1, nil}
@@ -183,6 +193,16 @@ defmodule Toxic2.Lexer do
   defp lex(<<?', rest::binary>>, line, col, acc, w, st) do
     start = {:charlist_start, line, col, line, col + 1, nil}
     read_quoted(rest, line, col + 1, [], {line, col + 1}, [start | acc], w, st, :charlist)
+  end
+
+  # --- sigils: ~name<delim>...<delim>modifiers ---------------------------
+  defp lex(<<?~, c, _::binary>> = bin, line, col, acc, w, st)
+       when c in ?a..?z or c in ?A..?Z do
+    namelen = sigil_name(rest_at(bin, 1), 0)
+    name = binary_part(bin, 1, namelen)
+    ncol = col + 1 + namelen
+    start = {:sigil_start, line, col, line, ncol, name}
+    begin_sigil(rest_at(bin, 1 + namelen), line, ncol, [start | acc], w, st, name)
   end
 
   # --- char literals: ?\<esc> and ?<codepoint> ---------------------------
@@ -294,9 +314,9 @@ defmodule Toxic2.Lexer do
     do: cont(rest, {:"{", line, col, line, col + 1, nil}, acc, w, [:brace | st])
 
   # --- `}` ends an interpolation (resume the string) OR closes a brace ---
-  defp lex(<<?}, rest::binary>>, line, col, acc, w, [{:interp, qk} | st]) do
+  defp lex(<<?}, rest::binary>>, line, col, acc, w, [{:interp, resume} | st]) do
     token = {:end_interpolation, line, col, line, col + 1, nil}
-    read_quoted(rest, line, col + 1, [], {line, col + 1}, [token | acc], w, st, qk)
+    resume_interp(resume, rest, line, col + 1, [token | acc], w, st)
   end
 
   defp lex(<<?}, rest::binary>>, line, col, acc, w, [:brace | st]),
@@ -410,7 +430,7 @@ defmodule Toxic2.Lexer do
   defp read_quoted(<<?#, ?{, rest::binary>>, line, col, buf, fs, acc, w, st, qk) do
     acc = flush_fragment(buf, fs, line, col, acc, frag_kind(qk))
     acc = [{:begin_interpolation, line, col, line, col + 2, nil} | acc]
-    lex(rest, line, col + 2, acc, w, [{:interp, qk} | st])
+    lex(rest, line, col + 2, acc, w, [{:interp, {:quoted, qk}} | st])
   end
 
   defp read_quoted(<<?\n, _::binary>> = rest, line, col, buf, fs, acc, w, st, qk) do
@@ -447,6 +467,282 @@ defmodule Toxic2.Lexer do
   defp frag_kind(:charlist), do: :charlist_fragment
   defp end_kind(:dquote), do: :string_end
   defp end_kind(:charlist), do: :charlist_end
+
+  # An interpolation's matching `}` resumes whatever literal it opened inside (P3: one scanner).
+  defp resume_interp({:quoted, qk}, rest, line, col, acc, w, st),
+    do: read_quoted(rest, line, col, [], {line, col}, acc, w, st, qk)
+
+  defp resume_interp({:sigil, sm}, rest, line, col, acc, w, st),
+    do: read_sigil(rest, line, col, [], {line, col}, acc, w, st, sm)
+
+  defp resume_interp({:heredoc, hc}, rest, line, col, acc, w, st),
+    do: read_heredoc(rest, line, col, [], {line, col}, acc, w, st, hc)
+
+  # --- sigils (phase 10): ~name<delim>content<delim>modifiers ------------
+  # Unlike `"`/`'`, sigil content is kept RAW at parse time (the sigil macro unescapes later); the
+  # ONLY parse-time rewrites are `\<close>` → the delimiter, and — for a lowercase-named sigil —
+  # `#{...}` interpolation. Paired delimiters do NOT nest (first unescaped close ends it). The
+  # opener token (`:sigil_start`, value = name) is emitted in `lex`; `:sigil_end` carries the
+  # trailing modifier letters (value = binary). `sm = {close_char, interp?}`.
+
+  # `\<close>` → literal delimiter (drop the backslash).
+  defp read_sigil(<<?\\, c, rest::binary>>, line, col, buf, fs, acc, w, st, {close, _} = sm)
+       when c == close,
+       do: read_sigil(rest, line, col + 2, [<<c::utf8>> | buf], fs, acc, w, st, sm)
+
+  # any other `\x` is kept verbatim (no parse-time unescape for sigils).
+  defp read_sigil(<<?\\, c, rest::binary>>, line, col, buf, fs, acc, w, st, sm),
+    do: read_sigil(rest, line, col + 2, [<<c::utf8>>, <<?\\>> | buf], fs, acc, w, st, sm)
+
+  # interpolation, lowercase sigils only.
+  defp read_sigil(<<?#, ?{, rest::binary>>, line, col, buf, fs, acc, w, st, {_close, true} = sm) do
+    acc = flush_fragment(buf, fs, line, col, acc, :string_fragment)
+    acc = [{:begin_interpolation, line, col, line, col + 2, nil} | acc]
+    lex(rest, line, col + 2, acc, w, [{:interp, {:sigil, sm}} | st])
+  end
+
+  # newlines are literal content (non-heredoc sigils may span lines).
+  defp read_sigil(<<?\n, rest::binary>>, line, _col, buf, fs, acc, w, st, sm),
+    do: read_sigil(rest, line + 1, 1, [<<?\n>> | buf], fs, acc, w, st, sm)
+
+  defp read_sigil(<<>>, line, col, buf, fs, acc, w, _st, _sm) do
+    acc = flush_fragment(buf, fs, line, col, acc, :string_fragment)
+    err = {:error, line, col, line, col, LexError.new(:sigil_missing_terminator, %{})}
+    {[{:sigil_end, line, col, line, col, ""}, err | acc], w}
+  end
+
+  defp read_sigil(<<c::utf8, rest::binary>>, line, col, buf, fs, acc, w, st, {close, _} = sm) do
+    if c == close do
+      acc = flush_fragment(buf, fs, line, col, acc, :string_fragment)
+      {mlen, after_mods} = take_while(rest, 0, &mod_char?/1)
+      mods = binary_part(rest, 0, mlen)
+      acc = [{:sigil_end, line, col, line, col + 1 + mlen, mods} | acc]
+      lex(after_mods, line, col + 1 + mlen, acc, w, st)
+    else
+      read_sigil(rest, line, col + 1, [<<c::utf8>> | buf], fs, acc, w, st, sm)
+    end
+  end
+
+  defp read_sigil(<<byte, rest::binary>>, line, col, buf, fs, acc, w, st, sm),
+    do: read_sigil(rest, line, col + 1, [<<byte>> | buf], fs, acc, w, st, sm)
+
+  defp mod_char?(c), do: c in ?a..?z or c in ?A..?Z or c in ?0..?9
+
+  # A sigil name is the run of letters/digits after `~` (single lowercase, or one-or-more
+  # uppercase — the oracle judges validity; we just measure the run). Returns its length.
+  defp sigil_name(<<c, rest::binary>>, n) when c in ?a..?z or c in ?A..?Z or c in ?0..?9,
+    do: sigil_name(rest, n + 1)
+
+  defp sigil_name(_bin, n), do: n
+
+  # An uppercase-named sigil is "raw" (no interpolation); a lowercase-named one interpolates.
+  defp sigil_interp?(<<c, _::binary>>) when c in ?A..?Z, do: false
+  defp sigil_interp?(_name), do: true
+
+  defp sigil_close(?(), do: ?)
+  defp sigil_close(?[), do: ?]
+  defp sigil_close(?{), do: ?}
+  defp sigil_close(?<), do: ?>
+  defp sigil_close(c), do: c
+
+  # The delimiter follows the name. A triple `"`/`'` is a sigil heredoc (shares `read_heredoc`,
+  # raw mode); a single paired/char delimiter is an ordinary sigil; anything else is a tolerant
+  # error. The `:sigil_start` opener is already on `acc`.
+  defp begin_sigil(<<a, b, c, rest::binary>>, line, col, acc, w, st, name)
+       when a in [?", ?'] and a == b and b == c do
+    spec = {a, :raw, sigil_interp?(name), :sigil_end}
+    heredoc_body(rest, line, col + 3, acc, w, st, spec)
+  end
+
+  defp begin_sigil(<<d, rest::binary>>, line, col, acc, w, st, name)
+       when d in [?(, ?[, ?{, ?<, ?/, ?|, ?", ?'] do
+    read_sigil(
+      rest,
+      line,
+      col + 1,
+      [],
+      {line, col + 1},
+      acc,
+      w,
+      st,
+      {sigil_close(d), sigil_interp?(name)}
+    )
+  end
+
+  defp begin_sigil(other, line, col, acc, w, st, _name) do
+    err = {:error, line, col, line, col, LexError.new(:invalid_sigil_delimiter, %{})}
+    lex(other, line, col, [err | acc], w, st)
+  end
+
+  # --- heredocs (phase 10): triple-quoted, indentation-stripped ----------
+  # `read_heredoc` scans a `"""` / `'''` body emitting the SAME linear tokens as a string/charlist
+  # (so lowering is shared). `hc = {delim_char, mode, interp?, strip, end_kind}`: `mode` is
+  # `:full` (unescape via @char_escapes, like a string) or `:raw` (keep verbatim, for uppercase
+  # sigil heredocs); `strip` is the closing delimiter's indentation, removed from each line's
+  # start. The opener and `strip` are computed in `open_heredoc`. A line `\s*<delim>x3` terminates.
+  defp read_heredoc(
+         <<?\\, e, rest::binary>>,
+         line,
+         col,
+         buf,
+         fs,
+         acc,
+         w,
+         st,
+         {_d, :full, _i, _s, _ek} = hc
+       ) do
+    cp = Map.get(@char_escapes, e, e)
+    read_heredoc(rest, line, col + 2, [<<cp::utf8>> | buf], fs, acc, w, st, hc)
+  end
+
+  defp read_heredoc(
+         <<?#, ?{, rest::binary>>,
+         line,
+         col,
+         buf,
+         fs,
+         acc,
+         w,
+         st,
+         {_d, _m, true, _s, ek} = hc
+       ) do
+    acc = flush_fragment(buf, fs, line, col, acc, frag_of(ek))
+    acc = [{:begin_interpolation, line, col, line, col + 2, nil} | acc]
+    lex(rest, line, col + 2, acc, w, [{:interp, {:heredoc, hc}} | st])
+  end
+
+  defp read_heredoc(<<?\n, rest::binary>>, line, _col, buf, fs, acc, w, st, hc),
+    do: heredoc_line_start(rest, line + 1, [<<?\n>> | buf], fs, acc, w, st, hc)
+
+  defp read_heredoc(<<>>, line, col, buf, fs, acc, w, _st, {_d, _m, _i, _s, ek}) do
+    acc = flush_fragment(buf, fs, line, col, acc, frag_of(ek))
+    err = {:error, line, col, line, col, LexError.new(:heredoc_missing_terminator, %{})}
+    {[{ek, line, col, line, col, nil}, err | acc], w}
+  end
+
+  defp read_heredoc(<<c::utf8, rest::binary>>, line, col, buf, fs, acc, w, st, hc),
+    do: read_heredoc(rest, line, col + 1, [<<c::utf8>> | buf], fs, acc, w, st, hc)
+
+  defp read_heredoc(<<byte, rest::binary>>, line, col, buf, fs, acc, w, st, hc),
+    do: read_heredoc(rest, line, col + 1, [<<byte>> | buf], fs, acc, w, st, hc)
+
+  # At the start of a body line: the terminator ends the heredoc, otherwise strip the (shared)
+  # indentation and keep scanning. Shared by the opener (first line) and the `\n` clause.
+  defp heredoc_line_start(rest, line, buf, fs, acc, w, st, {d, _m, _i, strip, _ek} = hc) do
+    if heredoc_terminator?(rest, d) do
+      heredoc_close(rest, line, buf, fs, acc, w, st, hc)
+    else
+      {dropped, rest2} = drop_indent(rest, strip)
+      read_heredoc(rest2, line, 1 + dropped, buf, fs, acc, w, st, hc)
+    end
+  end
+
+  # The closer is `\s*<delim>x3` at the start of a line; consume it and emit the end token.
+  defp heredoc_close(rest, line, buf, fs, acc, w, st, {_d, _m, _i, _strip, ek}) do
+    {ws, rest2} = take_while(rest, 0, &(&1 in [?\s, ?\t]))
+    <<_::binary-size(3), rest3::binary>> = rest2
+    col = 1 + ws
+    acc = flush_fragment(buf, fs, line, col, acc, frag_of(ek))
+    {mlen, after_mods, mods} = heredoc_mods(ek, rest3)
+    acc = [{ek, line, col, line, col + 3 + mlen, mods} | acc]
+    lex(after_mods, line, col + 3 + mlen, acc, w, st)
+  end
+
+  # Only a sigil heredoc takes trailing modifier letters after the closing `"""`.
+  defp heredoc_mods(:sigil_end, rest) do
+    {mlen, after_mods} = take_while(rest, 0, &mod_char?/1)
+    {mlen, after_mods, binary_part(rest, 0, mlen)}
+  end
+
+  defp heredoc_mods(_ek, rest), do: {0, rest, nil}
+
+  # A line is the terminator when, after its indentation, it begins with the delimiter*3.
+  defp heredoc_terminator?(line_rest, d) do
+    {_ws, after_ws} = take_while(line_rest, 0, &(&1 in [?\s, ?\t]))
+    heredoc_delim3?(after_ws, d)
+  end
+
+  defp heredoc_delim3?(<<a, b, c, _::binary>>, d), do: a == d and b == d and c == d
+  defp heredoc_delim3?(<<a, b, c>>, d), do: a == d and b == d and c == d
+  defp heredoc_delim3?(_bin, _d), do: false
+
+  # Drop up to `n` leading spaces/tabs; returns {dropped_count, rest}.
+  defp drop_indent(bin, n), do: drop_indent(bin, n, 0)
+
+  defp drop_indent(<<c, rest::binary>>, n, k) when n > 0 and c in [?\s, ?\t],
+    do: drop_indent(rest, n - 1, k + 1)
+
+  defp drop_indent(bin, _n, k), do: {k, bin}
+
+  # A bare `"""` / `'''` heredoc: emit the opener, then open the body. `spec = {delim, mode,
+  # interp?, end_kind}` (sigil heredocs reuse `heredoc_body` with a `:sigil_end` spec).
+  defp open_heredoc(rest, line, col, acc, w, st, ?") do
+    start = {:string_start, line, col, line, col + 3, nil}
+    heredoc_body(rest, line, col + 3, [start | acc], w, st, {?", :full, true, :string_end})
+  end
+
+  defp open_heredoc(rest, line, col, acc, w, st, ?') do
+    start = {:charlist_start, line, col, line, col + 3, nil}
+    heredoc_body(rest, line, col + 3, [start | acc], w, st, {?', :full, true, :charlist_end})
+  end
+
+  # Consume the rest of the opening line (only whitespace allowed before the newline), pre-scan the
+  # body for the closing delimiter's indentation (`strip`), and begin. The opener token is already
+  # on `acc`; `col` is just past the opening `"""`.
+  defp heredoc_body(rest, line, col, acc, w, st, {delim, mode, interp?, end_kind} = spec) do
+    {ows, after_ws} = take_while(rest, 0, &(&1 in [?\s, ?\t]))
+
+    case after_ws do
+      <<?\r, ?\n, body::binary>> ->
+        heredoc_start_body(body, line, acc, w, st, spec)
+
+      <<?\n, body::binary>> ->
+        heredoc_start_body(body, line, acc, w, st, spec)
+
+      _ ->
+        # content on the opening line is invalid — tolerant: flag it, scan from here, strip 0.
+        err = {:error, line, col, line, col, LexError.new(:heredoc_start_line, %{})}
+        hc = {delim, mode, interp?, 0, end_kind}
+        read_heredoc(rest, line, col + ows, [], {line, col}, [err | acc], w, st, hc)
+    end
+  end
+
+  defp heredoc_start_body(body, line, acc, w, st, {delim, mode, interp?, end_kind}) do
+    strip = heredoc_indent(body, delim, 0)
+    hc = {delim, mode, interp?, strip, end_kind}
+    heredoc_line_start(body, line + 1, [], {line + 1, 1}, acc, w, st, hc)
+  end
+
+  # Pre-scan the body for the closing delimiter's indentation. `depth` tracks `#{...}` nesting so a
+  # `"""` inside an interpolation isn't mistaken for the terminator. Returns 0 if none is found.
+  defp heredoc_indent(bin, delim, depth) do
+    {ws, after_ws} = take_while(bin, 0, &(&1 in [?\s, ?\t]))
+
+    cond do
+      depth == 0 and heredoc_delim3?(after_ws, delim) -> ws
+      true -> heredoc_indent_skip(after_ws, delim, depth)
+    end
+  end
+
+  defp heredoc_indent_skip(bin, delim, depth) do
+    case skip_to_eol(bin, depth) do
+      :eof -> 0
+      {rest, depth2} -> heredoc_indent(rest, delim, depth2)
+    end
+  end
+
+  # Scan to the next newline (consumed), tracking `#{`/brace depth and skipping escaped chars.
+  defp skip_to_eol(<<>>, _depth), do: :eof
+  defp skip_to_eol(<<?\n, rest::binary>>, depth), do: {rest, depth}
+  defp skip_to_eol(<<?\\, _c, rest::binary>>, depth), do: skip_to_eol(rest, depth)
+  defp skip_to_eol(<<?#, ?{, rest::binary>>, depth), do: skip_to_eol(rest, depth + 1)
+  defp skip_to_eol(<<?{, rest::binary>>, depth) when depth > 0, do: skip_to_eol(rest, depth + 1)
+  defp skip_to_eol(<<?}, rest::binary>>, depth) when depth > 0, do: skip_to_eol(rest, depth - 1)
+  defp skip_to_eol(<<_c, rest::binary>>, depth), do: skip_to_eol(rest, depth)
+
+  defp frag_of(:string_end), do: :string_fragment
+  defp frag_of(:charlist_end), do: :charlist_fragment
+  defp frag_of(:sigil_end), do: :string_fragment
 
   # A fragment token is emitted only for a non-empty run, spanning `fs`..(el, ec).
   defp flush_fragment([], _fs, _el, _ec, acc, _kind), do: acc

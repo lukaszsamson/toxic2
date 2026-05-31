@@ -445,6 +445,45 @@ defmodule Toxic2.ParserTest do
       assert {{:., _, [List, :to_charlist]}, _,
               [["a", {{:., _, [Kernel, :to_string]}, _, [{:b, _, nil}]}, "c"]]} = ast
     end
+
+    test "sigils: name, content <<>>, and modifier charlist" do
+      {_view, [s], []} = exprs("~r/foo/i")
+      assert CST.node_kind(s) == :sigil
+
+      assert {:sigil_r, _, [{:<<>>, _, ["foo"]}, ~c"i"]} =
+               elem(Toxic2.parse_to_ast("~r/foo/i"), 0)
+
+      assert {:sigil_w, _, [{:<<>>, _, ["a b c"]}, ~c"a"]} =
+               elem(Toxic2.parse_to_ast("~w(a b c)a"), 0)
+
+      assert {:sigil_s, _, [{:<<>>, _, [""]}, []]} = elem(Toxic2.parse_to_ast("~s()"), 0)
+
+      # uppercase sigils are raw: no escape/interpolation processing at parse time
+      assert {:sigil_S, _, [{:<<>>, _, ["raw\#{x}"]}, []]} =
+               elem(Toxic2.parse_to_ast("~S(raw\#{x})"), 0)
+
+      # lowercase sigils interpolate
+      assert {:sigil_s, _, [{:<<>>, _, ["a", {:"::", _, _}]}, []]} =
+               elem(Toxic2.parse_to_ast("~s(a\#{b})"), 0)
+    end
+
+    test "heredocs: indentation stripped, lowering shared with strings/charlists" do
+      assert {"hello\n", []} = Toxic2.parse_to_ast("\"\"\"\nhello\n\"\"\"")
+      assert {"a\nb\n", []} = Toxic2.parse_to_ast("\"\"\"\n  a\n  b\n  \"\"\"")
+      # a charlist heredoc uses ''' ; ~c""" is a sigil heredoc (:sigil_c)
+      assert {~c"c\n", _} = Toxic2.parse_to_ast("'''\nc\n'''")
+
+      assert {{:sigil_c, _, [{:<<>>, _, ["c\n"]}, []]}, _} =
+               Toxic2.parse_to_ast("~c\"\"\"\nc\n\"\"\"")
+
+      {ast, []} = Toxic2.parse_to_ast("\"\"\"\nx\#{y}z\n\"\"\"")
+      assert {:<<>>, _, ["x", {:"::", _, _}, "z\n"]} = ast
+    end
+
+    test "an unterminated heredoc does not crash and reports one error" do
+      {_ast, diags} = Toxic2.parse_to_ast("\"\"\"\nno end here\n")
+      assert Enum.any?(diags, &(elem(&1, 3) == :heredoc_missing_terminator))
+    end
   end
 
   describe "not in (lowering rewrite + deprecation)" do

@@ -149,6 +149,9 @@ defmodule Toxic2.Lower do
   defp lower_kind(:charlist, ch, _cst, view, opts, acc, nid),
     do: lower_charlist(ch, view, opts, acc, nid)
 
+  defp lower_kind(:sigil, ch, _cst, view, opts, acc, nid),
+    do: lower_sigil(ch, view, opts, acc, nid)
+
   # An interpolation's inner is a block (`#{a; b}` → `{:__block__, ...}`, `#{a}` → `a`).
   defp lower_kind(:interp, ch, _cst, view, opts, acc, nid),
     do: lower_block(ch, view, opts, acc, nid)
@@ -229,6 +232,60 @@ defmodule Toxic2.Lower do
 
   defp charlist_segment({:frag, bin}), do: bin
   defp charlist_segment({:interp, ast}), do: {{:., [], [Kernel, :to_string]}, [], [ast]}
+
+  # A sigil → `{:"sigil_<name>", [], [{:<<>>, [], segs}, modifier_charlist]}`. Content segments are
+  # like a string's (the sigil macro does any further unescaping at expansion); the name atom
+  # respects the atom policy. children = [start_leaf | parts... | end_leaf].
+  defp lower_sigil([start_leaf | rest], view, opts, acc, nid) do
+    name = Tokens.value(view, CST.token_index(start_leaf))
+    {part_children, mods} = sigil_split(rest, view)
+    {parts, acc, nid} = quoted_parts_ast(part_children, view, opts, acc, nid)
+    build_sigil(name, parts, mods, start_leaf, view, opts, acc, nid)
+  end
+
+  # The modifiers live on the trailing `:sigil_end` leaf (last child), if the run closed.
+  defp sigil_split([], _view), do: {[], ""}
+
+  defp sigil_split(children, view) do
+    [last | rev] = :lists.reverse(children)
+
+    case last do
+      {:token, idx, _f, _d} ->
+        if Tokens.kind(view, idx) == :sigil_end,
+          do: {:lists.reverse(rev), Tokens.value(view, idx) || ""},
+          else: {children, ""}
+
+      _ ->
+        {children, ""}
+    end
+  end
+
+  defp build_sigil(name, parts, mods, start_leaf, view, opts, acc, nid) do
+    case to_atom("sigil_" <> name, opts) do
+      {:ok, atom} ->
+        {{atom, [], [{:<<>>, [], sigil_segments(parts)}, String.to_charlist(mods)]}, acc, nid}
+
+      :error ->
+        {id, acc, nid} =
+          Diagnostics.emit(
+            acc,
+            nid,
+            :lowerer,
+            :error,
+            :nonexistent_atom,
+            name_span(start_leaf, view),
+            %{
+              name: "sigil_" <> name
+            }
+          )
+
+        {{:__error__, error_meta(start_leaf, view), %{diag_ids: [id]}}, acc, nid}
+    end
+  end
+
+  # A sigil's `<<>>` always has at least one (possibly empty) binary segment (`~s()` → [""]).
+  defp sigil_segments([]), do: [""]
+  defp sigil_segments(parts), do: Enum.map(parts, &string_segment/1)
 
   defp lower_block([], _view, _opts, acc, nid), do: {{:__block__, [], []}, acc, nid}
   defp lower_block([only], view, opts, acc, nid), do: lower(only, view, opts, acc, nid)

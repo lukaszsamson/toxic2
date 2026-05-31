@@ -551,8 +551,48 @@ defmodule Toxic2.Parser do
   defp parse_primary(:charlist_start, t, i, _ctx, diags, nid, fuel),
     do: parse_quoted(t, i, :charlist, diags, nid, fuel)
 
+  defp parse_primary(:sigil_start, t, i, _ctx, diags, nid, fuel),
+    do: parse_sigil(t, i, diags, nid, fuel)
+
   defp parse_primary(_kind, t, i, _ctx, diags, nid, fuel),
     do: parse_unexpected(t, i, diags, nid, fuel)
+
+  # A sigil is `:sigil_start <part>* :sigil_end`. The CST `:sigil` node keeps the start leaf
+  # (carries the name), the parts (fragments / interpolations), and the end leaf (carries the
+  # trailing modifiers) — lowering reads name + modifiers from those leaves.
+  defp parse_sigil(t, start_i, diags, nid, fuel) do
+    {children, j, diags, nid, fuel} =
+      sigil_parts(t, start_i + 1, [CST.token(start_i)], diags, nid, fuel)
+
+    span = merge(tok_span(t, start_i), tok_span(t, j - 1))
+    {CST.node(:sigil, span, children, :matched, nil), j, diags, nid, fuel}
+  end
+
+  defp sigil_parts(t, i, acc, diags, nid, fuel) do
+    cond do
+      fuel <= 0 -> {:lists.reverse(acc), i, diags, nid, fuel}
+      true -> sigil_part(Tokens.kind(t, i), t, i, acc, diags, nid, fuel)
+    end
+  end
+
+  defp sigil_part(:string_fragment, t, i, acc, diags, nid, fuel),
+    do: sigil_parts(t, i + 1, [CST.token(i) | acc], diags, nid, fuel)
+
+  defp sigil_part(:begin_interpolation, t, i, acc, diags, nid, fuel) do
+    {interp, j, diags, nid, fuel} = parse_interp(t, i, diags, nid, fuel)
+    sigil_parts(t, j, [interp | acc], diags, nid, fuel)
+  end
+
+  defp sigil_part(:sigil_end, _t, i, acc, diags, nid, fuel),
+    do: {:lists.reverse([CST.token(i) | acc]), i + 1, diags, nid, fuel}
+
+  defp sigil_part(:error, t, i, acc, diags, nid, fuel) do
+    {id, diags, nid} = emit_lex_error(t, i, diags, nid)
+    sigil_parts(t, i + 1, [CST.token(i, error: true, diag: id) | acc], diags, nid, fuel)
+  end
+
+  defp sigil_part(_other, _t, i, acc, diags, nid, fuel),
+    do: {:lists.reverse(acc), i, diags, nid, fuel}
 
   # --- strings / charlists / interpolation -------------------------------
 

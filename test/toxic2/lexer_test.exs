@@ -369,6 +369,35 @@ defmodule Toxic2.LexerTest do
                shapes(~S("abc))
     end
 
+    test "sigils: name on :sigil_start, modifiers on :sigil_end, raw content" do
+      assert shapes("~r/foo/i") == [
+               {:sigil_start, "r"},
+               {:string_fragment, "foo"},
+               {:sigil_end, "i"}
+             ]
+
+      # uppercase sigil keeps `#{` literal (no interpolation tokens)
+      assert shapes("~S(a\#{b})") == [
+               {:sigil_start, "S"},
+               {:string_fragment, "a\#{b}"},
+               {:sigil_end, ""}
+             ]
+    end
+
+    test "heredocs strip the closing delimiter's indentation (lexically)" do
+      assert shapes("\"\"\"\n  a\n  b\n  \"\"\"") == [
+               {:string_start, nil},
+               {:string_fragment, "a\nb\n"},
+               {:string_end, nil}
+             ]
+    end
+
+    test "a `}` inside a heredoc interpolation does not terminate the heredoc early" do
+      kinds = "\"\"\"\n#{"x\#{ %{a: 1} }y"}\n\"\"\"" |> tokens() |> Enum.map(&Token.kind/1)
+      assert :string_start == hd(kinds)
+      assert :string_end == List.last(kinds)
+    end
+
     test "charlists share the linear form with charlist_* token kinds" do
       assert shapes(~S('ab')) == [
                {:charlist_start, nil},

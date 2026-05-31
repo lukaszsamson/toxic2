@@ -540,19 +540,24 @@ phase 6 onward each phase also ends green under `toxic2.conformance --gate` and 
 7. Containers + calls.
 8. No-parens call families with expression-class flags.
 9. Blocks, stabs, control-flow, `do` attachment.
-10. Strings, sigils, heredocs, interpolation. **(in progress — double-quoted strings WITH
-    interpolation done. Lexer emits the linear form `:string_start` / `:string_fragment` (escapes
-    processed) / `:begin_interpolation` … `:end_interpolation` / `:string_end`; a small
-    terminator stack (`:brace` / `:interp`) in `lex` tells an interpolation-closing `}` apart from
-    a brace-closing one, so nested braces/strings/interpolations lex correctly. Parser builds a
-    `:string` node (fragment leaves + `:interp` block nodes); lowering yields a bare binary when
-    there's no interpolation, else the `{:<<>>, [], [..., {:"::", _, [{{:., _, [Kernel,
-    :to_string]}, _, [expr]}, {:binary, _, nil}]}, ...]}` form. Unterminated strings are one
-    `:error` + synthetic `:string_end` (no crash). Charlists `'...'` reuse the same scanner
-    (`read_quoted` parameterised by quote kind; `:charlist_start` / `:charlist_fragment` /
-    `:charlist_end`) and lower to a literal codepoint list when there's no interpolation, else
-    `{{:., _, [List, :to_charlist]}, _, [[...]]}` with bare `Kernel.to_string` segments (no
-    `::binary`). Next slices: heredocs, sigils.)**
+10. Strings, sigils, heredocs, interpolation. **(DONE. Lexer emits the linear form `:string_start`
+    / `:string_fragment` (escapes processed) / `:begin_interpolation` … `:end_interpolation` /
+    `:string_end`; a small terminator stack (`:brace` / `{:interp, resume}`) in `lex` tells an
+    interpolation-closing `}` apart from a brace-closing one, so nested braces/strings/
+    interpolations lex correctly. Parser builds a `:string` node (fragment leaves + `:interp` block
+    nodes); lowering yields a bare binary when there's no interpolation, else the `{:<<>>, [],
+    [..., {:"::", _, [{{:., _, [Kernel, :to_string]}, _, [expr]}, {:binary, _, nil}]}, ...]}` form.
+    Unterminated strings are one `:error` + synthetic `:string_end` (no crash). **Charlists**
+    `'...'` reuse the scanner (`read_quoted` keyed by quote kind) → literal codepoint list, or
+    `{{:., _, [List, :to_charlist]}, _, [[...]]}` with bare `Kernel.to_string` segments.
+    **Sigils** `~name<delim>…<delim>mods` (`read_sigil`): delimiters `()[]{}<>` `/` `|` `"` `'`
+    (no nesting); content kept RAW (only `\<close>` and — for lowercase names — interpolation are
+    processed at parse time, the macro unescapes later); uppercase names are raw/non-interpolating;
+    trailing modifiers → a charlist; lowers to `{:"sigil_<name>", [], [{:<<>>, _, segs}, mods]}`
+    (name atom via the atom policy). **Heredocs** `"""` / `'''` (`read_heredoc`): line-spanning,
+    indentation stripped lexically against the closing delimiter's column (pre-scanned, skipping
+    `#{…}`), sharing string/charlist lowering; sigil heredocs (`~s"""…"""`) reuse it in raw mode
+    with `:sigil_end` modifiers. All verified against the live oracle.)**
 11. Parser-only recovery + invalid-code property harness.
 12. Port old property failures as permanent fixtures.
 13. Benchmark; remove hot-path allocations before broadening features.
