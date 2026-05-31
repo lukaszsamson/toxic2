@@ -501,6 +501,37 @@ defmodule Toxic2.ParserTest do
     end
   end
 
+  describe "& capture (phase: access_expr island)" do
+    test "&N capture argument lowers to {:&, _, [N]}" do
+      assert {{:&, _, [1]}, []} = Toxic2.parse_to_ast("&1")
+      assert {{:&, _, [0]}, []} = Toxic2.parse_to_ast("&0")
+    end
+
+    test "&expr captures the whole following expression (prec 90)" do
+      # `&` grabs across `+` (210) but a capture-int operand is atomic
+      assert {{:&, _, [{:+, _, [{:&, _, [1]}, {:&, _, [2]}]}]}, []} =
+               Toxic2.parse_to_ast("& &1 + &2")
+
+      # ...and across `|>` (160)
+      assert {{:&, _, [{:|>, _, [{:/, _, [{:abs, _, nil}, 1]}, {:foo, _, nil}]}]}, []} =
+               Toxic2.parse_to_ast("&abs/1 |> foo")
+    end
+
+    test "function captures name/arity" do
+      assert {{:&, _, [{:/, _, [{:foo, _, nil}, 1]}]}, []} = Toxic2.parse_to_ast("&foo/1")
+
+      assert {{:&, _, [{:/, _, [{{:., _, [{:__aliases__, _, [:Mod]}, :fun]}, _, []}, 2]}]}, []} =
+               Toxic2.parse_to_ast("&Mod.fun/2")
+    end
+
+    test "& as a call/container arg, and `|` binds looser than capture" do
+      assert {{:f, _, [{:&, _, [1]}]}, []} = Toxic2.parse_to_ast("f(&1)")
+      # `|` (70) < capture (90): NOT captured -> (&x) | y
+      assert {{:|, _, [{:&, _, [{:x, _, nil}]}, {:y, _, nil}]}, []} =
+               Toxic2.parse_to_ast("&x | y")
+    end
+  end
+
   describe "not in (lowering rewrite + deprecation)" do
     test "`not a in b` rewrites to not(a in b) with a deprecation warning" do
       {ast, diags} = Toxic2.parse_to_ast("not a in b")

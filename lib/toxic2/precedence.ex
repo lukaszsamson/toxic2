@@ -48,7 +48,11 @@ defmodule Toxic2.Precedence do
 
   # Prefix (nud) operators: family => operand binding power. `dual_op` (`+`/`-`) is unary here
   # (300), infix elsewhere (210) — the parser picks by position, no lexer deferral (P2).
-  @prefix %{unary_op: 300, at_op: 320, dual_op: 300}
+  # `capture_op` (`&`) is a LOW-precedence prefix (90): `&` grabs the whole following expression
+  # down to precedence 90, so `& &1 + &2` => `&(&1 + &2)` and `&foo/1 |> g` => `&(foo/1 |> g)`,
+  # while `|` (70) / `::` (60) / `when` (50) bind looser and are NOT captured. The `:unary_op` it
+  # builds lowers to `{:&, _, [operand]}`; `&N` is the atomic `:capture_int` leaf.
+  @prefix %{unary_op: 300, at_op: 320, dual_op: 300, capture_op: 90}
 
   @doc "Infix `{precedence, associativity}` for a family, or `nil` if it is not a led operator."
   @spec infix(atom()) :: {pos_integer(), assoc()} | nil

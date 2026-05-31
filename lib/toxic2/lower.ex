@@ -49,6 +49,8 @@ defmodule Toxic2.Lower do
       :flt -> {val, acc, nid}
       :char -> {val, acc, nid}
       :literal -> {val, acc, nid}
+      # `&N` (capture argument): the whole token is the capture `{:&, _, [N]}` (see Precedence).
+      :capture_int -> {{:&, meta, [val]}, acc, nid}
       :atom -> atomize(cst, view, opts, acc, nid, val, & &1)
       :identifier -> atomize(cst, view, opts, acc, nid, val, &{&1, meta, nil})
       :alias -> atomize(cst, view, opts, acc, nid, val, &{:__aliases__, meta, [&1]})

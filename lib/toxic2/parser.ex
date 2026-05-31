@@ -35,15 +35,19 @@ defmodule Toxic2.Parser do
   (`else`/`catch`/`rescue`/`after`), and statement-or-stab-clause bodies. The do-block attaches to
   the outer call (`foo bar do end` => `foo(bar, do: ...)`).
 
-  Not yet handled (later phases): strings/sigils, `&` capture, multi-statement parens.
-  Encountering those yields error/leaf nodes rather than crashing.
+  Also: **`&` capture** — `&N` (the atomic `:capture_int` leaf → `{:&, _, [N]}`) and `&<expr>`
+  (a low-precedence unary, family `capture_op` at 90 → `{:&, _, [operand]}`), so `&foo/1`,
+  `&Mod.fun/2`, `&(&1 + &2)` work.
+
+  Not yet handled (later islands): multi-statement parens, chained calls `f()()`, the
+  `Foo.{A, B}` dot-tuple. Encountering those yields error/leaf nodes rather than crashing.
   """
 
   alias Toxic2.{CST, Diagnostics, LexError, Precedence, Tokens}
 
   @fuel_base 1_000
 
-  @atomic_kinds [:int, :flt, :char, :atom, :literal, :identifier]
+  @atomic_kinds [:int, :flt, :char, :atom, :literal, :identifier, :capture_int]
 
   # A map key / update base is parsed stopping before `|` (pipe_op 70) so the update separator
   # isn't swallowed as a binary operator.
@@ -281,6 +285,7 @@ defmodule Toxic2.Parser do
       :percent,
       :at_op,
       :capture_op,
+      :capture_int,
       :unary_op,
       :kw_identifier
     ]
