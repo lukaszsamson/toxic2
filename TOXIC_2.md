@@ -423,19 +423,32 @@ Tags/buckets = `:lexer` `:layout` `:operator` `:no_parens` `:do_block` `:stab` `
 
 ### Imported backlog corpora (a second, opt-in ratchet)
 
-Beyond the small hand-curated corpus (which must always be 100% green), ~2400 inputs are imported
-from the prior projects' suites — `toxic_parser/test/conformance_test.exs` (parser) and
-`toxic/test/toxic/valid_code_test.exs` (lexer) — via `scripts/import_corpus.exs` into
-`test/support/imported_*_corpus.ex`. Only the **input strings** are imported (tagged by their
-`describe` group); the suites' own expectations (metadata-rich AST / exact `:elixir_tokenizer`
-tuples) are NOT Toxic2's contract — the live oracle is the arbiter. `mix
-toxic2.conformance.imported [--lexer] [--bucket … | --gate | --update-freeze]` runs them as a
+Beyond the small hand-curated corpus (which must always be 100% green), thousands of inputs are
+imported from the prior projects' suites via `scripts/import_corpus.exs` into
+`test/support/imported_*_corpus.ex`. Only the **input strings** are imported (tagged by source
+suite + `describe` group); the suites' own expectations (metadata-rich AST / exact
+`:elixir_tokenizer` tuples) are NOT Toxic2's contract — the live oracle is the arbiter. Sources:
+
+- **parser** (4611) — `conformance_test.exs`, `conformance_large_test.exs`, `operators_test.exs`,
+  `elixir_source_repros_test.exs` (harvesting `assert_conforms(LIT)` args and `code = LIT`
+  assignments), plus a replicated bounded **systematic operator-precedence matrix** (the upstream
+  suite builds those by runtime interpolation, so they can't be harvested as literals).
+- **lexer** (743) — `valid_code_test.exs` `tokenize(LIT)` inputs.
+
+`mix toxic2.conformance.imported [--lexer] [--bucket … | --gate | --update-freeze]` runs them as a
 **report-only backlog ratchet** with its own freezes (`imported_freeze_{parser,lexer}.json`),
 deliberately kept OUT of `mix toxic2.check` so the curated gate never thrashes. The lexer track
 asserts a *lexer-clean* invariant (oracle-accepted source ⇒ no `:error` token, source-ordered),
 not token-stream parity. Opt-in: `mix test --include imported` / `mix toxic2.check.imported`.
-First snapshot: parser 803/1653, lexer 633/743 green — the backlog (e.g. `access_expr`,
-`newlines`, quoted/operator atoms, `&` capture) is the prioritised to-do list, shrink-only.
+Snapshot: parser 3466/4611, lexer 633/743 green — the backlog (`access_expr`, `newlines`,
+`large: keyword list`, nested interpolation, quoted/operator atoms, `&` capture) is the
+prioritised, shrink-only to-do list.
+
+`conformance_corpus_test.exs` parses **whole OSS files**; its inputs are machine-local paths, so
+it's a separate **report-only, uncommitted** tool: `TOXIC2_OSS_DIR=… mix toxic2.conformance.oss
+[--limit N]` walks the tree and reports whole-file conformance (skips cleanly if the dir is
+unset). Whole-file green requires zero recovery anywhere in a file, so it's a long-range target,
+not a gate.
 
 - Crash budget = 0 (P0, reported separately, blocks merge).
 - Perf gate soft until conformance is high, then hard.

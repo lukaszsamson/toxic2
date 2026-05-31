@@ -2,19 +2,20 @@
 #
 #   elixir scripts/import_corpus.exs
 #
-# It meta-parses each source suite, extracts the first string-literal argument of every
-# `assert_conforms(...)` (parser) / `tokenize(...)` (lexer) call, tags each input by its enclosing
-# `describe` title, dedups, and writes two GENERATED modules under test/support. We keep ONLY the
-# input strings — the suites' own expectations (metadata-rich AST / exact `:elixir_tokenizer`
-# tuples) are not Toxic2's contract; the live oracle is the arbiter. Output is committed; rerun
-# this only when the upstream suites change.
+# We keep ONLY the input strings — the suites' own expectations (metadata-rich AST / exact
+# `:elixir_tokenizer` tuples) are not Toxic2's contract; the live oracle is the arbiter. Output is
+# committed; rerun only when the upstream suites change.
+#
+# Parser inputs come from several suites, harvested two ways: the literal first argument of
+# `assert_conforms(...)` calls, and the literal RHS of `code = "..."` assignments (the `code =
+# expr; assert toxic_parse(code) == s2q(code)` idiom). The systematic operator-precedence suite
+# builds its inputs by runtime interpolation, so we can't harvest literals — instead we replicate
+# a bounded enumeration of its operator matrix here. Lexer inputs come from `tokenize(...)` calls.
 
-parser_src = Path.expand("../../toxic_parser/test/conformance_test.exs", __DIR__)
-lexer_src = Path.expand("../../toxic/test/toxic/valid_code_test.exs", __DIR__)
+base = Path.expand("../..", __DIR__)
 out_dir = Path.expand("../test/support", __DIR__)
+tp = fn rel -> Path.join([base, "toxic_parser/test", rel]) end
 
-# Pull a static binary out of a call argument. Plain string literals and `~s`/`~S` sigils with a
-# single static fragment are taken; interpolated / computed args are skipped.
 literal = fn
   bin, _self when is_binary(bin) ->
     {:ok, bin}
@@ -39,10 +40,11 @@ end
 
 line_of = fn meta -> Keyword.get(meta, :line, 0) end
 
-collect = fn path, call_name ->
+# Harvest {source, line, group} triples from one suite file. `calls` lists call names whose first
+# literal arg is an input; `code_var?` also harvests `code = <literal>` assignments.
+collect = fn path, calls, code_var? ->
   ast = path |> File.read!() |> Code.string_to_quoted!(columns: true)
 
-  # describes by line, so each call can be attributed to the nearest preceding `describe`.
   {_, describes} =
     Macro.prewalk(ast, [], fn
       {:describe, meta, [title | _]} = node, acc when is_binary(title) ->
@@ -64,43 +66,95 @@ collect = fn path, call_name ->
     end
   end
 
+  add = fn arg, meta, acc ->
+    case literal.(arg, literal) do
+      {:ok, src} -> [{src, line_of.(meta), group_for.(line_of.(meta))} | acc]
+      :skip -> acc
+    end
+  end
+
   {_, raw} =
     Macro.prewalk(ast, [], fn
-      {^call_name, meta, [arg | _]} = node, acc ->
-        case literal.(arg, literal) do
-          {:ok, src} -> {node, [{src, line_of.(meta), group_for.(line_of.(meta))} | acc]}
-          :skip -> {node, acc}
+      {name, meta, [arg | _]} = node, acc when is_atom(name) ->
+        cond do
+          name in calls ->
+            {node, add.(arg, meta, acc)}
+
+          code_var? and match?({:=, _, [{:code, _, c}, _]} when is_atom(c), node) ->
+            {node, add.(Enum.at(elem(node, 2), 1), meta, acc)}
+
+          true ->
+            {node, acc}
         end
 
       node, acc ->
         {node, acc}
     end)
 
-  # Dedup on source, keeping the first occurrence (lowest line).
   raw
-  |> Enum.sort_by(fn {_s, line, _g} -> line end)
-  |> Enum.uniq_by(fn {s, _l, _g} -> s end)
 end
 
-render = fn module, source_file, entries ->
+# --- systematic operator-precedence matrix (replicates systematic_operators_test.exs) ---------
+right_assoc = ~w(++ -- +++ --- .. <> = | :: when)
+
+left_assoc =
+  ~w(** * / + - ^^^ in |> <<< >>> <<~ ~>> <~ ~> <~> < > <= >= == != =~ === !== && &&& and || ||| or <- \\)
+
+binary_ops = right_assoc ++ left_assoc
+unary_str = %{"not" => "not "}
+simple_unary = ~w(+ - ! ^ not ~~~)
+us = fn u -> Map.get(unary_str, u, u) end
+
+systematic =
+  (for(o1 <- binary_ops, o2 <- binary_ops, do: "a #{o1} b #{o2} c") ++
+     for(u <- simple_unary, b <- binary_ops, do: "#{us.(u)}a #{b} b") ++
+     for(b <- binary_ops, u <- simple_unary, do: "a #{b} #{us.(u)}b"))
+  |> Enum.map(fn src -> {src, 0, "systematic operators"} end)
+
+# --- parser corpus: union across suites + the systematic matrix --------------------------------
+parser_files = [
+  {tp.("conformance_test.exs"), "conformance", [:assert_conforms], false},
+  {tp.("conformance_large_test.exs"), "large", [], true},
+  {tp.("operators_test.exs"), "operators", [], true},
+  {tp.("elixir_source_repros_test.exs"), "repros", [:assert_conforms], true}
+]
+
+parser_raw =
+  Enum.flat_map(parser_files, fn {path, ftag, calls, code_var?} ->
+    collect.(path, calls, code_var?) |> Enum.map(fn {s, l, g} -> {s, l, "#{ftag}: #{g}"} end)
+  end) ++ Enum.map(systematic, fn {s, l, g} -> {s, l, "systematic: #{g}"} end)
+
+parser = Enum.uniq_by(parser_raw, fn {s, _l, _g} -> s end)
+
+lexer =
+  collect.(tp.("../../toxic/test/toxic/valid_code_test.exs"), [:tokenize], false)
+  |> Enum.sort_by(fn {_s, l, _g} -> l end)
+  |> Enum.uniq_by(fn {s, _l, _g} -> s end)
+  |> Enum.map(fn {s, l, g} -> {s, l, "valid_code: #{g}"} end)
+
+# `group` is "file: describe"; tags = [:imported, file_slug, group_slug] for flexible bucketing.
+render = fn module, source_desc, entries ->
   body =
     Enum.map_join(entries, ",\n", fn {src, line, group} ->
-      "    %{source: #{inspect(src)}, tags: #{inspect([:imported, String.to_atom(slug.(group))])}, " <>
-        "group: #{inspect(group)}, line: #{line}}"
+      [ftag | _] = String.split(group, ":", parts: 2)
+
+      tags = [:imported, String.to_atom(slug.(ftag)), String.to_atom(slug.(group))] |> Enum.uniq()
+
+      "%{source: #{inspect(src)}, tags: #{inspect(tags)}, group: #{inspect(group)}, line: #{line}}"
     end)
 
   """
   defmodule #{module} do
     @moduledoc false
-    # GENERATED by scripts/import_corpus.exs from #{source_file}.
+    # GENERATED by scripts/import_corpus.exs from #{source_desc}.
     # Do not edit by hand — rerun the generator. Only the input strings are imported; the live
     # oracle (not any captured expectation) is the conformance arbiter.
 
     @entries [
-  #{body}
+    #{body}
     ]
 
-    @spec all() :: [%{source: String.t(), tags: [atom()], group: String.t(), line: pos_integer()}]
+    @spec all() :: [%{source: String.t(), tags: [atom()], group: String.t(), line: non_neg_integer()}]
     def all, do: @entries
   end
   """
@@ -110,12 +164,13 @@ write = fn name, source ->
   File.write!(Path.join(out_dir, name), Code.format_string!(source) ++ ["\n"])
 end
 
-parser = collect.(parser_src, :assert_conforms)
-lexer = collect.(lexer_src, :tokenize)
-
 write.(
   "imported_parser_corpus.ex",
-  render.("Toxic2.Conformance.ImportedParser", "toxic_parser/test/conformance_test.exs", parser)
+  render.(
+    "Toxic2.Conformance.ImportedParser",
+    "toxic_parser conformance/large/operators/repros suites + systematic operator matrix",
+    parser
+  )
 )
 
 write.(
@@ -123,5 +178,8 @@ write.(
   render.("Toxic2.Conformance.ImportedLexer", "toxic/test/toxic/valid_code_test.exs", lexer)
 )
 
-IO.puts("imported parser corpus: #{length(parser)} unique sources")
+IO.puts(
+  "imported parser corpus: #{length(parser)} unique sources (#{length(systematic)} systematic)"
+)
+
 IO.puts("imported lexer  corpus: #{length(lexer)} unique sources")
