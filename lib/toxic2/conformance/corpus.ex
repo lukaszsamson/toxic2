@@ -42,6 +42,18 @@ defmodule Toxic2.Conformance.Corpus do
     {"\"\#{ \"i\#{j}k\" }\"", [:interpolation]},
     {"\"\#{if x do y else z end}\"", [:interpolation]},
     {"[\"\#{a}\", \"\#{b}\"]", [:interpolation]},
+    # multiline quoted literals (NOT heredocs — a raw newline is allowed)
+    {"\"a\nb\"", [:string]},
+    {"'a\nb'", [:charlist]},
+    {"\"line1\nline2\nline3\"", [:string]},
+    # full escape forms (hex / unicode / line continuation)
+    {"\"\\x61\"", [:string]},
+    {"\"\\x41\\x42\"", [:string]},
+    {"\"\\u0061\"", [:string]},
+    {"\"\\u{61}\"", [:string]},
+    {"\"a\\\nb\"", [:string]},
+    {"'\\x61'", [:charlist]},
+    {"\"\"\"\n\\u0061\n\"\"\"", [:heredoc]},
     # charlists
     {"'abc'", [:charlist]},
     {"''", [:charlist]},

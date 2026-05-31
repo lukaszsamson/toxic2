@@ -480,6 +480,21 @@ defmodule Toxic2.ParserTest do
       assert {:<<>>, _, ["x", {:"::", _, _}, "z\n"]} = ast
     end
 
+    test "quoted strings/charlists may span newlines (not just heredocs)" do
+      assert {"a\nb", []} = Toxic2.parse_to_ast("\"a\nb\"")
+      assert {~c"a\nb", []} = Toxic2.parse_to_ast("'a\nb'")
+    end
+
+    test "full escape forms decode like Elixir (hex / unicode / line continuation)" do
+      assert {"a", []} = Toxic2.parse_to_ast("\"\\x61\"")
+      assert {"a", []} = Toxic2.parse_to_ast("\"\\u0061\"")
+      assert {"a", []} = Toxic2.parse_to_ast("\"\\u{61}\"")
+      # line continuation: backslash-newline is removed entirely
+      assert {"ab", []} = Toxic2.parse_to_ast("\"a\\\nb\"")
+      # \xHH is a raw byte; \u{..} is a codepoint
+      assert {"😀", []} = Toxic2.parse_to_ast("\"\\u{1F600}\"")
+    end
+
     test "an unterminated heredoc does not crash and reports one error" do
       {_ast, diags} = Toxic2.parse_to_ast("\"\"\"\nno end here\n")
       assert Enum.any?(diags, &(elem(&1, 3) == :heredoc_missing_terminator))

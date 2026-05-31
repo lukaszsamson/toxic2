@@ -135,6 +135,7 @@ defmodule Toxic2.Lexer do
   @value_literals %{"true" => true, "false" => false, "nil" => nil}
 
   defguardp is_digit(c) when c in ?0..?9
+  defguardp is_hex(c) when c in ?0..?9 or c in ?a..?f or c in ?A..?F
   defguardp is_lower_start(c) when c in ?a..?z or c == ?_
   defguardp is_upper_start(c) when c in ?A..?Z
   defguardp is_word(c) when c in ?a..?z or c in ?A..?Z or c in ?0..?9 or c == ?_
@@ -419,12 +420,13 @@ defmodule Toxic2.Lexer do
   # is emitted in `lex`; this emits `*_fragment` runs (escapes processed) interleaved with
   # `:begin_interpolation` / interpolation tokens / `:end_interpolation`, and a closer. On `#{` it
   # flushes the pending fragment, pushes `{:interp, qk}`, and hands control to `lex`; the matching
-  # `}` (recognised in `lex`) emits `:end_interpolation` and resumes the right scanner. A newline
-  # or EOF before the closer is unterminated (these don't span lines — that's heredocs).
-  # `fs = {line, col}` is the start position of the fragment currently accumulated in `buf`.
-  defp read_quoted(<<?\\, e, rest::binary>>, line, col, buf, fs, acc, w, st, qk) do
-    cp = Map.get(@char_escapes, e, e)
-    read_quoted(rest, line, col + 2, [<<cp::utf8>> | buf], fs, acc, w, st, qk)
+  # `}` (recognised in `lex`) emits `:end_interpolation` and resumes the right scanner. Quoted
+  # literals MAY span newlines (Elixir accepts `"a\nb"`); only EOF before the closer is
+  # unterminated. Escapes (`\n`, `\xHH`, `\u{..}`, line-continuation `\<newline>`, …) are decoded
+  # by `decode_escape`. `fs = {line, col}` is the start of the fragment accumulated in `buf`.
+  defp read_quoted(<<?\\, rest::binary>>, line, col, buf, fs, acc, w, st, qk) do
+    {app, rest2, line2, col2} = decode_escape(rest, line, col)
+    read_quoted(rest2, line2, col2, [app | buf], fs, acc, w, st, qk)
   end
 
   defp read_quoted(<<?#, ?{, rest::binary>>, line, col, buf, fs, acc, w, st, qk) do
@@ -433,12 +435,8 @@ defmodule Toxic2.Lexer do
     lex(rest, line, col + 2, acc, w, [{:interp, {:quoted, qk}} | st])
   end
 
-  defp read_quoted(<<?\n, _::binary>> = rest, line, col, buf, fs, acc, w, st, qk) do
-    acc = flush_fragment(buf, fs, line, col, acc, frag_kind(qk))
-    err = {:error, line, col, line, col, LexError.new(:string_missing_terminator, %{})}
-    acc = [{end_kind(qk), line, col, line, col, nil}, err | acc]
-    lex(rest, line, col, acc, w, st)
-  end
+  defp read_quoted(<<?\n, rest::binary>>, line, _col, buf, fs, acc, w, st, qk),
+    do: read_quoted(rest, line + 1, 1, [<<?\n>> | buf], fs, acc, w, st, qk)
 
   defp read_quoted(<<>>, line, col, buf, fs, acc, w, _st, qk) do
     acc = flush_fragment(buf, fs, line, col, acc, frag_kind(qk))
@@ -467,6 +465,67 @@ defmodule Toxic2.Lexer do
   defp frag_kind(:charlist), do: :charlist_fragment
   defp end_kind(:dquote), do: :string_end
   defp end_kind(:charlist), do: :charlist_end
+
+  # Decode one escape (`rest` is just past the `\`, at `(line, col)` of the backslash). Returns
+  # `{appended_bytes, rest_after, line_after, col_after}`. Covers `\xH`/`\xHH` (raw byte),
+  # `\x{H..}` and `\uHHHH`/`\u{H..}` (codepoint → UTF-8), the line-continuation `\<newline>` (emits
+  # nothing, the newline is swallowed), the fixed one-byte escapes (`\n`, `\t`, …), and a trailing
+  # `\` at EOF (kept literal). Tolerant: a malformed `\x`/`\u` falls back to the literal letter.
+  defp decode_escape(rest, line, col) do
+    case esc(rest) do
+      {app, rest2, :newline} ->
+        {app, rest2, line + 1, 1}
+
+      {app, rest2, :sameline} ->
+        {app, rest2, line, col + 1 + (byte_size(rest) - byte_size(rest2))}
+    end
+  end
+
+  defp esc(<<?x, ?{, rest::binary>>) do
+    {hex, rest2} = take_hex(rest, <<>>)
+    {cp_to_utf8(hex), drop_rbrace(rest2), :sameline}
+  end
+
+  defp esc(<<?x, a, b, rest::binary>>) when is_hex(a) and is_hex(b),
+    do: {<<hex_val(a) * 16 + hex_val(b)>>, rest, :sameline}
+
+  defp esc(<<?x, a, rest::binary>>) when is_hex(a), do: {<<hex_val(a)>>, rest, :sameline}
+
+  defp esc(<<?u, ?{, rest::binary>>) do
+    {hex, rest2} = take_hex(rest, <<>>)
+    {cp_to_utf8(hex), drop_rbrace(rest2), :sameline}
+  end
+
+  defp esc(<<?u, a, b, c, d, rest::binary>>)
+       when is_hex(a) and is_hex(b) and is_hex(c) and is_hex(d),
+       do: {cp_to_utf8(<<a, b, c, d>>), rest, :sameline}
+
+  defp esc(<<?\r, ?\n, rest::binary>>), do: {<<>>, rest, :newline}
+  defp esc(<<?\n, rest::binary>>), do: {<<>>, rest, :newline}
+
+  defp esc(<<e::utf8, rest::binary>>),
+    do: {<<Map.get(@char_escapes, e, e)::utf8>>, rest, :sameline}
+
+  defp esc(<<>>), do: {<<?\\>>, <<>>, :sameline}
+
+  defp take_hex(<<c, rest::binary>>, acc) when is_hex(c), do: take_hex(rest, <<acc::binary, c>>)
+  defp take_hex(bin, acc), do: {acc, bin}
+
+  defp drop_rbrace(<<?}, rest::binary>>), do: rest
+  defp drop_rbrace(bin), do: bin
+
+  defp hex_val(c) when c in ?0..?9, do: c - ?0
+  defp hex_val(c) when c in ?a..?f, do: c - ?a + 10
+  defp hex_val(c) when c in ?A..?F, do: c - ?A + 10
+
+  # A codepoint from collected hex digits, UTF-8 encoded. Tolerant: empty or out-of-range → "".
+  defp cp_to_utf8(<<>>), do: <<>>
+
+  defp cp_to_utf8(hex) do
+    <<String.to_integer(hex, 16)::utf8>>
+  rescue
+    ArgumentError -> <<>>
+  end
 
   # An interpolation's matching `}` resumes whatever literal it opened inside (P3: one scanner).
   defp resume_interp({:quoted, qk}, rest, line, col, acc, w, st),
@@ -581,7 +640,7 @@ defmodule Toxic2.Lexer do
   # sigil heredocs); `strip` is the closing delimiter's indentation, removed from each line's
   # start. The opener and `strip` are computed in `open_heredoc`. A line `\s*<delim>x3` terminates.
   defp read_heredoc(
-         <<?\\, e, rest::binary>>,
+         <<?\\, rest::binary>>,
          line,
          col,
          buf,
@@ -591,8 +650,8 @@ defmodule Toxic2.Lexer do
          st,
          {_d, :full, _i, _s, _ek} = hc
        ) do
-    cp = Map.get(@char_escapes, e, e)
-    read_heredoc(rest, line, col + 2, [<<cp::utf8>> | buf], fs, acc, w, st, hc)
+    {app, rest2, line2, col2} = decode_escape(rest, line, col)
+    read_heredoc(rest2, line2, col2, [app | buf], fs, acc, w, st, hc)
   end
 
   defp read_heredoc(
