@@ -30,12 +30,13 @@ defmodule Toxic2.Parser do
   **not** skipped when looking for the next infix operator — a newline there ends the expression
   (matching Elixir). EOE (`:eol` / `:";"`) separates top-level expressions.
 
-  Also covers anonymous functions **`fn ... -> ... end`** (multi-clause, `when` guards,
-  multi-statement bodies).
+  Also covers anonymous functions **`fn ... -> ... end`** and **`do`/`end` blocks** (`if`, `case`,
+  `cond`, `receive`, `try`, `with`, `foo do ... end`) — multi-clause, `when` guards, block labels
+  (`else`/`catch`/`rescue`/`after`), and statement-or-stab-clause bodies. The do-block attaches to
+  the outer call (`foo bar do end` => `foo(bar, do: ...)`).
 
-  Not yet handled (later phases): `do`/`end` blocks and `case`/`cond`/`receive`/`try`/`with`,
-  strings/sigils, `&` capture, multi-statement parens. Encountering those yields error/leaf nodes
-  rather than crashing.
+  Not yet handled (later phases): strings/sigils, `&` capture, multi-statement parens.
+  Encountering those yields error/leaf nodes rather than crashing.
   """
 
   alias Toxic2.{CST, Diagnostics, LexError, Precedence, Tokens}
@@ -142,7 +143,36 @@ defmodule Toxic2.Parser do
     {lhs, i, diags, nid, fuel} = parse_prefix(t, i, ctx, diags, nid, fuel)
     {lhs, i, diags, nid, fuel} = postfix(t, i, lhs, ctx, diags, nid, fuel)
     {lhs, i, diags, nid, fuel} = maybe_no_parens(t, i, lhs, ctx, diags, nid, fuel)
+    {lhs, i, diags, nid, fuel} = maybe_do_block(t, i, lhs, ctx, diags, nid, fuel)
     led(t, i, lhs, min_bp, ctx, diags, nid, fuel)
+  end
+
+  # `<call> do ... end`: the do-block attaches to the call as a trailing `[do: ..., else: ...]`
+  # keyword list. Suppressed in `:no_parens_arg` so the do attaches to the OUTER call:
+  # `foo bar do end` => `foo(bar, do: ...)`, not `foo(bar(do: ...))`.
+  defp maybe_do_block(t, i, lhs, ctx, diags, nid, fuel) do
+    if ctx != :no_parens_arg and Tokens.kind(t, i) == :do and do_attachable?(lhs, t) do
+      {db, j, diags, nid, fuel} = parse_do_block(t, i, diags, nid, fuel)
+      {attach_do(t, lhs, db, j), j, diags, nid, fuel}
+    else
+      {lhs, i, diags, nid, fuel}
+    end
+  end
+
+  defp do_attachable?({:token, idx, _f, _d}, t), do: Tokens.kind(t, idx) == :identifier
+  defp do_attachable?({:node, k, _sp, _ch, _f, _d}, _t), do: k in [:call, :np_call, :remote_call]
+  defp do_attachable?(_lhs, _t), do: false
+
+  defp attach_do(t, lhs, db, end_i) do
+    span = merge(cst_span(t, lhs), tok_span(t, end_i - 1))
+
+    case lhs do
+      {:token, _idx, _f, _d} ->
+        CST.node(:call, span, [lhs, db], :matched, nil)
+
+      {:node, k, _sp, children, _f, _d} ->
+        CST.node(k, span, Enum.concat(children, [db]), :matched, nil)
+    end
   end
 
   # No-parens call: a bare identifier callee followed (with a space, same line) by an argument.
@@ -155,7 +185,7 @@ defmodule Toxic2.Parser do
       {arg, j, is_kw, diags, nid, fuel} = parse_np_arg(t, i, diags, nid, fuel)
 
       {args, k, diags, nid, fuel} =
-        if ctx == :no_parens,
+        if ctx in [:no_parens, :no_parens_arg],
           do: np_more_args(t, j, [arg], is_kw, diags, nid, fuel),
           else: {[arg], j, diags, nid, fuel}
 
@@ -196,14 +226,14 @@ defmodule Toxic2.Parser do
   defp parse_np_arg(t, i, diags, nid, fuel) do
     if Tokens.kind(t, i) == :kw_identifier do
       key = CST.token(i)
-      {val, j, diags, nid, fuel} = parse_expr(t, i + 1, 0, :no_parens, diags, nid, fuel - 1)
+      {val, j, diags, nid, fuel} = parse_expr(t, i + 1, 0, :no_parens_arg, diags, nid, fuel - 1)
 
       node =
         CST.node(:kw_pair, merge(tok_span(t, i), cst_span(t, val)), [key, val], :matched, nil)
 
       {node, j, true, diags, nid, fuel}
     else
-      {expr, j, diags, nid, fuel} = parse_expr(t, i, 0, :no_parens, diags, nid, fuel - 1)
+      {expr, j, diags, nid, fuel} = parse_expr(t, i, 0, :no_parens_arg, diags, nid, fuel - 1)
       {expr, j, false, diags, nid, fuel}
     end
   end
@@ -624,7 +654,7 @@ defmodule Toxic2.Parser do
     i = skip_eoe(t, i)
 
     cond do
-      Tokens.kind(t, i) == :end or Tokens.at_eof?(t, i) or clause_head_ahead?(t, i, 0) ->
+      at_section_end?(t, i) or clause_head_ahead?(t, i, 0) ->
         {CST.node(
            :stab_body,
            list_span(t, :lists.reverse(acc)),
@@ -640,12 +670,18 @@ defmodule Toxic2.Parser do
     end
   end
 
+  # A clause/section body ends at `end`, a block label (`else`/`catch`/`rescue`/`after`), or EOF.
+  defp at_section_end?(t, i),
+    do: Tokens.kind(t, i) in [:end, :block_label] or Tokens.at_eof?(t, i)
+
   # Is the upcoming line a clause head? True if a depth-0 `->` precedes the next EOE / `end` / EOF.
   defp clause_head_ahead?(t, i, depth) do
     case Tokens.kind(t, i) do
       :eof -> false
       :stab_op when depth == 0 -> true
       :end when depth == 0 -> false
+      # A block label ends the current section, so a `->` beyond it belongs to a later section.
+      :block_label when depth == 0 -> false
       k when depth == 0 and k in [:eol, :";"] -> false
       k when k in [:"(", :"[", :"{", :"<<", :fn, :do] -> clause_head_ahead?(t, i + 1, depth + 1)
       k when k in [:")", :"]", :"}", :">>", :end] -> clause_head_ahead?(t, i + 1, depth - 1)
@@ -656,6 +692,82 @@ defmodule Toxic2.Parser do
   # `head_patterns` always returns at least one pattern, so `patterns` is non-empty here.
   defp head_span(t, patterns, nil), do: list_span(t, patterns)
   defp head_span(t, patterns, guard), do: merge(cst_span(t, hd(patterns)), cst_span(t, guard))
+
+  # --- do/end blocks -----------------------------------------------------
+
+  # `do <section>+ end`, where the first section is `do` and later sections are block labels
+  # (`else`/`catch`/`rescue`/`after`). Each section body is statements or stab clauses.
+  defp parse_do_block(t, do_i, diags, nid, fuel) do
+    {sections, j, diags, nid, fuel} = parse_sections(t, do_i, [], diags, nid, fuel)
+
+    {CST.node(:do_block, merge(tok_span(t, do_i), tok_span(t, j - 1)), sections, :matched, nil),
+     j, diags, nid, fuel}
+  end
+
+  defp parse_sections(t, i, acc, diags, nid, fuel) do
+    label = CST.token(i)
+    {body, j, diags, nid, fuel} = parse_section_body(t, i + 1, diags, nid, fuel)
+
+    section =
+      CST.node(
+        :do_section,
+        merge(tok_span(t, i), cst_span(t, body)),
+        [label, body],
+        :matched,
+        nil
+      )
+
+    cond do
+      Tokens.kind(t, j) == :block_label ->
+        parse_sections(t, j, [section | acc], diags, nid, fuel)
+
+      Tokens.kind(t, j) == :end ->
+        {:lists.reverse([section | acc]), j + 1, diags, nid, fuel}
+
+      true ->
+        {id, diags, nid} =
+          Diagnostics.emit(diags, nid, :parser, :error, :expected_end, tok_span(t, j), %{})
+
+        {:lists.reverse([CST.missing(:end, j, diag: id), section | acc]), j, diags, nid, fuel}
+    end
+  end
+
+  # A section body is stab clauses (if a `->` heads the line) or a statement sequence.
+  defp parse_section_body(t, i, diags, nid, fuel) do
+    i = skip_eoe(t, i)
+
+    if not at_section_end?(t, i) and clause_head_ahead?(t, i, 0) do
+      {clauses, j, diags, nid, fuel} = parse_block_clauses(t, i, [], diags, nid, fuel)
+      {CST.node(:do_clauses, list_span(t, clauses), clauses, :matched, nil), j, diags, nid, fuel}
+    else
+      {stmts, j, diags, nid, fuel} = parse_block_stmts(t, i, [], diags, nid, fuel)
+      {CST.node(:do_body, list_span(t, stmts), stmts, :matched, nil), j, diags, nid, fuel}
+    end
+  end
+
+  defp parse_block_clauses(t, i, acc, diags, nid, fuel) do
+    i = skip_eoe(t, i)
+
+    if at_section_end?(t, i) do
+      {:lists.reverse(acc), i, diags, nid, fuel}
+    else
+      {clause, j, diags, nid, fuel} = parse_clause(t, i, diags, nid, fuel)
+      j = if j > i, do: j, else: i + 1
+      parse_block_clauses(t, j, [clause | acc], diags, nid, fuel)
+    end
+  end
+
+  defp parse_block_stmts(t, i, acc, diags, nid, fuel) do
+    i = skip_eoe(t, i)
+
+    if at_section_end?(t, i) do
+      {:lists.reverse(acc), i, diags, nid, fuel}
+    else
+      {stmt, j, diags, nid, fuel} = parse_expr(t, i, 0, :no_parens, diags, nid, fuel - 1)
+      j = if j > i, do: j, else: i + 1
+      parse_block_stmts(t, j, [stmt | acc], diags, nid, fuel)
+    end
+  end
 
   # `%{...}` map or `%Name{...}` struct.
   defp parse_percent(t, i, diags, nid, fuel) do

@@ -185,7 +185,7 @@ defmodule Toxic2.Lower do
 
   # `f(args)` => `{fun_atom, meta, lowered_args}`. The callee name respects the atom policy.
   defp lower_call([callee | arg_children], view, opts, acc, nid) do
-    {args, acc, nid} = lower_args(arg_children, view, opts, acc, nid)
+    {args, acc, nid} = lower_call_args(arg_children, view, opts, acc, nid)
     idx = CST.token_index(callee)
     name = Tokens.value(view, idx)
 
@@ -231,7 +231,7 @@ defmodule Toxic2.Lower do
   # `a.b` / `a.b(args)` => `{{:., m, [base, name]}, m, args}` (zero-arg form is just `args = []`).
   defp lower_remote_call([base, name_leaf | arg_children], view, opts, acc, nid) do
     {base_ast, acc, nid} = lower(base, view, opts, acc, nid)
-    {args, acc, nid} = lower_args(arg_children, view, opts, acc, nid)
+    {args, acc, nid} = lower_call_args(arg_children, view, opts, acc, nid)
     idx = CST.token_index(name_leaf)
     meta = tmeta(view, idx)
 
@@ -291,6 +291,62 @@ defmodule Toxic2.Lower do
   end
 
   defp kw_pair?(cst), do: CST.tag(cst) == :node and CST.node_kind(cst) == :kw_pair
+
+  # Call args, where a trailing `:do_block` child becomes the final `[do: ..., else: ...]` arg.
+  defp lower_call_args(children, view, opts, acc, nid) do
+    {plain, do_block} = pop_do_block(children)
+    {args, acc, nid} = lower_args(plain, view, opts, acc, nid)
+
+    case do_block do
+      nil ->
+        {args, acc, nid}
+
+      db ->
+        {kw, acc, nid} = lower_do_block(db, view, opts, acc, nid)
+        {Enum.concat(args, [kw]), acc, nid}
+    end
+  end
+
+  defp pop_do_block(children) do
+    case :lists.reverse(children) do
+      [{:node, :do_block, _sp, _ch, _f, _d} = db | rev] -> {:lists.reverse(rev), db}
+      _ -> {children, nil}
+    end
+  end
+
+  # `do ... else ... end` => keyword list `[do: body, else: body, ...]`.
+  defp lower_do_block(db, view, opts, acc, nid) do
+    {pairs, acc, nid} =
+      Enum.reduce(CST.children(db), {[], acc, nid}, fn section, {ps, a, n} ->
+        {pair, a, n} = lower_section(section, view, opts, a, n)
+        {[pair | ps], a, n}
+      end)
+
+    {:lists.reverse(pairs), acc, nid}
+  end
+
+  defp lower_section({:node, :do_section, _sp, [label_leaf, body], _f, _d}, view, opts, acc, nid) do
+    {b, acc, nid} = lower_section_body(body, view, opts, acc, nid)
+    {{section_label(label_leaf, view), b}, acc, nid}
+  end
+
+  defp section_label(label_leaf, view) do
+    idx = CST.token_index(label_leaf)
+    if Tokens.kind(view, idx) == :do, do: :do, else: Tokens.value(view, idx)
+  end
+
+  # A `:do_body` lowers like a block (nil / expr / __block__); `:do_clauses` lowers to a list of
+  # `{:->, ...}` clauses.
+  defp lower_section_body({:node, :do_clauses, _sp, clauses, _f, _d}, view, opts, acc, nid),
+    do: lower_each(clauses, view, opts, acc, nid)
+
+  defp lower_section_body({:node, :do_body, _sp, stmts, _f, _d}, view, opts, acc, nid) do
+    case stmts do
+      [] -> {nil, acc, nid}
+      [one] -> lower(one, view, opts, acc, nid)
+      many -> wrap_block(lower_each(many, view, opts, acc, nid))
+    end
+  end
 
   # `<<...>>` => `{:<<>>, [], elems}` (segments incl. `::` are ordinary expressions).
   defp lower_bitstring(children, view, opts, acc, nid) do

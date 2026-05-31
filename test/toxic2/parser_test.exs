@@ -369,6 +369,41 @@ defmodule Toxic2.ParserTest do
     end
   end
 
+  describe "do/end blocks (phase 9)" do
+    test "do-block attaches as a [do: ...] keyword arg" do
+      assert {{:if, _, [{:x, _, nil}, [do: {:y, _, nil}]]}, []} =
+               Toxic2.parse_to_ast("if x do y end")
+
+      assert {{:foo, _, [[do: :ok]]}, []} = Toxic2.parse_to_ast("foo do :ok end")
+
+      assert {{:foo, _, [{:a, _, nil}, {:b, _, nil}, [do: {:x, _, nil}]]}, []} =
+               Toxic2.parse_to_ast("foo a, b do x end")
+    end
+
+    test "do attaches to the OUTER call (foo bar do end)" do
+      assert {{:foo, _, [{:bar, _, nil}, [do: :ok]]}, []} =
+               Toxic2.parse_to_ast("foo bar do :ok end")
+    end
+
+    test "block labels (else/rescue/after)" do
+      assert {{:if, _, [{:x, _, nil}, [do: {:y, _, nil}, else: {:z, _, nil}]]}, []} =
+               Toxic2.parse_to_ast("if x do y else z end")
+
+      assert {{:try, _, [[do: {:x, _, nil}, after: {:z, _, nil}]]}, []} =
+               Toxic2.parse_to_ast("try do x after z end")
+    end
+
+    test "stab-clause bodies (case/cond)" do
+      assert {{:case, _, [{:x, _, nil}, [do: [{:->, _, [[1], :a]}, {:->, _, [[2], :b]}]]]}, []} =
+               Toxic2.parse_to_ast("case x do 1 -> :a\n 2 -> :b end")
+    end
+
+    test "multi-statement body lowers to a block" do
+      assert {{:if, _, [{:x, _, nil}, [do: {:__block__, _, [_, _]}]]}, []} =
+               Toxic2.parse_to_ast("if x do\n a\n b\n end")
+    end
+  end
+
   describe "tolerant behavior (P1: never crash; one diagnostic per error)" do
     test "a trailing operator yields a binary_op with a missing RHS + one diagnostic" do
       {_view, [e], diags} = exprs("1 +")
