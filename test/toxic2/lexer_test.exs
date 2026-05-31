@@ -313,29 +313,60 @@ defmodule Toxic2.LexerTest do
     end
   end
 
-  describe "double-quoted strings (phase 10 slice 1: no interpolation)" do
-    test "simple strings carry their unescaped binary value" do
-      assert shapes(~S("abc")) == [{:string, "abc"}]
-      assert shapes(~S("")) == [{:string, ""}]
-      assert shapes(~S("hello world")) == [{:string, "hello world"}]
+  describe "double-quoted strings (phase 10: linear, interpolation-aware)" do
+    test "a simple string is start / fragment / end with the unescaped value" do
+      assert shapes(~S("abc")) == [
+               {:string_start, nil},
+               {:string_fragment, "abc"},
+               {:string_end, nil}
+             ]
+
+      assert shapes(~S("")) == [{:string_start, nil}, {:string_end, nil}]
     end
 
-    test "escapes are processed into the value" do
-      assert shapes(~S("a\nb")) == [{:string, "a\nb"}]
-      assert shapes(~S("a\tb\\c\"d")) == [{:string, "a\tb\\c\"d"}]
+    test "escapes are processed into the fragment value" do
+      assert shapes(~S("a\nb")) == [
+               {:string_start, nil},
+               {:string_fragment, "a\nb"},
+               {:string_end, nil}
+             ]
+
+      assert shapes(~S("a\tb\\c\"d")) == [
+               {:string_start, nil},
+               {:string_fragment, "a\tb\\c\"d"},
+               {:string_end, nil}
+             ]
     end
 
-    test "a string is a single token among others" do
-      assert shapes(~S(foo "x" 1)) == [{:identifier, "foo"}, {:string, "x"}, {:int, 1}]
+    test "interpolation lexes to begin/end markers wrapping the inner tokens" do
+      assert shapes(~S("a#{b}c")) == [
+               {:string_start, nil},
+               {:string_fragment, "a"},
+               {:begin_interpolation, nil},
+               {:identifier, "b"},
+               {:end_interpolation, nil},
+               {:string_fragment, "c"},
+               {:string_end, nil}
+             ]
     end
 
-    test "interpolation is deferred to a single tolerant :error token (never a wrong value)" do
-      assert [{:error, _}] = shapes(~S("a#{b}c"))
+    test "a `}` inside the interpolation (nested braces) does NOT end it early" do
+      kinds = ~S("#{ {1} }") |> tokens() |> Enum.map(&Token.kind/1)
+
+      assert kinds == [
+               :string_start,
+               :begin_interpolation,
+               :"{",
+               :int,
+               :"}",
+               :end_interpolation,
+               :string_end
+             ]
     end
 
-    test "an unterminated string is one :error, never a raise" do
-      assert [{:error, _}] = shapes(~S("abc))
-      assert [{:error, _} | _] = shapes("\"abc\n")
+    test "an unterminated string is one :error then a synthetic :string_end, never a raise" do
+      assert [{:string_start, _}, {:string_fragment, "abc"}, {:error, _}, {:string_end, _}] =
+               shapes(~S("abc))
     end
   end
 

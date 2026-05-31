@@ -389,6 +389,51 @@ defmodule Toxic2.ParserTest do
     end
   end
 
+  describe "strings / interpolation (phase 10)" do
+    test "a plain string is a :string node of fragment leaves, no diagnostics" do
+      {view, [s], diags} = exprs(~S("abc"))
+      assert CST.node_kind(s) == :string
+      assert [frag] = CST.children(s)
+      assert Tokens.value(view, CST.token_index(frag)) == "abc"
+      assert diags == []
+    end
+
+    test "interpolation parses an :interp child holding the inner expression" do
+      {_view, [s], diags} = exprs("\"a\#{b}c\"")
+      assert CST.node_kind(s) == :string
+      kinds = Enum.map(CST.children(s), fn c -> CST.tag(c) end)
+      assert :node in kinds
+      interp = Enum.find(CST.children(s), &(CST.tag(&1) == :node))
+      assert CST.node_kind(interp) == :interp
+      assert diags == []
+    end
+
+    test "no-interpolation string lowers to a bare binary" do
+      assert {"abc", []} = Toxic2.parse_to_ast(~S("abc"))
+      assert {"", []} = Toxic2.parse_to_ast(~S(""))
+    end
+
+    test "interpolation lowers to the Kernel.to_string <<>> form" do
+      {ast, diags} = Toxic2.parse_to_ast("\"a\#{b}c\"")
+
+      assert {:<<>>, _,
+              [
+                "a",
+                {:"::", _,
+                 [{{:., _, [Kernel, :to_string]}, _, [{:b, _, nil}]}, {:binary, _, nil}]},
+                "c"
+              ]} = ast
+
+      assert diags == []
+    end
+
+    test "an unterminated string does not crash and reports one error" do
+      {ast, diags} = Toxic2.parse_to_ast(~S("abc))
+      assert is_binary(ast) or is_tuple(ast)
+      assert Enum.any?(diags, &(elem(&1, 3) == :string_missing_terminator))
+    end
+  end
+
   describe "not in (lowering rewrite + deprecation)" do
     test "`not a in b` rewrites to not(a in b) with a deprecation warning" do
       {ast, diags} = Toxic2.parse_to_ast("not a in b")

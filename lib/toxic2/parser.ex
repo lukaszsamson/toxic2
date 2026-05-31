@@ -43,7 +43,7 @@ defmodule Toxic2.Parser do
 
   @fuel_base 1_000
 
-  @atomic_kinds [:int, :flt, :char, :atom, :literal, :identifier, :string]
+  @atomic_kinds [:int, :flt, :char, :atom, :literal, :identifier]
 
   # A map key / update base is parsed stopping before `|` (pipe_op 70) so the update separator
   # isn't swallowed as a binary operator.
@@ -521,26 +521,153 @@ defmodule Toxic2.Parser do
       prefix_bp != nil ->
         parse_unary(t, i, prefix_bp, ctx, diags, nid, fuel)
 
-      kind == :"(" ->
-        parse_paren(t, i, ctx, diags, nid, fuel)
+      true ->
+        parse_primary(kind, t, i, ctx, diags, nid, fuel)
+    end
+  end
 
-      kind == :"[" ->
-        parse_container(t, i, :"]", :list, diags, nid, fuel)
+  # Structural prefixes (one trivial clause per opener; keeps `parse_prefix` under the complexity
+  # budget). `ctx` is only load-bearing for parens; the rest ignore it.
+  defp parse_primary(:"(", t, i, ctx, diags, nid, fuel),
+    do: parse_paren(t, i, ctx, diags, nid, fuel)
 
-      kind == :"{" ->
-        parse_container(t, i, :"}", :tuple, diags, nid, fuel)
+  defp parse_primary(:"[", t, i, _ctx, diags, nid, fuel),
+    do: parse_container(t, i, :"]", :list, diags, nid, fuel)
 
-      kind == :"<<" ->
-        parse_container(t, i, :">>", :bitstring, diags, nid, fuel)
+  defp parse_primary(:"{", t, i, _ctx, diags, nid, fuel),
+    do: parse_container(t, i, :"}", :tuple, diags, nid, fuel)
 
-      kind == :percent ->
-        parse_percent(t, i, diags, nid, fuel)
+  defp parse_primary(:"<<", t, i, _ctx, diags, nid, fuel),
+    do: parse_container(t, i, :">>", :bitstring, diags, nid, fuel)
 
-      kind == :fn ->
-        parse_fn(t, i, diags, nid, fuel)
+  defp parse_primary(:percent, t, i, _ctx, diags, nid, fuel),
+    do: parse_percent(t, i, diags, nid, fuel)
+
+  defp parse_primary(:fn, t, i, _ctx, diags, nid, fuel), do: parse_fn(t, i, diags, nid, fuel)
+
+  defp parse_primary(:string_start, t, i, _ctx, diags, nid, fuel),
+    do: parse_string(t, i, diags, nid, fuel)
+
+  defp parse_primary(_kind, t, i, _ctx, diags, nid, fuel),
+    do: parse_unexpected(t, i, diags, nid, fuel)
+
+  # --- strings / interpolation -------------------------------------------
+
+  # A string is a linear run `:string_start <part>* :string_end`, where each part is a
+  # `:string_fragment` leaf or a `:begin_interpolation ... :end_interpolation` interpolation. The
+  # CST `:string` node keeps the parts in order; lowering decides bare-binary vs `<<>>`.
+  defp parse_string(t, start_i, diags, nid, fuel) do
+    {parts, j, diags, nid, fuel} = string_parts(t, start_i + 1, [], diags, nid, fuel)
+    span = merge(tok_span(t, start_i), tok_span(t, j - 1))
+    {CST.node(:string, span, parts, :matched, nil), j, diags, nid, fuel}
+  end
+
+  defp string_parts(t, i, acc, diags, nid, fuel) do
+    cond do
+      fuel <= 0 ->
+        {:lists.reverse(acc), i, diags, nid, fuel}
 
       true ->
-        parse_unexpected(t, i, diags, nid, fuel)
+        case Tokens.kind(t, i) do
+          :string_fragment ->
+            string_parts(t, i + 1, [CST.token(i) | acc], diags, nid, fuel)
+
+          :begin_interpolation ->
+            {interp, j, diags, nid, fuel} = parse_interp(t, i, diags, nid, fuel)
+            string_parts(t, j, [interp | acc], diags, nid, fuel)
+
+          :string_end ->
+            {:lists.reverse(acc), i + 1, diags, nid, fuel}
+
+          # The lexer's unterminated-string marker (sole transport, P3): record and keep going;
+          # a synthetic `:string_end` follows it.
+          :error ->
+            {id, diags, nid} = emit_lex_error(t, i, diags, nid)
+            string_parts(t, i + 1, [CST.token(i, error: true, diag: id) | acc], diags, nid, fuel)
+
+          # No `:string_end` (truncated stream): stop without consuming.
+          _ ->
+            {:lists.reverse(acc), i, diags, nid, fuel}
+        end
+    end
+  end
+
+  # `#{ <block> }` — the inner is a statement block (0 → empty, 1 → expr, n → block at lowering).
+  defp parse_interp(t, begin_i, diags, nid, fuel) do
+    {exprs, j, diags, nid, fuel} = collect_interp(t, begin_i + 1, [], diags, nid, fuel - 1)
+
+    {end_i, diags, nid} =
+      if Tokens.kind(t, j) == :end_interpolation do
+        {j + 1, diags, nid}
+      else
+        {_id, diags, nid} =
+          Diagnostics.emit(
+            diags,
+            nid,
+            :parser,
+            :error,
+            :unclosed_interpolation,
+            tok_span(t, j),
+            %{}
+          )
+
+        {j, diags, nid}
+      end
+
+    span = merge(tok_span(t, begin_i), tok_span(t, end_i - 1))
+    {CST.node(:interp, span, exprs, :matched, nil), end_i, diags, nid, fuel}
+  end
+
+  defp collect_interp(t, i, acc, diags, nid, fuel) do
+    cond do
+      fuel <= 0 ->
+        {:lists.reverse(acc), i, diags, nid, fuel}
+
+      Tokens.kind(t, i) in [:end_interpolation, :eof] ->
+        {:lists.reverse(acc), i, diags, nid, fuel}
+
+      Tokens.kind(t, i) in [:eol, :";"] ->
+        collect_interp(t, skip_eoe(t, i), acc, diags, nid, fuel)
+
+      true ->
+        collect_interp_one(t, i, acc, diags, nid, fuel)
+    end
+  end
+
+  defp collect_interp_one(t, i, acc, diags, nid, fuel) do
+    {expr, i2, diags, nid, fuel} = parse_expr(t, i, 0, :no_parens, diags, nid, fuel - 1)
+    i2 = if i2 > i, do: i2, else: i + 1
+    {i3, diags, nid} = end_interp_stmt(t, i2, diags, nid)
+    collect_interp(t, i3, [expr | acc], diags, nid, fuel)
+  end
+
+  # A statement inside `#{...}` ends at EOE or the closing `}`; anything else is leftover.
+  defp end_interp_stmt(t, i, diags, nid) do
+    case Tokens.kind(t, i) do
+      k when k in [:eol, :";"] ->
+        {skip_eoe(t, i), diags, nid}
+
+      k when k in [:end_interpolation, :eof] ->
+        {i, diags, nid}
+
+      :error ->
+        {_id, diags, nid} = emit_lex_error(t, i, diags, nid)
+        {skip_to_interp_eoe(t, i + 1), diags, nid}
+
+      k ->
+        {_id, diags, nid} =
+          Diagnostics.emit(diags, nid, :parser, :error, :unexpected_token, tok_span(t, i), %{
+            kind: k
+          })
+
+        {skip_to_interp_eoe(t, i + 1), diags, nid}
+    end
+  end
+
+  defp skip_to_interp_eoe(t, i) do
+    case Tokens.kind(t, i) do
+      k when k in [:eol, :";", :end_interpolation, :eof] -> i
+      _ -> skip_to_interp_eoe(t, i + 1)
     end
   end
 

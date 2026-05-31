@@ -4,9 +4,13 @@ defmodule Toxic2.Lexer do
 
   Phase 2 rounds out the **non-string** lexicon: numbers (int/float, `0x`/`0o`/`0b`), char
   literals, atoms, keyword keys, `true`/`false`/`nil`, the full operator family set, `<<`/`>>`,
-  `%`, and comments. Strings / heredocs / sigils / interpolation are intentionally **deferred to
-  phase 10** (the spec's dedicated phase): a partial string lexer that ignored interpolation
-  would freeze a wrong token contract, so we do them whole or not at all.
+  `%`, and comments.
+
+  Phase 10 adds **double-quoted strings with interpolation** in the linear source-ordered form:
+  `:string_start`, `:string_fragment` (escapes processed), `:begin_interpolation` /
+  `:end_interpolation` wrapping the interpolation's ordinary tokens, and `:string_end`. The
+  interpolation-closing `}` is told apart from a brace-closing `}` by a small terminator stack
+  (`st`); see the note above `lex/6`. Heredocs, charlists, and sigils are still pending.
 
   Architecture invariants this locks in:
 
@@ -140,43 +144,54 @@ defmodule Toxic2.Lexer do
   """
   @spec tokenize(binary(), keyword()) :: {[token()], [warning()]}
   def tokenize(source, _opts \\ []) when is_binary(source) do
-    {rev_tokens, rev_warnings} = lex(source, 1, 1, [], [])
+    {rev_tokens, rev_warnings} = lex(source, 1, 1, [], [], [])
     {:lists.reverse(rev_tokens), :lists.reverse(rev_warnings)}
   end
 
+  # `st` is a terminator stack used ONLY to tell an interpolation-closing `}` (which ends a
+  # string interpolation and resumes string scanning) apart from a `}` that closes a `{`. `{`
+  # pushes `:brace`; `#{` inside a string pushes `:interp` (see `read_string`). It is NOT the
+  # parser's delimiter matcher — unbalanced delimiters are the parser's concern; this only
+  # disambiguates the lexer's two meanings of `}`.
+
   # --- EOF ---------------------------------------------------------------
-  defp lex(<<>>, _line, _col, acc, w), do: {acc, w}
+  defp lex(<<>>, _line, _col, acc, w, _st), do: {acc, w}
 
   # --- horizontal whitespace ---------------------------------------------
-  defp lex(<<c, rest::binary>>, line, col, acc, w) when c in [?\s, ?\t],
-    do: lex(rest, line, col + 1, acc, w)
+  defp lex(<<c, rest::binary>>, line, col, acc, w, st) when c in [?\s, ?\t],
+    do: lex(rest, line, col + 1, acc, w, st)
 
   # --- end of line (coalesced run, explicit token) -----------------------
-  defp lex(<<"\r\n", _::binary>> = bin, line, col, acc, w), do: do_eol(bin, line, col, acc, w)
-  defp lex(<<"\n", _::binary>> = bin, line, col, acc, w), do: do_eol(bin, line, col, acc, w)
+  defp lex(<<"\r\n", _::binary>> = bin, line, col, acc, w, st),
+    do: do_eol(bin, line, col, acc, w, st)
+
+  defp lex(<<"\n", _::binary>> = bin, line, col, acc, w, st),
+    do: do_eol(bin, line, col, acc, w, st)
 
   # --- comments (dropped unless preserved; phase 2 drops) ----------------
-  defp lex(<<?#, rest::binary>>, line, col, acc, w) do
+  defp lex(<<?#, rest::binary>>, line, col, acc, w, st) do
     {drop_len, rest2} = take_while(rest, 0, &(&1 != ?\n))
-    lex(rest2, line, col + 1 + drop_len, acc, w)
+    lex(rest2, line, col + 1 + drop_len, acc, w, st)
   end
 
-  # --- double-quoted strings (no interpolation yet — phase 10 slice 1) ---
-  defp lex(<<?", rest::binary>>, line, col, acc, w) do
-    read_string(rest, line, col + 1, [], false, line, col, acc, w)
+  # --- double-quoted strings: linear form (string_start, fragments, interp, string_end) --
+  defp lex(<<?", rest::binary>>, line, col, acc, w, st) do
+    start = {:string_start, line, col, line, col + 1, nil}
+    read_string(rest, line, col + 1, [], line, col + 1, [start | acc], w, st)
   end
 
   # --- char literals: ?\<esc> and ?<codepoint> ---------------------------
-  defp lex(<<??, ?\\, e, rest::binary>>, line, col, acc, w) do
+  defp lex(<<??, ?\\, e, rest::binary>>, line, col, acc, w, st) do
     value = Map.get(@char_escapes, e, e)
-    cont(rest, {:char, line, col, line, col + 3, value}, acc, w)
+    cont(rest, {:char, line, col, line, col + 3, value}, acc, w, st)
   end
 
-  defp lex(<<??, cp::utf8, rest::binary>>, line, col, acc, w),
-    do: cont(rest, {:char, line, col, line, col + 2, cp}, acc, w)
+  defp lex(<<??, cp::utf8, rest::binary>>, line, col, acc, w, st),
+    do: cont(rest, {:char, line, col, line, col + 2, cp}, acc, w, st)
 
   # --- numbers: 0x / 0o / 0b ---------------------------------------------
-  defp lex(<<?0, b, _::binary>> = bin, line, col, acc, w) when b in [?x, ?X, ?o, ?O, ?b, ?B] do
+  defp lex(<<?0, b, _::binary>> = bin, line, col, acc, w, st)
+       when b in [?x, ?X, ?o, ?O, ?b, ?B] do
     {base, pred} = radix(b)
     {rlen, _rest} = run_len(rest_at(bin, 2), pred)
     digits = binary_part(bin, 2, rlen)
@@ -184,14 +199,14 @@ defmodule Toxic2.Lexer do
     if rlen > 0 and valid_underscores?(digits, pred) do
       total = 2 + rlen
       value = digits |> strip_underscores() |> String.to_integer(base)
-      cont(rest_at(bin, total), {:int, line, col, line, col + total, value}, acc, w)
+      cont(rest_at(bin, total), {:int, line, col, line, col + total, value}, acc, w, st)
     else
-      num_error(bin, 2 + rlen, line, col, acc, w)
+      num_error(bin, 2 + rlen, line, col, acc, w, st)
     end
   end
 
   # --- numbers: decimal int / float --------------------------------------
-  defp lex(<<c, _::binary>> = bin, line, col, acc, w) when is_digit(c) do
+  defp lex(<<c, _::binary>> = bin, line, col, acc, w, st) when is_digit(c) do
     {ilen, after_int} = run_len(bin, &dec?/1)
     int_ok = valid_underscores?(binary_part(bin, 0, ilen), &dec?/1)
 
@@ -204,27 +219,27 @@ defmodule Toxic2.Lexer do
 
         if int_ok and frac_ok and exp_ok do
           value = bin |> binary_part(0, total) |> strip_underscores() |> String.to_float()
-          cont(rest_at(bin, total), {:flt, line, col, line, col + total, value}, acc, w)
+          cont(rest_at(bin, total), {:flt, line, col, line, col + total, value}, acc, w, st)
         else
-          num_error(bin, total, line, col, acc, w)
+          num_error(bin, total, line, col, acc, w, st)
         end
 
       _ ->
         if int_ok do
           value = bin |> binary_part(0, ilen) |> strip_underscores() |> String.to_integer()
-          cont(rest_at(bin, ilen), {:int, line, col, line, col + ilen, value}, acc, w)
+          cont(rest_at(bin, ilen), {:int, line, col, line, col + ilen, value}, acc, w, st)
         else
-          num_error(bin, ilen, line, col, acc, w)
+          num_error(bin, ilen, line, col, acc, w, st)
         end
     end
   end
 
   # --- type operator :: (before the atom `:` clause) ---------------------
-  defp lex(<<"::", rest::binary>>, line, col, acc, w),
-    do: cont(rest, {:type_op, line, col, line, col + 2, :"::"}, acc, w)
+  defp lex(<<"::", rest::binary>>, line, col, acc, w, st),
+    do: cont(rest, {:type_op, line, col, line, col + 2, :"::"}, acc, w, st)
 
   # --- atoms: :name and :<operator> (quoted atoms deferred to phase 10) --
-  defp lex(<<?:, c, _::binary>> = bin, line, col, acc, w)
+  defp lex(<<?:, c, _::binary>> = bin, line, col, acc, w, st)
        when is_lower_start(c) or is_upper_start(c) do
     {wlen, _name, _rest} = read_name(rest_at(bin, 1))
     total = 1 + wlen
@@ -233,11 +248,12 @@ defmodule Toxic2.Lexer do
       rest_at(bin, total),
       {:atom, line, col, line, col + total, binary_part(bin, 1, wlen)},
       acc,
-      w
+      w,
+      st
     )
   end
 
-  defp lex(<<?:, rest::binary>> = bin, line, col, acc, w) do
+  defp lex(<<?:, rest::binary>> = bin, line, col, acc, w, st) do
     case match_op(rest) do
       {_kind, _value, oplen} ->
         total = 1 + oplen
@@ -246,73 +262,90 @@ defmodule Toxic2.Lexer do
           rest_at(bin, total),
           {:atom, line, col, line, col + total, binary_part(bin, 1, oplen)},
           acc,
-          w
+          w,
+          st
         )
 
       nil ->
         err = LexError.new(:unexpected_colon, %{})
-        cont(rest_at(bin, 1), {:error, line, col, line, col + 1, err}, acc, w)
+        cont(rest_at(bin, 1), {:error, line, col, line, col + 1, err}, acc, w, st)
     end
   end
 
   # --- capture int &1 (before the `&` operator in the table) -------------
-  defp lex(<<?&, d, _::binary>> = bin, line, col, acc, w) when is_digit(d) do
+  defp lex(<<?&, d, _::binary>> = bin, line, col, acc, w, st) when is_digit(d) do
     {dlen, _} = take_while(rest_at(bin, 1), 0, &is_digit/1)
     total = 1 + dlen
     value = bin |> binary_part(1, dlen) |> String.to_integer()
-    cont(rest_at(bin, total), {:capture_int, line, col, line, col + total, value}, acc, w)
+    cont(rest_at(bin, total), {:capture_int, line, col, line, col + total, value}, acc, w, st)
   end
 
   # --- percent (parser combines with `{`/alias for maps/structs) ---------
-  defp lex(<<?%, rest::binary>>, line, col, acc, w),
-    do: cont(rest, {:percent, line, col, line, col + 1, nil}, acc, w)
+  defp lex(<<?%, rest::binary>>, line, col, acc, w, st),
+    do: cont(rest, {:percent, line, col, line, col + 1, nil}, acc, w, st)
 
-  # --- single-char delimiters / separators -------------------------------
-  defp lex(<<c, rest::binary>>, line, col, acc, w) when c in [?(, ?), ?[, ?], ?{, ?}, ?,, ?;],
-    do: cont(rest, {delim_kind(c), line, col, line, col + 1, nil}, acc, w)
+  # --- `{` opens a brace frame (so the matching `}` isn't mistaken for an interp close) ---
+  defp lex(<<?{, rest::binary>>, line, col, acc, w, st),
+    do: cont(rest, {:"{", line, col, line, col + 1, nil}, acc, w, [:brace | st])
+
+  # --- `}` ends an interpolation (resume the string) OR closes a brace ---
+  defp lex(<<?}, rest::binary>>, line, col, acc, w, [:interp | st]) do
+    token = {:end_interpolation, line, col, line, col + 1, nil}
+    read_string(rest, line, col + 1, [], line, col + 1, [token | acc], w, st)
+  end
+
+  defp lex(<<?}, rest::binary>>, line, col, acc, w, [:brace | st]),
+    do: cont(rest, {:"}", line, col, line, col + 1, nil}, acc, w, st)
+
+  defp lex(<<?}, rest::binary>>, line, col, acc, w, st),
+    do: cont(rest, {:"}", line, col, line, col + 1, nil}, acc, w, st)
+
+  # --- other single-char delimiters / separators ------------------------
+  defp lex(<<c, rest::binary>>, line, col, acc, w, st) when c in [?(, ?), ?[, ?], ?,, ?;],
+    do: cont(rest, {delim_kind(c), line, col, line, col + 1, nil}, acc, w, st)
 
   # --- identifiers (lowercase/_) : kw key, reserved op, literal, or name --
-  defp lex(<<c, _::binary>> = bin, line, col, acc, w) when is_lower_start(c) do
+  defp lex(<<c, _::binary>> = bin, line, col, acc, w, st) when is_lower_start(c) do
     {len, name, after_name} = read_name(bin)
 
     case kw_suffix(after_name) do
       {:kw, rest} ->
-        cont(rest, {:kw_identifier, line, col, line, col + len + 1, name}, acc, w)
+        cont(rest, {:kw_identifier, line, col, line, col + len + 1, name}, acc, w, st)
 
       :no ->
-        cont(rest_at(bin, len), lower_token(name, line, col, len), acc, w)
+        cont(rest_at(bin, len), lower_token(name, line, col, len), acc, w, st)
     end
   end
 
   # --- aliases (Uppercase): kw key or alias ------------------------------
-  defp lex(<<c, _::binary>> = bin, line, col, acc, w) when is_upper_start(c) do
+  defp lex(<<c, _::binary>> = bin, line, col, acc, w, st) when is_upper_start(c) do
     {len, _} = word_len(bin, 0)
     name = binary_part(bin, 0, len)
 
     case kw_suffix(rest_at(bin, len)) do
       {:kw, rest} ->
-        cont(rest, {:kw_identifier, line, col, line, col + len + 1, name}, acc, w)
+        cont(rest, {:kw_identifier, line, col, line, col + len + 1, name}, acc, w, st)
 
       :no ->
-        cont(rest_at(bin, len), {:alias, line, col, line, col + len, name}, acc, w)
+        cont(rest_at(bin, len), {:alias, line, col, line, col + len, name}, acc, w, st)
     end
   end
 
   # --- operators (longest match) + tolerant UTF-8/byte error fallback ----
-  defp lex(bin, line, col, acc, w) do
+  defp lex(bin, line, col, acc, w, st) do
     case match_op(bin) do
       {kind, value, len} ->
-        cont(rest_at(bin, len), {kind, line, col, line, col + len, value}, acc, w)
+        cont(rest_at(bin, len), {kind, line, col, line, col + len, value}, acc, w, st)
 
       nil ->
         case bin do
           <<cp::utf8, rest::binary>> ->
             err = LexError.new(:unexpected_char, %{codepoint: cp})
-            cont(rest, {:error, line, col, line, col + 1, err}, acc, w)
+            cont(rest, {:error, line, col, line, col + 1, err}, acc, w, st)
 
           <<byte, rest::binary>> ->
             err = LexError.new(:invalid_byte, %{byte: byte})
-            cont(rest, {:error, line, col, line, col + 1, err}, acc, w)
+            cont(rest, {:error, line, col, line, col + 1, err}, acc, w, st)
         end
     end
   end
@@ -353,51 +386,62 @@ defmodule Toxic2.Lexer do
   # --- shared continuation -----------------------------------------------
 
   # Continue lexing from `rest`, advancing the cursor to the token's end position.
-  defp cont(rest, {_kind, _sl, _sc, el, ec, _v} = token, acc, w),
-    do: lex(rest, el, ec, [token | acc], w)
+  defp cont(rest, {_kind, _sl, _sc, el, ec, _v} = token, acc, w, st),
+    do: lex(rest, el, ec, [token | acc], w, st)
 
-  # --- string scanning (phase 10 slice 1: no interpolation) --------------
-  # Accumulates fragment bytes with escapes processed. `#{` marks the string as interpolated;
-  # interpolation is deferred to a later slice, so an interpolated string lexes to a single
-  # tolerant :error token — never a wrong value. A newline or EOF before the closing `"` is an
-  # unterminated-string error (double-quoted strings don't span lines; that's heredocs).
-  defp read_string(<<?", rest::binary>>, line, col, buf, interp?, sl, sc, acc, w) do
-    token =
-      if interp? do
-        {:error, sl, sc, line, col + 1, LexError.new(:interpolation_unsupported, %{})}
-      else
-        {:string, sl, sc, line, col + 1, IO.iodata_to_binary(:lists.reverse(buf))}
-      end
-
-    lex(rest, line, col + 1, [token | acc], w)
+  # --- string scanning (phase 10): linear, interpolation-aware -----------
+  # Emits `:string_fragment` runs (escapes processed) interleaved with `:begin_interpolation` /
+  # interpolation tokens / `:end_interpolation`, terminated by `:string_end`. On `#{` it flushes
+  # the pending fragment, emits `:begin_interpolation`, pushes an `:interp` frame and hands
+  # control back to `lex`; the matching `}` (recognised in `lex`) emits `:end_interpolation` and
+  # resumes here with a fresh fragment. A newline or EOF before the closing `"` is an
+  # unterminated-string error (double-quoted strings don't span lines — that's heredocs).
+  # `(fl, fc)` is the start position of the fragment currently being accumulated in `buf`.
+  defp read_string(<<?", rest::binary>>, line, col, buf, fl, fc, acc, w, st) do
+    acc = flush_fragment(buf, fl, fc, line, col, acc)
+    acc = [{:string_end, line, col, line, col + 1, nil} | acc]
+    lex(rest, line, col + 1, acc, w, st)
   end
 
-  defp read_string(<<?\\, e, rest::binary>>, line, col, buf, interp?, sl, sc, acc, w) do
+  defp read_string(<<?\\, e, rest::binary>>, line, col, buf, fl, fc, acc, w, st) do
     cp = Map.get(@char_escapes, e, e)
-    read_string(rest, line, col + 2, [<<cp::utf8>> | buf], interp?, sl, sc, acc, w)
+    read_string(rest, line, col + 2, [<<cp::utf8>> | buf], fl, fc, acc, w, st)
   end
 
-  defp read_string(<<?#, ?{, rest::binary>>, line, col, buf, _interp?, sl, sc, acc, w) do
-    read_string(rest, line, col + 2, buf, true, sl, sc, acc, w)
+  defp read_string(<<?#, ?{, rest::binary>>, line, col, buf, fl, fc, acc, w, st) do
+    acc = flush_fragment(buf, fl, fc, line, col, acc)
+    acc = [{:begin_interpolation, line, col, line, col + 2, nil} | acc]
+    lex(rest, line, col + 2, acc, w, [:interp | st])
   end
 
-  defp read_string(<<?\n, _::binary>> = rest, line, col, _buf, _interp?, sl, sc, acc, w) do
-    err = {:error, sl, sc, line, col, LexError.new(:string_missing_terminator, %{})}
-    lex(rest, line, col, [err | acc], w)
+  defp read_string(<<?\n, _::binary>> = rest, line, col, buf, fl, fc, acc, w, st) do
+    acc = flush_fragment(buf, fl, fc, line, col, acc)
+    err = {:error, line, col, line, col, LexError.new(:string_missing_terminator, %{})}
+    acc = [{:string_end, line, col, line, col, nil}, err | acc]
+    lex(rest, line, col, acc, w, st)
   end
 
-  defp read_string(<<>>, line, col, _buf, _interp?, sl, sc, acc, w) do
-    err = {:error, sl, sc, line, col, LexError.new(:string_missing_terminator, %{})}
-    {[err | acc], w}
+  defp read_string(<<>>, line, col, buf, fl, fc, acc, w, _st) do
+    acc = flush_fragment(buf, fl, fc, line, col, acc)
+    err = {:error, line, col, line, col, LexError.new(:string_missing_terminator, %{})}
+    {[{:string_end, line, col, line, col, nil}, err | acc], w}
   end
 
-  defp read_string(<<c::utf8, rest::binary>>, line, col, buf, interp?, sl, sc, acc, w) do
-    read_string(rest, line, col + 1, [<<c::utf8>> | buf], interp?, sl, sc, acc, w)
+  defp read_string(<<c::utf8, rest::binary>>, line, col, buf, fl, fc, acc, w, st) do
+    read_string(rest, line, col + 1, [<<c::utf8>> | buf], fl, fc, acc, w, st)
   end
 
   # A stray non-UTF-8 byte inside a string: keep it verbatim and keep scanning (tolerant).
-  defp read_string(<<byte, rest::binary>>, line, col, buf, interp?, sl, sc, acc, w) do
-    read_string(rest, line, col + 1, [<<byte>> | buf], interp?, sl, sc, acc, w)
+  defp read_string(<<byte, rest::binary>>, line, col, buf, fl, fc, acc, w, st) do
+    read_string(rest, line, col + 1, [<<byte>> | buf], fl, fc, acc, w, st)
+  end
+
+  # A fragment token is emitted only for a non-empty run, spanning (fl, fc)..(el, ec).
+  defp flush_fragment([], _fl, _fc, _el, _ec, acc), do: acc
+
+  defp flush_fragment(buf, fl, fc, el, ec, acc) do
+    value = IO.iodata_to_binary(:lists.reverse(buf))
+    [{:string_fragment, fl, fc, el, ec, value} | acc]
   end
 
   # Read an identifier/atom name: word chars + optional single trailing ? or !.
@@ -417,9 +461,9 @@ defmodule Toxic2.Lexer do
 
   # --- end-of-line coalescing --------------------------------------------
 
-  defp do_eol(bin, sl, sc, acc, w) do
+  defp do_eol(bin, sl, sc, acc, w, st) do
     {rest, el, ec, count} = consume_eols(bin, sl, sc, 0)
-    lex(rest, el, ec, [{:eol, sl, sc, el, ec, count} | acc], w)
+    lex(rest, el, ec, [{:eol, sl, sc, el, ec, count} | acc], w, st)
   end
 
   defp consume_eols(<<"\r\n", rest::binary>>, line, _col, count),
@@ -484,9 +528,9 @@ defmodule Toxic2.Lexer do
 
   defp scan_exp(_bin), do: {0, true}
 
-  defp num_error(bin, len, line, col, acc, w) do
+  defp num_error(bin, len, line, col, acc, w, st) do
     err = LexError.new(:invalid_number, %{})
-    cont(rest_at(bin, len), {:error, line, col, line, col + len, err}, acc, w)
+    cont(rest_at(bin, len), {:error, line, col, line, col + len, err}, acc, w, st)
   end
 
   defp strip_underscores(bin), do: :binary.replace(bin, "_", "", [:global])
@@ -504,8 +548,6 @@ defmodule Toxic2.Lexer do
   defp delim_kind(?)), do: :")"
   defp delim_kind(?[), do: :"["
   defp delim_kind(?]), do: :"]"
-  defp delim_kind(?{), do: :"{"
-  defp delim_kind(?}), do: :"}"
   defp delim_kind(?,), do: :","
   defp delim_kind(?;), do: :";"
 end

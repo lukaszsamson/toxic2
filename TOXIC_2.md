@@ -540,11 +540,15 @@ phase 6 onward each phase also ends green under `toxic2.conformance --gate` and 
 7. Containers + calls.
 8. No-parens call families with expression-class flags.
 9. Blocks, stabs, control-flow, `do` attachment.
-10. Strings, sigils, heredocs, interpolation. **(in progress — slice 1: double-quoted strings
-    with escape processing → `:string` token → binary literal. `#{` is detected and deferred to a
-    single tolerant `:error` (never a wrong value); unterminated strings are one `:error`. Next
-    slices: real interpolation (linear `string_start`/`fragment`/`begin_interpolation`/
-    `end_interpolation`/`string_end` + `{:<<>>, ...}` lowering), charlists, heredocs, sigils.)**
+10. Strings, sigils, heredocs, interpolation. **(in progress — double-quoted strings WITH
+    interpolation done. Lexer emits the linear form `:string_start` / `:string_fragment` (escapes
+    processed) / `:begin_interpolation` … `:end_interpolation` / `:string_end`; a small
+    terminator stack (`:brace` / `:interp`) in `lex` tells an interpolation-closing `}` apart from
+    a brace-closing one, so nested braces/strings/interpolations lex correctly. Parser builds a
+    `:string` node (fragment leaves + `:interp` block nodes); lowering yields a bare binary when
+    there's no interpolation, else the `{:<<>>, [], [..., {:"::", _, [{{:., _, [Kernel,
+    :to_string]}, _, [expr]}, {:binary, _, nil}]}, ...]}` form. Unterminated strings are one
+    `:error` + synthetic `:string_end` (no crash). Next slices: charlists, heredocs, sigils.)**
 11. Parser-only recovery + invalid-code property harness.
 12. Port old property failures as permanent fixtures.
 13. Benchmark; remove hot-path allocations before broadening features.

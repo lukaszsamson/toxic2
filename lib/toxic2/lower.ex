@@ -48,7 +48,6 @@ defmodule Toxic2.Lower do
       :int -> {val, acc, nid}
       :flt -> {val, acc, nid}
       :char -> {val, acc, nid}
-      :string -> {val, acc, nid}
       :literal -> {val, acc, nid}
       :atom -> atomize(cst, view, opts, acc, nid, val, & &1)
       :identifier -> atomize(cst, view, opts, acc, nid, val, &{&1, meta, nil})
@@ -144,7 +143,64 @@ defmodule Toxic2.Lower do
     {{:->, [], [args, body]}, acc, nid}
   end
 
+  defp lower_kind(:string, ch, _cst, view, opts, acc, nid),
+    do: lower_string(ch, view, opts, acc, nid)
+
+  # An interpolation's inner is a block (`#{a; b}` → `{:__block__, ...}`, `#{a}` → `a`).
+  defp lower_kind(:interp, ch, _cst, view, opts, acc, nid),
+    do: lower_block(ch, view, opts, acc, nid)
+
   defp lower_kind(_other, _ch, cst, view, _opts, acc, nid), do: {error_ast(cst, view), acc, nid}
+
+  # A string lowers to a bare binary when it has no interpolation, else to the `<<>>` form Elixir
+  # uses: fragments stay binaries; each interpolation becomes a `Kernel.to_string/1` ::-binary
+  # segment. Error leaves (unterminated marker) are skipped — their diagnostic is already emitted.
+  defp lower_string(children, view, opts, acc, nid) do
+    {rev_parts, acc, nid} =
+      Enum.reduce(children, {[], acc, nid}, fn child, {parts, a, n} ->
+        lower_string_part(child, view, opts, parts, a, n)
+      end)
+
+    build_string(:lists.reverse(rev_parts), acc, nid)
+  end
+
+  defp lower_string_part(child, view, opts, parts, acc, nid) do
+    case CST.tag(child) do
+      :token -> lower_fragment_part(child, view, parts, acc, nid)
+      :node -> lower_interp_part(child, view, opts, parts, acc, nid)
+      _ -> {parts, acc, nid}
+    end
+  end
+
+  defp lower_fragment_part(child, view, parts, acc, nid) do
+    if Tokens.kind(view, CST.token_index(child)) == :string_fragment do
+      {[{:frag, Tokens.value(view, CST.token_index(child))} | parts], acc, nid}
+    else
+      {parts, acc, nid}
+    end
+  end
+
+  defp lower_interp_part(child, view, opts, parts, acc, nid) do
+    if CST.node_kind(child) == :interp do
+      {ast, acc, nid} = lower_block(CST.children(child), view, opts, acc, nid)
+      {[{:interp, ast} | parts], acc, nid}
+    else
+      {parts, acc, nid}
+    end
+  end
+
+  defp build_string(parts, acc, nid) do
+    if Enum.any?(parts, &match?({:interp, _}, &1)) do
+      {{:<<>>, [], Enum.map(parts, &string_segment/1)}, acc, nid}
+    else
+      {parts |> Enum.map(fn {:frag, b} -> b end) |> IO.iodata_to_binary(), acc, nid}
+    end
+  end
+
+  defp string_segment({:frag, bin}), do: bin
+
+  defp string_segment({:interp, ast}),
+    do: {:"::", [], [{{:., [], [Kernel, :to_string]}, [], [ast]}, {:binary, [], nil}]}
 
   defp lower_block([], _view, _opts, acc, nid), do: {{:__block__, [], []}, acc, nid}
   defp lower_block([only], view, opts, acc, nid), do: lower(only, view, opts, acc, nid)
