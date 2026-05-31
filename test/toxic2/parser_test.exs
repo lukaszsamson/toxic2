@@ -367,6 +367,36 @@ defmodule Toxic2.ParserTest do
       {_v, _es, diags} = exprs("fn x -> x")
       assert Enum.any?(diags, &(elem(&1, 3) == :expected_end))
     end
+
+    test "empty fn is an error" do
+      {_v, _es, diags} = exprs("fn end")
+      assert Enum.any?(diags, &(elem(&1, 3) == :missing_clauses))
+    end
+
+    test "missing end in a do-block does NOT crash lowering (totality, P5)" do
+      for src <- ["if x do y", "foo do", "case x do 1 -> y"] do
+        {ast, diags} = Toxic2.parse_to_ast(src)
+        assert is_tuple(ast) or is_atom(ast)
+        assert Enum.any?(diags, &(elem(&1, 3) == :expected_end)), "#{src}"
+      end
+    end
+
+    test "leftover same-line tokens inside bodies are an error" do
+      for src <- ["fn -> 1 2 end", "if x do 1 2 end", "case x do 1 -> 2 3 end"] do
+        {_v, _es, diags} = exprs(src)
+        assert Enum.any?(diags, &(elem(&1, 3) == :unexpected_token)), "#{src}"
+      end
+    end
+  end
+
+  describe "not in (lowering rewrite + deprecation)" do
+    test "`not a in b` rewrites to not(a in b) with a deprecation warning" do
+      {ast, diags} = Toxic2.parse_to_ast("not a in b")
+      assert {:not, _, [{:in, _, [{:a, _, nil}, {:b, _, nil}]}]} = ast
+      assert Enum.any?(diags, &(elem(&1, 1) == :lowerer and elem(&1, 3) == :deprecated_not_in))
+      # warning, not error — valid code still conforms
+      refute Enum.any?(diags, &(elem(&1, 2) == :error))
+    end
   end
 
   describe "do/end blocks (phase 9)" do

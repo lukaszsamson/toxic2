@@ -160,10 +160,41 @@ defmodule Toxic2.Lower do
     do: lower(inner, view, opts, acc, nid)
 
   defp lower_binary([lhs, op_leaf, rhs], view, opts, acc, nid) do
-    {l, acc, nid} = lower(lhs, view, opts, acc, nid)
-    {r, acc, nid} = lower(rhs, view, opts, acc, nid)
-    {{op_atom(op_leaf, view), op_meta(op_leaf, view), [l, r]}, acc, nid}
+    if op_atom(op_leaf, view) == :in and not_unary?(lhs, view) do
+      lower_deprecated_not_in(lhs, op_leaf, rhs, view, opts, acc, nid)
+    else
+      {l, acc, nid} = lower(lhs, view, opts, acc, nid)
+      {r, acc, nid} = lower(rhs, view, opts, acc, nid)
+      {{op_atom(op_leaf, view), op_meta(op_leaf, view), [l, r]}, acc, nid}
+    end
   end
+
+  # `not a in b` (an `in` whose LHS is a bare unary `not`) is the deprecated spelling of
+  # `not(a in b)`. Rewrite it here (P5) and emit a deprecation `:warning`. `(not a) in b`
+  # (parenthesized) is a `:paren` lhs, so it is not matched and keeps its literal meaning.
+  defp lower_deprecated_not_in(
+         {:node, :unary_op, _sp, [_not, operand], _f, _d},
+         op_leaf,
+         rhs,
+         view,
+         opts,
+         acc,
+         nid
+       ) do
+    {o, acc, nid} = lower(operand, view, opts, acc, nid)
+    {r, acc, nid} = lower(rhs, view, opts, acc, nid)
+    span = Tokens.span(view, CST.token_index(op_leaf)) || {1, 1, 1, 1}
+
+    {_id, acc, nid} =
+      Diagnostics.emit(acc, nid, :lowerer, :warning, :deprecated_not_in, span, %{})
+
+    {{:not, [], [{:in, [], [o, r]}]}, acc, nid}
+  end
+
+  defp not_unary?({:node, :unary_op, _sp, [op_leaf, _operand], _f, _d}, view),
+    do: Tokens.value(view, CST.token_index(op_leaf)) == :not
+
+  defp not_unary?(_lhs, _view), do: false
 
   defp lower_unary([op_leaf, operand], view, opts, acc, nid) do
     {o, acc, nid} = lower(operand, view, opts, acc, nid)
@@ -314,12 +345,17 @@ defmodule Toxic2.Lower do
     end
   end
 
-  # `do ... else ... end` => keyword list `[do: body, else: body, ...]`.
+  # `do ... else ... end` => keyword list `[do: body, else: body, ...]`. A trailing `:missing`
+  # (recovered missing `end`) is skipped — its diagnostic was already emitted by the parser.
   defp lower_do_block(db, view, opts, acc, nid) do
     {pairs, acc, nid} =
-      Enum.reduce(CST.children(db), {[], acc, nid}, fn section, {ps, a, n} ->
-        {pair, a, n} = lower_section(section, view, opts, a, n)
-        {[pair | ps], a, n}
+      Enum.reduce(CST.children(db), {[], acc, nid}, fn
+        {:node, :do_section, _sp, _ch, _f, _d} = section, {ps, a, n} ->
+          {pair, a, n} = lower_section(section, view, opts, a, n)
+          {[pair | ps], a, n}
+
+        _other, accum ->
+          accum
       end)
 
     {:lists.reverse(pairs), acc, nid}

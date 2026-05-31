@@ -159,6 +159,7 @@ defmodule Toxic2.Conformance.Corpus do
     {"f a,\n b", [:no_parens]},
     {"f a,\n b: 1", [:no_parens]},
     {"a not in b", [:operator]},
+    {"not a in b", [:operator]},
     # fn / stab clauses (phase 9)
     {"fn -> :ok end", [:fn]},
     {"fn x -> x end", [:fn]},
@@ -212,6 +213,16 @@ defmodule Toxic2.Conformance.Corpus do
     {"%{m |}", [:map]},
     {"%Foo{m |}", [:struct]},
     {"{a: 1}", [:keyword]},
+    # missing `end` / empty fn / leftover tokens in bodies (must not crash; emit diagnostics)
+    {"if x do y", [:do_block]},
+    {"foo do", [:do_block]},
+    {"case x do 1 -> y", [:do_block]},
+    {"fn end", [:fn]},
+    {"fn -> 1 2 end", [:fn]},
+    {"if x do 1 2 end", [:do_block]},
+    {"foo do 1 2 end", [:do_block]},
+    {"case x do 1 -> 2 3 end", [:do_block]},
+    {"cond do true -> 1 2 end", [:do_block]},
     # no-parens call as a non-last container element (oracle rejects; parens required)
     {"[f a, b]", [:no_parens]},
     {"{f a, b}", [:no_parens]},

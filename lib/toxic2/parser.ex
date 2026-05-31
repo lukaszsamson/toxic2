@@ -559,6 +559,17 @@ defmodule Toxic2.Parser do
 
     cond do
       Tokens.kind(t, i) == :end ->
+        # `fn end` (no clauses) is invalid in Elixir.
+        {diags, nid} =
+          if acc == [] do
+            {_id, d, n} =
+              Diagnostics.emit(diags, nid, :parser, :error, :missing_clauses, tok_span(t, i), %{})
+
+            {d, n}
+          else
+            {diags, nid}
+          end
+
         {:lists.reverse(acc), i + 1, diags, nid, fuel}
 
       Tokens.at_eof?(t, i) ->
@@ -666,7 +677,33 @@ defmodule Toxic2.Parser do
       true ->
         {stmt, j, diags, nid, fuel} = parse_expr(t, i, 0, :no_parens, diags, nid, fuel - 1)
         j = if j > i, do: j, else: i + 1
+        {j, diags, nid} = body_boundary(t, j, diags, nid)
         parse_clause_body(t, j, [stmt | acc], diags, nid, fuel)
+    end
+  end
+
+  # After a body statement, the cursor must be at a boundary (EOE / `end` / block label / EOF /
+  # next clause head). A same-line leftover token (`fn -> 1 2 end`) is an error; skip to a boundary.
+  defp body_boundary(t, i, diags, nid) do
+    cond do
+      at_section_end?(t, i) or Tokens.kind(t, i) in [:eol, :";"] or clause_head_ahead?(t, i, 0) ->
+        {i, diags, nid}
+
+      true ->
+        {_id, diags, nid} =
+          Diagnostics.emit(diags, nid, :parser, :error, :unexpected_token, tok_span(t, i), %{
+            kind: Tokens.kind(t, i)
+          })
+
+        {skip_to_body_boundary(t, i + 1), diags, nid}
+    end
+  end
+
+  defp skip_to_body_boundary(t, i) do
+    if at_section_end?(t, i) or Tokens.kind(t, i) in [:eol, :";"] do
+      i
+    else
+      skip_to_body_boundary(t, i + 1)
     end
   end
 
@@ -765,6 +802,7 @@ defmodule Toxic2.Parser do
     else
       {stmt, j, diags, nid, fuel} = parse_expr(t, i, 0, :no_parens, diags, nid, fuel - 1)
       j = if j > i, do: j, else: i + 1
+      {j, diags, nid} = body_boundary(t, j, diags, nid)
       parse_block_stmts(t, j, [stmt | acc], diags, nid, fuel)
     end
   end
