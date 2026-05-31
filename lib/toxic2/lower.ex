@@ -361,6 +361,11 @@ defmodule Toxic2.Lower do
   # `f(args)` => `{fun_atom, meta, lowered_args}`. The callee name respects the atom policy.
   defp lower_call([callee | arg_children], view, opts, acc, nid) do
     {args, acc, nid} = lower_call_args(arg_children, view, opts, acc, nid)
+    lower_callee(CST.tag(callee), callee, args, view, opts, acc, nid)
+  end
+
+  # A bare identifier callee is a named call `{name, meta, args}` (atom via the atom policy).
+  defp lower_callee(:token, callee, args, view, opts, acc, nid) do
     idx = CST.token_index(callee)
     name = Tokens.value(view, idx)
 
@@ -377,11 +382,20 @@ defmodule Toxic2.Lower do
             :error,
             :nonexistent_atom,
             name_span(callee, view),
-            %{name: name}
+            %{
+              name: name
+            }
           )
 
         {{:__error__, tmeta(view, idx), %{diag_ids: [id]}}, acc, nid}
     end
+  end
+
+  # A node callee is the "double parens" call `f(a)(b)` => `{f(a), [], [b]}`: lower the callee
+  # expression and wrap it.
+  defp lower_callee(_tag, callee, args, view, opts, acc, nid) do
+    {callee_ast, acc, nid} = lower(callee, view, opts, acc, nid)
+    {{callee_ast, [], args}, acc, nid}
   end
 
   # Alias chain: `{:__aliases__, meta, segments}`. A leading alias segment contributes its atom;

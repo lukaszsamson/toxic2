@@ -39,8 +39,11 @@ defmodule Toxic2.Parser do
   (a low-precedence unary, family `capture_op` at 90 → `{:&, _, [operand]}`), so `&foo/1`,
   `&Mod.fun/2`, `&(&1 + &2)` work.
 
-  Not yet handled (later islands): multi-statement parens, chained calls `f()()`, the
-  `Foo.{A, B}` dot-tuple. Encountering those yields error/leaf nodes rather than crashing.
+  Chained/double-parens calls `f(a)(b)` / `a.b()()` are handled with Elixir's "at most two paren
+  groups per base" rule (a third, or a call on an alias/access/container, is an error).
+
+  Not yet handled (later islands): multi-statement parens, the `Foo.{A, B}` dot-tuple.
+  Encountering those yields error/leaf nodes rather than crashing.
   """
 
   alias Toxic2.{CST, Diagnostics, LexError, Precedence, Tokens}
@@ -292,10 +295,15 @@ defmodule Toxic2.Parser do
   end
 
   # Postfix operations bind tightest (yecc 310): a paren call `f(...)` (adjacent `(`), and dot
-  # forms `a.b` / `a.b(...)` / `a.(...)` / `Foo.Bar` (alias chain).
-  defp postfix(t, i, lhs, ctx, diags, nid, fuel) do
+  # forms `a.b` / `a.b(...)` / `a.(...)` / `Foo.Bar` (alias chain). `pdepth` counts paren-call
+  # groups already applied to the CURRENT call base: Elixir's "double parens" rule allows at most
+  # two (`foo(a)(b)`, `a.b()()`), so a third is rejected. A dot / access / alias starts a fresh
+  # base (`pdepth` resets to 0); a consumed first group (remote/anon call) continues at 1.
+  defp postfix(t, i, lhs, ctx, diags, nid, fuel), do: postfix(t, i, lhs, ctx, diags, nid, fuel, 0)
+
+  defp postfix(t, i, lhs, ctx, diags, nid, fuel, pdepth) do
     cond do
-      paren_call?(t, lhs, i) ->
+      paren_call?(t, lhs, i, pdepth) ->
         {args, j, diags, nid, fuel} = parse_seq(t, i + 1, :")", :call, diags, nid, fuel)
 
         call =
@@ -307,7 +315,7 @@ defmodule Toxic2.Parser do
             nil
           )
 
-        postfix(t, j, call, ctx, diags, nid, fuel)
+        postfix(t, j, call, ctx, diags, nid, fuel, pdepth + 1)
 
       access?(t, lhs, i) ->
         access(t, i, lhs, ctx, diags, nid, fuel)
@@ -357,10 +365,21 @@ defmodule Toxic2.Parser do
     end
   end
 
-  defp paren_call?(t, lhs, i) do
-    CST.tag(lhs) == :token and Tokens.kind(t, CST.token_index(lhs)) == :identifier and
-      Tokens.kind(t, i) == :"(" and Tokens.adjacent?(t, CST.token_index(lhs), i)
+  # A paren-call needs an adjacent `(` and an eligible callee for the current depth: at depth 0 a
+  # bare local-call identifier (`foo(`), at depth 1 the call node it produced (the double
+  # `foo()(`); never deeper, and never an alias / access / container / literal callee.
+  defp paren_call?(t, lhs, i, pdepth) do
+    Tokens.kind(t, i) == :"(" and paren_callee?(t, lhs, pdepth) and
+      adjacent_after?(cst_span(t, lhs), Tokens.span(t, i))
   end
+
+  defp paren_callee?(t, lhs, 0),
+    do: CST.tag(lhs) == :token and Tokens.kind(t, CST.token_index(lhs)) == :identifier
+
+  defp paren_callee?(_t, lhs, 1),
+    do: CST.tag(lhs) == :node and CST.node_kind(lhs) in [:call, :remote_call, :anon_call]
+
+  defp paren_callee?(_t, _lhs, _pdepth), do: false
 
   # `.` after a primary: alias-chain extension (`.Alias`), remote call (`.name` / `.name(...)`),
   # or anonymous call (`.(...)`). A newline is allowed after the dot.
@@ -380,7 +399,9 @@ defmodule Toxic2.Parser do
             nil
           )
 
-        postfix(t, j + 1, node, ctx, diags, nid, fuel)
+        # An alias chain (`Foo.Bar`) is a fresh base that does NOT take a paren-call (`Foo.Bar()`
+        # is rejected by Elixir), so depth 0.
+        postfix(t, j + 1, node, ctx, diags, nid, fuel, 0)
 
       :identifier ->
         remote_call(t, j, lhs, ctx, diags, nid, fuel)
@@ -397,7 +418,8 @@ defmodule Toxic2.Parser do
             nil
           )
 
-        postfix(t, k, node, ctx, diags, nid, fuel)
+        # Anon call `a.(...)` consumed its first paren group; one more (`a.()()`) is allowed.
+        postfix(t, k, node, ctx, diags, nid, fuel, 1)
 
       _ ->
         {id, diags, nid} =
@@ -439,7 +461,8 @@ defmodule Toxic2.Parser do
           nil
         )
 
-      postfix(t, k, node, ctx, diags, nid, fuel)
+      # `a.b(...)` consumed its first paren group; the double `a.b()()` is allowed.
+      postfix(t, k, node, ctx, diags, nid, fuel, 1)
     else
       node =
         CST.node(
@@ -450,7 +473,8 @@ defmodule Toxic2.Parser do
           nil
         )
 
-      postfix(t, name_i + 1, node, ctx, diags, nid, fuel)
+      # `a.b` (no adjacent parens) is a fresh base; a following `(` would have been consumed above.
+      postfix(t, name_i + 1, node, ctx, diags, nid, fuel, 0)
     end
   end
 

@@ -69,6 +69,13 @@ defmodule Toxic2.Conformance.Corpus do
     {"f(&1)", [:capture]},
     {"&abs/1 |> foo", [:capture]},
     {"&x = y", [:capture]},
+    # chained / double-parens calls (Elixir allows at most two groups per base)
+    {"foo()()", [:chained_call]},
+    {"foo(1)(2)", [:chained_call]},
+    {"foo.bar()()", [:chained_call]},
+    {"a.()()", [:chained_call]},
+    {"foo().bar()()", [:chained_call]},
+    {"a.b.c()()", [:chained_call]},
     # charlists
     {"'abc'", [:charlist]},
     {"''", [:charlist]},
@@ -276,6 +283,12 @@ defmodule Toxic2.Conformance.Corpus do
 
   # Oracle rejects these; Toxic2 must not crash and must emit an :error diagnostic.
   @invalid [
+    # over-chained / ineligible paren-call callees (the double-parens rule allows at most two)
+    {"foo()()()", [:chained_call]},
+    {"foo(1)(2)(3)", [:chained_call]},
+    {"foo.bar()()()", [:chained_call]},
+    {"Foo.Bar()", [:chained_call]},
+    {"foo[0]()", [:chained_call]},
     {"a => b", [:recovery]},
     {"1 +", [:recovery]},
     {")", [:recovery]},

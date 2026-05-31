@@ -532,6 +532,30 @@ defmodule Toxic2.ParserTest do
     end
   end
 
+  describe "chained / double-parens calls" do
+    test "two paren-call groups per base are allowed and nest left" do
+      assert {{{:foo, _, []}, _, []}, []} = Toxic2.parse_to_ast("foo()()")
+      assert {{{:foo, _, [1]}, _, [2]}, []} = Toxic2.parse_to_ast("foo(1)(2)")
+
+      assert {{{{:., _, [{:foo, _, nil}, :bar]}, _, []}, _, []}, []} =
+               Toxic2.parse_to_ast("foo.bar()()")
+
+      assert {{{{:., _, [{:a, _, nil}]}, _, []}, _, []}, []} = Toxic2.parse_to_ast("a.()()")
+    end
+
+    test "a third group is rejected (tolerant), not parsed" do
+      {_ast, diags} = Toxic2.parse_to_ast("foo()()()")
+      assert Enum.any?(diags, &(elem(&1, 2) == :error))
+    end
+
+    test "alias / access callees do not take a paren-call" do
+      for src <- ["Foo.Bar()", "foo[0]()"] do
+        {_ast, diags} = Toxic2.parse_to_ast(src)
+        assert Enum.any?(diags, &(elem(&1, 2) == :error)), src
+      end
+    end
+  end
+
   describe "not in (lowering rewrite + deprecation)" do
     test "`not a in b` rewrites to not(a in b) with a deprecation warning" do
       {ast, diags} = Toxic2.parse_to_ast("not a in b")
