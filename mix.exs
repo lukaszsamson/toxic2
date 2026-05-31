@@ -7,6 +7,7 @@ defmodule Toxic2.MixProject do
       version: "0.1.0",
       elixir: "~> 1.19",
       start_permanent: Mix.env() == :prod,
+      elixirc_paths: elixirc_paths(Mix.env()),
       deps: deps(),
       aliases: aliases(),
       # Warnings are errors in CI/quality runs (set MIX_ENV=test or pass --warnings-as-errors).
@@ -23,8 +24,21 @@ defmodule Toxic2.MixProject do
 
   # Run the quality gate in :test env so the `test` step inside the alias works.
   def cli do
-    [preferred_envs: ["toxic2.check": :test, "toxic2.check.full": :test]]
+    [
+      preferred_envs: [
+        "toxic2.check": :test,
+        "toxic2.check.full": :test,
+        "toxic2.conformance.imported": :test,
+        "toxic2.check.imported": :test
+      ]
+    ]
   end
+
+  # In :test, also compile `test/support` — home of the large imported conformance corpora
+  # (`*_corpus.ex`). They live here (not lib/) so they don't ship in the app and aren't scanned
+  # by the quality guard (which globs `lib/**/*.ex` + `test/**/*.exs`, never `test/**/*.ex`).
+  defp elixirc_paths(:test), do: ["lib", "test/support"]
+  defp elixirc_paths(_), do: ["lib"]
 
   defp deps do
     [
@@ -52,6 +66,12 @@ defmodule Toxic2.MixProject do
       "toxic2.check.full": [
         "toxic2.check",
         "dialyzer"
+      ],
+      # Opt-in regression gate for the imported backlog corpora (NOT in the default check —
+      # report-only ratchet). Fails only if a frozen-green imported source regresses.
+      "toxic2.check.imported": [
+        "toxic2.conformance.imported --gate",
+        "toxic2.conformance.imported --lexer --gate"
       ]
     ]
   end

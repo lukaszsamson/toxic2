@@ -421,6 +421,22 @@ Per-class pass/fail/crash counts, perf `ratio_to_yecc`, failures bucketed by con
 
 Tags/buckets = `:lexer` `:layout` `:operator` `:no_parens` `:do_block` `:stab` `:container` `:map` `:bitstring` `:string` `:interpolation` `:keyword` `:recovery` `:lowering` `:metadata` `:performance`. An agent targets one bucket; the gate protects all others.
 
+### Imported backlog corpora (a second, opt-in ratchet)
+
+Beyond the small hand-curated corpus (which must always be 100% green), ~2400 inputs are imported
+from the prior projects' suites — `toxic_parser/test/conformance_test.exs` (parser) and
+`toxic/test/toxic/valid_code_test.exs` (lexer) — via `scripts/import_corpus.exs` into
+`test/support/imported_*_corpus.ex`. Only the **input strings** are imported (tagged by their
+`describe` group); the suites' own expectations (metadata-rich AST / exact `:elixir_tokenizer`
+tuples) are NOT Toxic2's contract — the live oracle is the arbiter. `mix
+toxic2.conformance.imported [--lexer] [--bucket … | --gate | --update-freeze]` runs them as a
+**report-only backlog ratchet** with its own freezes (`imported_freeze_{parser,lexer}.json`),
+deliberately kept OUT of `mix toxic2.check` so the curated gate never thrashes. The lexer track
+asserts a *lexer-clean* invariant (oracle-accepted source ⇒ no `:error` token, source-ordered),
+not token-stream parity. Opt-in: `mix test --include imported` / `mix toxic2.check.imported`.
+First snapshot: parser 803/1653, lexer 633/743 green — the backlog (e.g. `access_expr`,
+`newlines`, quoted/operator atoms, `&` capture) is the prioritised to-do list, shrink-only.
+
 - Crash budget = 0 (P0, reported separately, blocks merge).
 - Perf gate soft until conformance is high, then hard.
 
