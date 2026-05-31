@@ -21,6 +21,15 @@ defmodule Toxic2.Conformance.Corpus do
     {"3.14", [:literal]},
     {"1.0e10", [:literal]},
     {"?a", [:literal]},
+    # strings (phase 10 slice 1: no interpolation)
+    {~S("abc"), [:string]},
+    {~S(""), [:string]},
+    {~S("hello world"), [:string]},
+    {~S("a\nb"), [:string]},
+    {~S("a\tb\\c\""), [:string]},
+    {~S(["a", "b"]), [:string]},
+    {"foo(\"x\")", [:string]},
+    {~S("a" <> "b"), [:string]},
     {":foo", [:literal]},
     {"true", [:literal]},
     {"false", [:literal]},
@@ -203,6 +212,9 @@ defmodule Toxic2.Conformance.Corpus do
     {"%{a =>", [:recovery]},
     {"<<1, 2", [:recovery]},
     {"a[b", [:recovery]},
+    # unterminated string (no crash; emit :error)
+    {~S("abc), [:string]},
+    {~S("a\n), [:string]},
     # keyword-last / trailing-comma / update / kw-in-tuple violations (oracle rejects)
     {"f(1,)", [:recovery]},
     {"f(a: 1, 2)", [:keyword]},

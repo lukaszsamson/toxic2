@@ -48,6 +48,7 @@ defmodule Toxic2.Lower do
       :int -> {val, acc, nid}
       :flt -> {val, acc, nid}
       :char -> {val, acc, nid}
+      :string -> {val, acc, nid}
       :literal -> {val, acc, nid}
       :atom -> atomize(cst, view, opts, acc, nid, val, & &1)
       :identifier -> atomize(cst, view, opts, acc, nid, val, &{&1, meta, nil})

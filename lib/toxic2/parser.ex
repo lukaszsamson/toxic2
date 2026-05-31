@@ -43,7 +43,7 @@ defmodule Toxic2.Parser do
 
   @fuel_base 1_000
 
-  @atomic_kinds [:int, :flt, :char, :atom, :literal, :identifier]
+  @atomic_kinds [:int, :flt, :char, :atom, :literal, :identifier, :string]
 
   # A map key / update base is parsed stopping before `|` (pipe_op 70) so the update separator
   # isn't swallowed as a binary operator.

@@ -313,6 +313,32 @@ defmodule Toxic2.LexerTest do
     end
   end
 
+  describe "double-quoted strings (phase 10 slice 1: no interpolation)" do
+    test "simple strings carry their unescaped binary value" do
+      assert shapes(~S("abc")) == [{:string, "abc"}]
+      assert shapes(~S("")) == [{:string, ""}]
+      assert shapes(~S("hello world")) == [{:string, "hello world"}]
+    end
+
+    test "escapes are processed into the value" do
+      assert shapes(~S("a\nb")) == [{:string, "a\nb"}]
+      assert shapes(~S("a\tb\\c\"d")) == [{:string, "a\tb\\c\"d"}]
+    end
+
+    test "a string is a single token among others" do
+      assert shapes(~S(foo "x" 1)) == [{:identifier, "foo"}, {:string, "x"}, {:int, 1}]
+    end
+
+    test "interpolation is deferred to a single tolerant :error token (never a wrong value)" do
+      assert [{:error, _}] = shapes(~S("a#{b}c"))
+    end
+
+    test "an unterminated string is one :error, never a raise" do
+      assert [{:error, _}] = shapes(~S("abc))
+      assert [{:error, _} | _] = shapes("\"abc\n")
+    end
+  end
+
   describe "batch / source-order invariants" do
     test "empty source yields no tokens" do
       assert tokens("") == []

@@ -161,6 +161,11 @@ defmodule Toxic2.Lexer do
     lex(rest2, line, col + 1 + drop_len, acc, w)
   end
 
+  # --- double-quoted strings (no interpolation yet — phase 10 slice 1) ---
+  defp lex(<<?", rest::binary>>, line, col, acc, w) do
+    read_string(rest, line, col + 1, [], false, line, col, acc, w)
+  end
+
   # --- char literals: ?\<esc> and ?<codepoint> ---------------------------
   defp lex(<<??, ?\\, e, rest::binary>>, line, col, acc, w) do
     value = Map.get(@char_escapes, e, e)
@@ -350,6 +355,50 @@ defmodule Toxic2.Lexer do
   # Continue lexing from `rest`, advancing the cursor to the token's end position.
   defp cont(rest, {_kind, _sl, _sc, el, ec, _v} = token, acc, w),
     do: lex(rest, el, ec, [token | acc], w)
+
+  # --- string scanning (phase 10 slice 1: no interpolation) --------------
+  # Accumulates fragment bytes with escapes processed. `#{` marks the string as interpolated;
+  # interpolation is deferred to a later slice, so an interpolated string lexes to a single
+  # tolerant :error token — never a wrong value. A newline or EOF before the closing `"` is an
+  # unterminated-string error (double-quoted strings don't span lines; that's heredocs).
+  defp read_string(<<?", rest::binary>>, line, col, buf, interp?, sl, sc, acc, w) do
+    token =
+      if interp? do
+        {:error, sl, sc, line, col + 1, LexError.new(:interpolation_unsupported, %{})}
+      else
+        {:string, sl, sc, line, col + 1, IO.iodata_to_binary(:lists.reverse(buf))}
+      end
+
+    lex(rest, line, col + 1, [token | acc], w)
+  end
+
+  defp read_string(<<?\\, e, rest::binary>>, line, col, buf, interp?, sl, sc, acc, w) do
+    cp = Map.get(@char_escapes, e, e)
+    read_string(rest, line, col + 2, [<<cp::utf8>> | buf], interp?, sl, sc, acc, w)
+  end
+
+  defp read_string(<<?#, ?{, rest::binary>>, line, col, buf, _interp?, sl, sc, acc, w) do
+    read_string(rest, line, col + 2, buf, true, sl, sc, acc, w)
+  end
+
+  defp read_string(<<?\n, _::binary>> = rest, line, col, _buf, _interp?, sl, sc, acc, w) do
+    err = {:error, sl, sc, line, col, LexError.new(:string_missing_terminator, %{})}
+    lex(rest, line, col, [err | acc], w)
+  end
+
+  defp read_string(<<>>, line, col, _buf, _interp?, sl, sc, acc, w) do
+    err = {:error, sl, sc, line, col, LexError.new(:string_missing_terminator, %{})}
+    {[err | acc], w}
+  end
+
+  defp read_string(<<c::utf8, rest::binary>>, line, col, buf, interp?, sl, sc, acc, w) do
+    read_string(rest, line, col + 1, [<<c::utf8>> | buf], interp?, sl, sc, acc, w)
+  end
+
+  # A stray non-UTF-8 byte inside a string: keep it verbatim and keep scanning (tolerant).
+  defp read_string(<<byte, rest::binary>>, line, col, buf, interp?, sl, sc, acc, w) do
+    read_string(rest, line, col + 1, [<<byte>> | buf], interp?, sl, sc, acc, w)
+  end
 
   # Read an identifier/atom name: word chars + optional single trailing ? or !.
   defp read_name(bin) do
