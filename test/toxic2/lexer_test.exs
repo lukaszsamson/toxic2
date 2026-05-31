@@ -368,6 +368,23 @@ defmodule Toxic2.LexerTest do
       assert [{:string_start, _}, {:string_fragment, "abc"}, {:error, _}, {:string_end, _}] =
                shapes(~S("abc))
     end
+
+    test "charlists share the linear form with charlist_* token kinds" do
+      assert shapes(~S('ab')) == [
+               {:charlist_start, nil},
+               {:charlist_fragment, "ab"},
+               {:charlist_end, nil}
+             ]
+
+      assert shapes("'x\#{y}'") == [
+               {:charlist_start, nil},
+               {:charlist_fragment, "x"},
+               {:begin_interpolation, nil},
+               {:identifier, "y"},
+               {:end_interpolation, nil},
+               {:charlist_end, nil}
+             ]
+    end
   end
 
   describe "batch / source-order invariants" do

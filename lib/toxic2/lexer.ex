@@ -174,10 +174,15 @@ defmodule Toxic2.Lexer do
     lex(rest2, line, col + 1 + drop_len, acc, w, st)
   end
 
-  # --- double-quoted strings: linear form (string_start, fragments, interp, string_end) --
+  # --- quoted literals: linear form (start, fragments, interp, end) ------
   defp lex(<<?", rest::binary>>, line, col, acc, w, st) do
     start = {:string_start, line, col, line, col + 1, nil}
-    read_string(rest, line, col + 1, [], line, col + 1, [start | acc], w, st)
+    read_quoted(rest, line, col + 1, [], {line, col + 1}, [start | acc], w, st, :dquote)
+  end
+
+  defp lex(<<?', rest::binary>>, line, col, acc, w, st) do
+    start = {:charlist_start, line, col, line, col + 1, nil}
+    read_quoted(rest, line, col + 1, [], {line, col + 1}, [start | acc], w, st, :charlist)
   end
 
   # --- char literals: ?\<esc> and ?<codepoint> ---------------------------
@@ -289,9 +294,9 @@ defmodule Toxic2.Lexer do
     do: cont(rest, {:"{", line, col, line, col + 1, nil}, acc, w, [:brace | st])
 
   # --- `}` ends an interpolation (resume the string) OR closes a brace ---
-  defp lex(<<?}, rest::binary>>, line, col, acc, w, [:interp | st]) do
+  defp lex(<<?}, rest::binary>>, line, col, acc, w, [{:interp, qk} | st]) do
     token = {:end_interpolation, line, col, line, col + 1, nil}
-    read_string(rest, line, col + 1, [], line, col + 1, [token | acc], w, st)
+    read_quoted(rest, line, col + 1, [], {line, col + 1}, [token | acc], w, st, qk)
   end
 
   defp lex(<<?}, rest::binary>>, line, col, acc, w, [:brace | st]),
@@ -389,59 +394,66 @@ defmodule Toxic2.Lexer do
   defp cont(rest, {_kind, _sl, _sc, el, ec, _v} = token, acc, w, st),
     do: lex(rest, el, ec, [token | acc], w, st)
 
-  # --- string scanning (phase 10): linear, interpolation-aware -----------
-  # Emits `:string_fragment` runs (escapes processed) interleaved with `:begin_interpolation` /
-  # interpolation tokens / `:end_interpolation`, terminated by `:string_end`. On `#{` it flushes
-  # the pending fragment, emits `:begin_interpolation`, pushes an `:interp` frame and hands
-  # control back to `lex`; the matching `}` (recognised in `lex`) emits `:end_interpolation` and
-  # resumes here with a fresh fragment. A newline or EOF before the closing `"` is an
-  # unterminated-string error (double-quoted strings don't span lines — that's heredocs).
-  # `(fl, fc)` is the start position of the fragment currently being accumulated in `buf`.
-  defp read_string(<<?", rest::binary>>, line, col, buf, fl, fc, acc, w, st) do
-    acc = flush_fragment(buf, fl, fc, line, col, acc)
-    acc = [{:string_end, line, col, line, col + 1, nil} | acc]
-    lex(rest, line, col + 1, acc, w, st)
-  end
-
-  defp read_string(<<?\\, e, rest::binary>>, line, col, buf, fl, fc, acc, w, st) do
+  # --- quoted literals (phase 10): linear, interpolation-aware -----------
+  # Shared scanner for `"..."` (`qk = :dquote`) and `'...'` (`qk = :charlist`). The opener token
+  # is emitted in `lex`; this emits `*_fragment` runs (escapes processed) interleaved with
+  # `:begin_interpolation` / interpolation tokens / `:end_interpolation`, and a closer. On `#{` it
+  # flushes the pending fragment, pushes `{:interp, qk}`, and hands control to `lex`; the matching
+  # `}` (recognised in `lex`) emits `:end_interpolation` and resumes the right scanner. A newline
+  # or EOF before the closer is unterminated (these don't span lines — that's heredocs).
+  # `fs = {line, col}` is the start position of the fragment currently accumulated in `buf`.
+  defp read_quoted(<<?\\, e, rest::binary>>, line, col, buf, fs, acc, w, st, qk) do
     cp = Map.get(@char_escapes, e, e)
-    read_string(rest, line, col + 2, [<<cp::utf8>> | buf], fl, fc, acc, w, st)
+    read_quoted(rest, line, col + 2, [<<cp::utf8>> | buf], fs, acc, w, st, qk)
   end
 
-  defp read_string(<<?#, ?{, rest::binary>>, line, col, buf, fl, fc, acc, w, st) do
-    acc = flush_fragment(buf, fl, fc, line, col, acc)
+  defp read_quoted(<<?#, ?{, rest::binary>>, line, col, buf, fs, acc, w, st, qk) do
+    acc = flush_fragment(buf, fs, line, col, acc, frag_kind(qk))
     acc = [{:begin_interpolation, line, col, line, col + 2, nil} | acc]
-    lex(rest, line, col + 2, acc, w, [:interp | st])
+    lex(rest, line, col + 2, acc, w, [{:interp, qk} | st])
   end
 
-  defp read_string(<<?\n, _::binary>> = rest, line, col, buf, fl, fc, acc, w, st) do
-    acc = flush_fragment(buf, fl, fc, line, col, acc)
+  defp read_quoted(<<?\n, _::binary>> = rest, line, col, buf, fs, acc, w, st, qk) do
+    acc = flush_fragment(buf, fs, line, col, acc, frag_kind(qk))
     err = {:error, line, col, line, col, LexError.new(:string_missing_terminator, %{})}
-    acc = [{:string_end, line, col, line, col, nil}, err | acc]
+    acc = [{end_kind(qk), line, col, line, col, nil}, err | acc]
     lex(rest, line, col, acc, w, st)
   end
 
-  defp read_string(<<>>, line, col, buf, fl, fc, acc, w, _st) do
-    acc = flush_fragment(buf, fl, fc, line, col, acc)
+  defp read_quoted(<<>>, line, col, buf, fs, acc, w, _st, qk) do
+    acc = flush_fragment(buf, fs, line, col, acc, frag_kind(qk))
     err = {:error, line, col, line, col, LexError.new(:string_missing_terminator, %{})}
-    {[{:string_end, line, col, line, col, nil}, err | acc], w}
+    {[{end_kind(qk), line, col, line, col, nil}, err | acc], w}
   end
 
-  defp read_string(<<c::utf8, rest::binary>>, line, col, buf, fl, fc, acc, w, st) do
-    read_string(rest, line, col + 1, [<<c::utf8>> | buf], fl, fc, acc, w, st)
+  defp read_quoted(<<c::utf8, rest::binary>>, line, col, buf, fs, acc, w, st, qk) do
+    if c == close_char(qk) do
+      acc = flush_fragment(buf, fs, line, col, acc, frag_kind(qk))
+      acc = [{end_kind(qk), line, col, line, col + 1, nil} | acc]
+      lex(rest, line, col + 1, acc, w, st)
+    else
+      read_quoted(rest, line, col + 1, [<<c::utf8>> | buf], fs, acc, w, st, qk)
+    end
   end
 
-  # A stray non-UTF-8 byte inside a string: keep it verbatim and keep scanning (tolerant).
-  defp read_string(<<byte, rest::binary>>, line, col, buf, fl, fc, acc, w, st) do
-    read_string(rest, line, col + 1, [<<byte>> | buf], fl, fc, acc, w, st)
+  # A stray non-UTF-8 byte inside a quoted literal: keep it verbatim and keep scanning (tolerant).
+  defp read_quoted(<<byte, rest::binary>>, line, col, buf, fs, acc, w, st, qk) do
+    read_quoted(rest, line, col + 1, [<<byte>> | buf], fs, acc, w, st, qk)
   end
 
-  # A fragment token is emitted only for a non-empty run, spanning (fl, fc)..(el, ec).
-  defp flush_fragment([], _fl, _fc, _el, _ec, acc), do: acc
+  defp close_char(:dquote), do: ?"
+  defp close_char(:charlist), do: ?'
+  defp frag_kind(:dquote), do: :string_fragment
+  defp frag_kind(:charlist), do: :charlist_fragment
+  defp end_kind(:dquote), do: :string_end
+  defp end_kind(:charlist), do: :charlist_end
 
-  defp flush_fragment(buf, fl, fc, el, ec, acc) do
+  # A fragment token is emitted only for a non-empty run, spanning `fs`..(el, ec).
+  defp flush_fragment([], _fs, _el, _ec, acc, _kind), do: acc
+
+  defp flush_fragment(buf, {fl, fc}, el, ec, acc, kind) do
     value = IO.iodata_to_binary(:lists.reverse(buf))
-    [{:string_fragment, fl, fc, el, ec, value} | acc]
+    [{kind, fl, fc, el, ec, value} | acc]
   end
 
   # Read an identifier/atom name: word chars + optional single trailing ? or !.

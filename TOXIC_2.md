@@ -548,7 +548,11 @@ phase 6 onward each phase also ends green under `toxic2.conformance --gate` and 
     `:string` node (fragment leaves + `:interp` block nodes); lowering yields a bare binary when
     there's no interpolation, else the `{:<<>>, [], [..., {:"::", _, [{{:., _, [Kernel,
     :to_string]}, _, [expr]}, {:binary, _, nil}]}, ...]}` form. Unterminated strings are one
-    `:error` + synthetic `:string_end` (no crash). Next slices: charlists, heredocs, sigils.)**
+    `:error` + synthetic `:string_end` (no crash). Charlists `'...'` reuse the same scanner
+    (`read_quoted` parameterised by quote kind; `:charlist_start` / `:charlist_fragment` /
+    `:charlist_end`) and lower to a literal codepoint list when there's no interpolation, else
+    `{{:., _, [List, :to_charlist]}, _, [[...]]}` with bare `Kernel.to_string` segments (no
+    `::binary`). Next slices: heredocs, sigils.)**
 11. Parser-only recovery + invalid-code property harness.
 12. Port old property failures as permanent fixtures.
 13. Benchmark; remove hot-path allocations before broadening features.

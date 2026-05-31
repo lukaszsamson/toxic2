@@ -546,51 +546,55 @@ defmodule Toxic2.Parser do
   defp parse_primary(:fn, t, i, _ctx, diags, nid, fuel), do: parse_fn(t, i, diags, nid, fuel)
 
   defp parse_primary(:string_start, t, i, _ctx, diags, nid, fuel),
-    do: parse_string(t, i, diags, nid, fuel)
+    do: parse_quoted(t, i, :string, diags, nid, fuel)
+
+  defp parse_primary(:charlist_start, t, i, _ctx, diags, nid, fuel),
+    do: parse_quoted(t, i, :charlist, diags, nid, fuel)
 
   defp parse_primary(_kind, t, i, _ctx, diags, nid, fuel),
     do: parse_unexpected(t, i, diags, nid, fuel)
 
-  # --- strings / interpolation -------------------------------------------
+  # --- strings / charlists / interpolation -------------------------------
 
-  # A string is a linear run `:string_start <part>* :string_end`, where each part is a
-  # `:string_fragment` leaf or a `:begin_interpolation ... :end_interpolation` interpolation. The
-  # CST `:string` node keeps the parts in order; lowering decides bare-binary vs `<<>>`.
-  defp parse_string(t, start_i, diags, nid, fuel) do
-    {parts, j, diags, nid, fuel} = string_parts(t, start_i + 1, [], diags, nid, fuel)
+  # A quoted literal is a linear run `<start> <part>* <end>`, where each part is a fragment leaf
+  # or a `:begin_interpolation ... :end_interpolation` interpolation. `node_kind` (`:string` or
+  # `:charlist`) is set from the opener; lowering decides the concrete shape from it.
+  defp parse_quoted(t, start_i, node_kind, diags, nid, fuel) do
+    {parts, j, diags, nid, fuel} = quoted_parts(t, start_i + 1, [], diags, nid, fuel)
     span = merge(tok_span(t, start_i), tok_span(t, j - 1))
-    {CST.node(:string, span, parts, :matched, nil), j, diags, nid, fuel}
+    {CST.node(node_kind, span, parts, :matched, nil), j, diags, nid, fuel}
   end
 
-  defp string_parts(t, i, acc, diags, nid, fuel) do
+  defp quoted_parts(t, i, acc, diags, nid, fuel) do
     cond do
-      fuel <= 0 ->
-        {:lists.reverse(acc), i, diags, nid, fuel}
-
-      true ->
-        case Tokens.kind(t, i) do
-          :string_fragment ->
-            string_parts(t, i + 1, [CST.token(i) | acc], diags, nid, fuel)
-
-          :begin_interpolation ->
-            {interp, j, diags, nid, fuel} = parse_interp(t, i, diags, nid, fuel)
-            string_parts(t, j, [interp | acc], diags, nid, fuel)
-
-          :string_end ->
-            {:lists.reverse(acc), i + 1, diags, nid, fuel}
-
-          # The lexer's unterminated-string marker (sole transport, P3): record and keep going;
-          # a synthetic `:string_end` follows it.
-          :error ->
-            {id, diags, nid} = emit_lex_error(t, i, diags, nid)
-            string_parts(t, i + 1, [CST.token(i, error: true, diag: id) | acc], diags, nid, fuel)
-
-          # No `:string_end` (truncated stream): stop without consuming.
-          _ ->
-            {:lists.reverse(acc), i, diags, nid, fuel}
-        end
+      fuel <= 0 -> {:lists.reverse(acc), i, diags, nid, fuel}
+      true -> quoted_part(Tokens.kind(t, i), t, i, acc, diags, nid, fuel)
     end
   end
+
+  defp quoted_part(frag, t, i, acc, diags, nid, fuel)
+       when frag in [:string_fragment, :charlist_fragment],
+       do: quoted_parts(t, i + 1, [CST.token(i) | acc], diags, nid, fuel)
+
+  defp quoted_part(:begin_interpolation, t, i, acc, diags, nid, fuel) do
+    {interp, j, diags, nid, fuel} = parse_interp(t, i, diags, nid, fuel)
+    quoted_parts(t, j, [interp | acc], diags, nid, fuel)
+  end
+
+  defp quoted_part(close, _t, i, acc, diags, nid, fuel)
+       when close in [:string_end, :charlist_end],
+       do: {:lists.reverse(acc), i + 1, diags, nid, fuel}
+
+  # The lexer's unterminated marker (sole transport, P3): record and keep going; a synthetic end
+  # follows it.
+  defp quoted_part(:error, t, i, acc, diags, nid, fuel) do
+    {id, diags, nid} = emit_lex_error(t, i, diags, nid)
+    quoted_parts(t, i + 1, [CST.token(i, error: true, diag: id) | acc], diags, nid, fuel)
+  end
+
+  # No closer (truncated stream): stop without consuming.
+  defp quoted_part(_other, _t, i, acc, diags, nid, fuel),
+    do: {:lists.reverse(acc), i, diags, nid, fuel}
 
   # `#{ <block> }` — the inner is a statement block (0 → empty, 1 → expr, n → block at lowering).
   defp parse_interp(t, begin_i, diags, nid, fuel) do

@@ -432,6 +432,19 @@ defmodule Toxic2.ParserTest do
       assert is_binary(ast) or is_tuple(ast)
       assert Enum.any?(diags, &(elem(&1, 3) == :string_missing_terminator))
     end
+
+    test "charlists: a :charlist node, lowering to a codepoint list or List.to_charlist form" do
+      {_view, [c], []} = exprs("'abc'")
+      assert CST.node_kind(c) == :charlist
+
+      assert {[97, 98, 99], []} = Toxic2.parse_to_ast("'abc'")
+      assert {[], []} = Toxic2.parse_to_ast("''")
+
+      {ast, []} = Toxic2.parse_to_ast("'a\#{b}c'")
+
+      assert {{:., _, [List, :to_charlist]}, _,
+              [["a", {{:., _, [Kernel, :to_string]}, _, [{:b, _, nil}]}, "c"]]} = ast
+    end
   end
 
   describe "not in (lowering rewrite + deprecation)" do

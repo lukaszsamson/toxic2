@@ -146,25 +146,41 @@ defmodule Toxic2.Lower do
   defp lower_kind(:string, ch, _cst, view, opts, acc, nid),
     do: lower_string(ch, view, opts, acc, nid)
 
+  defp lower_kind(:charlist, ch, _cst, view, opts, acc, nid),
+    do: lower_charlist(ch, view, opts, acc, nid)
+
   # An interpolation's inner is a block (`#{a; b}` → `{:__block__, ...}`, `#{a}` → `a`).
   defp lower_kind(:interp, ch, _cst, view, opts, acc, nid),
     do: lower_block(ch, view, opts, acc, nid)
 
   defp lower_kind(_other, _ch, cst, view, _opts, acc, nid), do: {error_ast(cst, view), acc, nid}
 
-  # A string lowers to a bare binary when it has no interpolation, else to the `<<>>` form Elixir
-  # uses: fragments stay binaries; each interpolation becomes a `Kernel.to_string/1` ::-binary
-  # segment. Error leaves (unterminated marker) are skipped — their diagnostic is already emitted.
+  # A string lowers to a bare binary with no interpolation, else the `<<>>` form Elixir uses:
+  # fragments stay binaries; each interpolation becomes a `Kernel.to_string/1` ::-binary segment.
   defp lower_string(children, view, opts, acc, nid) do
-    {rev_parts, acc, nid} =
-      Enum.reduce(children, {[], acc, nid}, fn child, {parts, a, n} ->
-        lower_string_part(child, view, opts, parts, a, n)
-      end)
-
-    build_string(:lists.reverse(rev_parts), acc, nid)
+    {parts, acc, nid} = quoted_parts_ast(children, view, opts, acc, nid)
+    build_string(parts, acc, nid)
   end
 
-  defp lower_string_part(child, view, opts, parts, acc, nid) do
+  # A charlist lowers to a literal codepoint list with no interpolation, else to
+  # `List.to_charlist([...])` where interpolations are bare `Kernel.to_string/1` (no ::-binary).
+  defp lower_charlist(children, view, opts, acc, nid) do
+    {parts, acc, nid} = quoted_parts_ast(children, view, opts, acc, nid)
+    build_charlist(parts, acc, nid)
+  end
+
+  # Collect a quoted literal's parts as `{:frag, binary}` / `{:interp, ast}`, in source order.
+  # Error leaves (unterminated marker) are skipped — their diagnostic is already emitted.
+  defp quoted_parts_ast(children, view, opts, acc, nid) do
+    {rev_parts, acc, nid} =
+      Enum.reduce(children, {[], acc, nid}, fn child, {parts, a, n} ->
+        lower_quoted_part(child, view, opts, parts, a, n)
+      end)
+
+    {:lists.reverse(rev_parts), acc, nid}
+  end
+
+  defp lower_quoted_part(child, view, opts, parts, acc, nid) do
     case CST.tag(child) do
       :token -> lower_fragment_part(child, view, parts, acc, nid)
       :node -> lower_interp_part(child, view, opts, parts, acc, nid)
@@ -173,7 +189,7 @@ defmodule Toxic2.Lower do
   end
 
   defp lower_fragment_part(child, view, parts, acc, nid) do
-    if Tokens.kind(view, CST.token_index(child)) == :string_fragment do
+    if Tokens.kind(view, CST.token_index(child)) in [:string_fragment, :charlist_fragment] do
       {[{:frag, Tokens.value(view, CST.token_index(child))} | parts], acc, nid}
     else
       {parts, acc, nid}
@@ -197,10 +213,22 @@ defmodule Toxic2.Lower do
     end
   end
 
+  defp build_charlist(parts, acc, nid) do
+    if Enum.any?(parts, &match?({:interp, _}, &1)) do
+      {{{:., [], [List, :to_charlist]}, [], [Enum.map(parts, &charlist_segment/1)]}, acc, nid}
+    else
+      bin = parts |> Enum.map(fn {:frag, b} -> b end) |> IO.iodata_to_binary()
+      {String.to_charlist(bin), acc, nid}
+    end
+  end
+
   defp string_segment({:frag, bin}), do: bin
 
   defp string_segment({:interp, ast}),
     do: {:"::", [], [{{:., [], [Kernel, :to_string]}, [], [ast]}, {:binary, [], nil}]}
+
+  defp charlist_segment({:frag, bin}), do: bin
+  defp charlist_segment({:interp, ast}), do: {{:., [], [Kernel, :to_string]}, [], [ast]}
 
   defp lower_block([], _view, _opts, acc, nid), do: {{:__block__, [], []}, acc, nid}
   defp lower_block([only], view, opts, acc, nid), do: lower(only, view, opts, acc, nid)
