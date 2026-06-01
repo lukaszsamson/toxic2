@@ -377,6 +377,14 @@ defmodule Toxic2.ParserTest do
       assert Enum.any?(diags, &(elem(&1, 3) == :expected_end))
     end
 
+    test "fn is a valid no-parens argument (resolve fn ... end)" do
+      assert {{:resolve, _, [{:fn, _, [{:->, _, [[{:x, _, nil}], {:x, _, nil}]}]}]}, []} =
+               Toxic2.parse_to_ast("resolve fn x -> x end")
+
+      assert {{{:., _, [{:__aliases__, _, [:Enum]}, :map]}, _, [{:x, _, nil}, {:fn, _, _}]}, []} =
+               Toxic2.parse_to_ast("Enum.map x, fn i -> i end")
+    end
+
     test "empty fn is an error" do
       {_v, _es, diags} = exprs("fn end")
       assert Enum.any?(diags, &(elem(&1, 3) == :missing_clauses))

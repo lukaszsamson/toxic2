@@ -303,6 +303,9 @@ defmodule Toxic2.Conformance.Corpus do
     {"fn a -> 1\n b -> 2 end", [:fn]},
     {"fn 1 -> :one\n 2 -> :two end", [:fn]},
     {"f(fn x -> x end)", [:fn]},
+    {"resolve fn x -> x end", [:fn]},
+    {"change fn cs, _ -> cs end", [:fn]},
+    {"Enum.map x, fn i -> i end", [:fn]},
     {"fn x -> y = x\n y end", [:fn]},
     # do/end blocks (phase 9)
     {"if x do y end", [:do_block]},

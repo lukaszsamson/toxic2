@@ -296,7 +296,8 @@ defmodule Toxic2.Parser do
       :string_start,
       :charlist_start,
       :sigil_start,
-      :quoted_atom
+      :quoted_atom,
+      :fn
     ]
   end
 
