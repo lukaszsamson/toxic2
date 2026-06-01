@@ -354,7 +354,7 @@ defmodule Toxic2.Lower do
 
   defp lower_binary([lhs, op_leaf, rhs], view, opts, acc, nid) do
     cond do
-      op_atom(op_leaf, view) == :in and not_unary?(lhs, view) ->
+      op_atom(op_leaf, view) == :in and negation_unary?(lhs, view) ->
         lower_deprecated_not_in(lhs, op_leaf, rhs, view, opts, acc, nid)
 
       op_atom(op_leaf, view) == :"//" ->
@@ -383,7 +383,7 @@ defmodule Toxic2.Lower do
   # `not(a in b)`. Rewrite it here (P5) and emit a deprecation `:warning`. `(not a) in b`
   # (parenthesized) is a `:paren` lhs, so it is not matched and keeps its literal meaning.
   defp lower_deprecated_not_in(
-         {:node, :unary_op, _sp, [_not, operand], _f, _d},
+         {:node, :unary_op, _sp, [neg_leaf, operand], _f, _d},
          op_leaf,
          rhs,
          view,
@@ -391,6 +391,7 @@ defmodule Toxic2.Lower do
          acc,
          nid
        ) do
+    neg = Tokens.value(view, CST.token_index(neg_leaf))
     {o, acc, nid} = lower(operand, view, opts, acc, nid)
     {r, acc, nid} = lower(rhs, view, opts, acc, nid)
     span = Tokens.span(view, CST.token_index(op_leaf)) || {1, 1, 1, 1}
@@ -398,13 +399,16 @@ defmodule Toxic2.Lower do
     {_id, acc, nid} =
       Diagnostics.emit(acc, nid, :lowerer, :warning, :deprecated_not_in, span, %{})
 
-    {{:not, [], [{:in, [], [o, r]}]}, acc, nid}
+    {{neg, [], [{:in, [], [o, r]}]}, acc, nid}
   end
 
-  defp not_unary?({:node, :unary_op, _sp, [op_leaf, _operand], _f, _d}, view),
-    do: Tokens.value(view, CST.token_index(op_leaf)) == :not
+  # `not a in b` / `!a in b` — a bare `not`/`!` left of `in` is the membership-negation form
+  # `not(a in b)` / `!(a in b)` (`not` binds looser than `in` here). Parenthesising the operand
+  # (`(not a) in b`) gives a `:paren` lhs, which is not matched, so it keeps its literal meaning.
+  defp negation_unary?({:node, :unary_op, _sp, [op_leaf, _operand], _f, _d}, view),
+    do: Tokens.value(view, CST.token_index(op_leaf)) in [:not, :!]
 
-  defp not_unary?(_lhs, _view), do: false
+  defp negation_unary?(_lhs, _view), do: false
 
   defp lower_unary([op_leaf, operand], view, opts, acc, nid) do
     {o, acc, nid} = lower(operand, view, opts, acc, nid)

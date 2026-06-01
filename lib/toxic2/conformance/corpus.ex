@@ -294,6 +294,7 @@ defmodule Toxic2.Conformance.Corpus do
     {"f a,\n b: 1", [:no_parens]},
     {"a not in b", [:operator]},
     {"not a in b", [:operator]},
+    {"!a in b", [:operator]},
     # fn / stab clauses (phase 9)
     {"fn -> :ok end", [:fn]},
     {"fn x -> x end", [:fn]},

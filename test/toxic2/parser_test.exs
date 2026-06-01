@@ -678,6 +678,16 @@ defmodule Toxic2.ParserTest do
     end
   end
 
+  describe "membership negation (not/! left of in)" do
+    test "`!a in b` rewrites to !(a in b), like `not a in b`" do
+      assert {{:!, _, [{:in, _, [{:a, _, nil}, {:b, _, nil}]}]}, _} =
+               Toxic2.parse_to_ast("!a in b")
+
+      assert {{:not, _, [{:in, _, [{:a, _, nil}, {:b, _, nil}]}]}, _} =
+               Toxic2.parse_to_ast("not a in b")
+    end
+  end
+
   describe "not in (lowering rewrite + deprecation)" do
     test "`not a in b` rewrites to not(a in b) with a deprecation warning" do
       {ast, diags} = Toxic2.parse_to_ast("not a in b")
