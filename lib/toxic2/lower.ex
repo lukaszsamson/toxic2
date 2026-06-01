@@ -347,10 +347,13 @@ defmodule Toxic2.Lower do
   end
 
   # Parentheses are transparent in the AST (they only carry metadata upstream).
-  defp lower_paren([], _view, _opts, acc, nid), do: {{:__block__, [], []}, acc, nid}
-
-  defp lower_paren([inner | _maybe_missing], view, opts, acc, nid),
-    do: lower(inner, view, opts, acc, nid)
+  # A paren is a statement block: empty => empty block, one => the expr (transparent), many =>
+  # `__block__`. A trailing recovered `:missing` (no `)`) is skipped — its diagnostic is emitted.
+  defp lower_paren(children, view, opts, acc, nid) do
+    children
+    |> Enum.reject(&(CST.tag(&1) == :missing))
+    |> lower_block(view, opts, acc, nid)
+  end
 
   defp lower_binary([lhs, op_leaf, rhs], view, opts, acc, nid) do
     cond do

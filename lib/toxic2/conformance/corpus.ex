@@ -191,6 +191,14 @@ defmodule Toxic2.Conformance.Corpus do
     # parens
     {"(1 + 2) * 3", [:operator]},
     {"(a)", [:operator]},
+    # multi-statement parens => block
+    {"(a; b)", [:paren]},
+    {"(a; b; c)", [:paren]},
+    {"(;)", [:paren]},
+    {"(a;)", [:paren]},
+    {"(f a, b)", [:paren]},
+    {"(a = 1; a)", [:paren]},
+    {"(1 + 2; 3)", [:paren]},
     # lists
     {"[1, 2, 3]", [:container]},
     {"[]", [:container]},
@@ -383,6 +391,9 @@ defmodule Toxic2.Conformance.Corpus do
     {"a // b", [:operator]},
     {"a..b//c//d", [:operator]},
     {"a..(b // c)", [:operator]},
+    # commas/semicolons not allowed where they would need a tuple/call
+    {"(a, b)", [:paren]},
+    {"foo(a; b)", [:paren]},
     # missing `end` / empty fn / leftover tokens in bodies (must not crash; emit diagnostics)
     {"if x do y", [:do_block]},
     {"foo do", [:do_block]},

@@ -101,6 +101,15 @@ defmodule Toxic2.ParserTest do
       assert CST.node_kind(left) == :paren
       assert CST.node_kind(child(left, 0)) == :binary_op
     end
+
+    test "multi-statement parens lower to a block; single is transparent; empty is an empty block" do
+      assert {{:__block__, _, [{:a, _, nil}, {:b, _, nil}]}, []} = Toxic2.parse_to_ast("(a; b)")
+      assert {{:a, _, nil}, []} = Toxic2.parse_to_ast("(a)")
+      assert {{:a, _, nil}, []} = Toxic2.parse_to_ast("(a;)")
+      assert {{:__block__, _, []}, []} = Toxic2.parse_to_ast("(;)")
+      # inner statements are a no-parens context
+      assert {{:f, _, [{:a, _, nil}, {:b, _, nil}]}, []} = Toxic2.parse_to_ast("(f a, b)")
+    end
   end
 
   describe "expression list + layout" do

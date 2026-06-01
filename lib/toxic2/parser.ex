@@ -42,8 +42,8 @@ defmodule Toxic2.Parser do
   Chained/double-parens calls `f(a)(b)` / `a.b()()` are handled with Elixir's "at most two paren
   groups per base" rule (a third, or a call on an alias/access/container, is an error).
 
-  Not yet handled (later islands): multi-statement parens `(a; b)`. Encountering those yields
-  error/leaf nodes rather than crashing.
+  Not yet handled (later islands): quoted keyword keys, operator-named atoms, unicode
+  identifiers. Encountering those yields error/leaf nodes rather than crashing.
   """
 
   alias Toxic2.{CST, Diagnostics, LexError, Precedence, Tokens}
@@ -1542,30 +1542,69 @@ defmodule Toxic2.Parser do
   # A single parenthesised expression. Multi-statement parens `(a; b)` are deferred; here a `;`
   # before `)` is reported as a missing `)` and recovered by the expr-list loop.
   # A paren resets to a fresh `:matched` context, so the caller's `ctx` is not threaded inside.
+  # A parenthesised expression is a statement block: 0 statements => `{:__block__, [], []}` (`()`,
+  # `(;)`), 1 => the statement (transparent, `(a)` => a), n => a block (`(a; b)` => block). Inner
+  # statements are a `:no_parens` context (`(f a, b)` => `f(a, b)`), separated by `;` / newline.
   defp parse_paren(t, open, _ctx, diags, nid, fuel) do
-    inner_start = skip_eols(t, open + 1)
+    {stmts, close, diags, nid, fuel} = paren_stmts(t, skip_eoe(t, open + 1), [], diags, nid, fuel)
 
-    if Tokens.kind(t, inner_start) == :")" do
-      span = merge(tok_span(t, open), tok_span(t, inner_start))
-      {CST.node(:paren, span, [], :matched, nil), inner_start + 1, diags, nid, fuel}
-    else
-      {inner, k, diags, nid, fuel} = parse_expr(t, inner_start, 0, :matched, diags, nid, fuel - 1)
-      close = skip_eols(t, k)
-      close_paren(t, open, inner, close, diags, nid, fuel)
-    end
-  end
-
-  defp close_paren(t, open, inner, close, diags, nid, fuel) do
     if Tokens.kind(t, close) == :")" do
       span = merge(tok_span(t, open), tok_span(t, close))
-      {CST.node(:paren, span, [inner], :matched, nil), close + 1, diags, nid, fuel}
+      {CST.node(:paren, span, stmts, :matched, nil), close + 1, diags, nid, fuel}
     else
       {id, diags, nid} =
         Diagnostics.emit(diags, nid, :parser, :error, :expected_rparen, tok_span(t, close))
 
       miss = CST.missing(:")", close, diag: id)
-      span = merge(tok_span(t, open), cst_span(t, inner))
-      {CST.node(:paren, span, [inner, miss], :matched, nil), close, diags, nid, fuel}
+      span = merge(tok_span(t, open), tok_span(t, close))
+      {CST.node(:paren, span, Enum.concat(stmts, [miss]), :matched, nil), close, diags, nid, fuel}
+    end
+  end
+
+  defp paren_stmts(t, i, acc, diags, nid, fuel) do
+    cond do
+      fuel <= 0 -> {:lists.reverse(acc), i, diags, nid, fuel}
+      Tokens.kind(t, i) == :")" -> {:lists.reverse(acc), i, diags, nid, fuel}
+      Tokens.at_eof?(t, i) -> {:lists.reverse(acc), i, diags, nid, fuel}
+      true -> paren_stmt(t, i, acc, diags, nid, fuel)
+    end
+  end
+
+  defp paren_stmt(t, i, acc, diags, nid, fuel) do
+    {expr, i2, diags, nid, fuel} = parse_expr(t, i, 0, :no_parens, diags, nid, fuel - 1)
+    i2 = if i2 > i, do: i2, else: i + 1
+    {i3, diags, nid} = paren_end_stmt(t, i2, diags, nid)
+    paren_stmts(t, i3, [expr | acc], diags, nid, fuel)
+  end
+
+  # A paren statement ends at `;` / newline (separator) or `)`; anything else is leftover (error).
+  defp paren_end_stmt(t, i, diags, nid) do
+    case Tokens.kind(t, i) do
+      k when k in [:eol, :";"] ->
+        {skip_eoe(t, i), diags, nid}
+
+      k when k in [:")", :eof] ->
+        {i, diags, nid}
+
+      :error ->
+        {_id, d, n} = emit_lex_error(t, i, diags, nid)
+        {skip_to_paren_eoe(t, i + 1), d, n}
+
+      k ->
+        {_id, d, n} =
+          Diagnostics.emit(diags, nid, :parser, :error, :unexpected_token, tok_span(t, i), %{
+            kind: k
+          })
+
+        {skip_to_paren_eoe(t, i + 1), d, n}
+    end
+  end
+
+  defp skip_to_paren_eoe(t, i) do
+    case Tokens.kind(t, i) do
+      k when k in [:eol, :";"] -> skip_eoe(t, i)
+      k when k in [:")", :eof] -> i
+      _ -> skip_to_paren_eoe(t, i + 1)
     end
   end
 
