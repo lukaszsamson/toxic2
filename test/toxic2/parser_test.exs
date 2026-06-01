@@ -556,6 +556,35 @@ defmodule Toxic2.ParserTest do
     end
   end
 
+  describe "struct base / @ precedence / no-parens string args" do
+    test "struct base may be any primary, not just an alias" do
+      assert {{:%, _, [{:mod, _, nil}, {:%{}, _, [a: 1]}]}, []} =
+               Toxic2.parse_to_ast("%mod{a: 1}")
+
+      assert {{:%, _, [nil, {:%{}, _, []}]}, []} = Toxic2.parse_to_ast("%nil{}")
+    end
+
+    test "@ binds tighter than dot/access: @x.y == (@x).y" do
+      assert {{{:., _, [{:@, _, [{:foo, _, nil}]}, :bar]}, _, []}, []} =
+               Toxic2.parse_to_ast("@foo.bar")
+
+      # ...but @ still takes a no-parens operand
+      assert {{:@, _, [{:moduledoc, _, [false]}]}, []} = Toxic2.parse_to_ast("@moduledoc false")
+    end
+
+    test "no-parens calls accept string / sigil arguments" do
+      assert {{:@, _, [{:doc, _, ["x"]}]}, []} = Toxic2.parse_to_ast("@doc \"x\"")
+
+      assert {{{:., _, [{:__aliases__, _, [:IO]}, :puts]}, _, ["hello"]}, []} =
+               Toxic2.parse_to_ast("IO.puts \"hello\"")
+    end
+
+    test "bitstrings carry trailing keywords after a positional element" do
+      assert {{:<<>>, _, [{:foo, _, nil}, [bar: {:baz, _, nil}]]}, []} =
+               Toxic2.parse_to_ast("<<foo, bar: baz>>")
+    end
+  end
+
   describe "quoted atoms (:\"...\")" do
     test "no interpolation lowers to the atom (escapes processed)" do
       assert {:a, []} = Toxic2.parse_to_ast(":\"a\"")

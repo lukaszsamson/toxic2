@@ -111,7 +111,7 @@ defmodule Toxic2.Lower do
   # `Foo.{A, B}` => `{{:., _, [base, :{}]}, _, [elems]}` (multi-alias / `alias Foo.{...}`).
   defp lower_kind(:dot_tuple, [base | elems], _cst, view, opts, acc, nid) do
     {base_ast, acc, nid} = lower(base, view, opts, acc, nid)
-    {elem_asts, acc, nid} = lower_each(elems, view, opts, acc, nid)
+    {elem_asts, acc, nid} = lower_args(elems, view, opts, acc, nid)
     {{{:., [], [base_ast, :{}]}, [], elem_asts}, acc, nid}
   end
 
@@ -593,8 +593,9 @@ defmodule Toxic2.Lower do
   end
 
   # `<<...>>` => `{:<<>>, [], elems}` (segments incl. `::` are ordinary expressions).
+  # Trailing keyword pairs collapse into one keyword-list element (`<<a, k: 1>>` => `[a, [k: 1]]`).
   defp lower_bitstring(children, view, opts, acc, nid) do
-    {asts, acc, nid} = lower_each(children, view, opts, acc, nid)
+    {asts, acc, nid} = lower_args(children, view, opts, acc, nid)
     {{:<<>>, [], asts}, acc, nid}
   end
 

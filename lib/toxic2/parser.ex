@@ -292,7 +292,11 @@ defmodule Toxic2.Parser do
       :capture_op,
       :capture_int,
       :unary_op,
-      :kw_identifier
+      :kw_identifier,
+      :string_start,
+      :charlist_start,
+      :sigil_start,
+      :quoted_atom
     ]
   end
 
@@ -1057,7 +1061,7 @@ defmodule Toxic2.Parser do
       Tokens.kind(t, j) == :"{" ->
         parse_map_body(t, j, i, diags, nid, fuel)
 
-      Tokens.kind(t, j) in [:alias, :identifier] ->
+      struct_base_start?(Tokens.kind(t, j)) ->
         parse_struct(t, i, diags, nid, fuel)
 
       true ->
@@ -1074,6 +1078,32 @@ defmodule Toxic2.Parser do
 
         {CST.token(i, error: true, diag: id), i + 1, diags, nid, fuel}
     end
+  end
+
+  # A struct base is any primary expression (`%Alias{}`, `%var{}`, `%nil{}`, `%@attr{}`, `%"s"{}`,
+  # ...), not only an alias/identifier — `parse_struct` parses it at @struct_name_bp.
+  defp struct_base_start?(kind) do
+    kind in [
+      :alias,
+      :identifier,
+      :int,
+      :flt,
+      :char,
+      :atom,
+      :literal,
+      :quoted_atom,
+      :string_start,
+      :charlist_start,
+      :sigil_start,
+      :at_op,
+      :unary_op,
+      :capture_op,
+      :capture_int,
+      :"(",
+      :"[",
+      :"<<",
+      :percent
+    ]
   end
 
   defp parse_struct(t, pct, diags, nid, fuel) do
@@ -1268,19 +1298,19 @@ defmodule Toxic2.Parser do
   # `[ ... ]` / `{ ... }` / `<< ... >>`: a comma-separated sequence; `kind` is also the seq `mode`.
   defp parse_container(t, open, close, kind, diags, nid, fuel) do
     {elems, j, diags, nid, fuel} = parse_seq(t, open + 1, close, kind, diags, nid, fuel)
-    {diags, nid} = check_tuple_lead(kind, t, elems, diags, nid)
+    {diags, nid} = check_container_lead(kind, t, elems, diags, nid)
 
     {CST.node(kind, merge(tok_span(t, open), tok_span(t, j - 1)), elems, :matched, nil), j, diags,
      nid, fuel}
   end
 
-  # A tuple may carry trailing keywords (`{1, a: 1}` => `{1, [a: 1]}`) but its FIRST element must
-  # be positional — an all-keyword tuple (`{a: 1}`, `{a: 1, b: 2}`) is rejected by Elixir.
-  defp check_tuple_lead(:tuple, t, [first | _], diags, nid) do
+  # A tuple/bitstring may carry trailing keywords (`{1, a: 1}` => `{1, [a: 1]}`) but its FIRST
+  # element must be positional — an all-keyword `{a: 1}` / `<<a: 1>>` is rejected by Elixir.
+  defp check_container_lead(kind, t, [first | _], diags, nid) when kind in [:tuple, :bitstring] do
     if kw_pair_node?(first) do
       {_id, diags, nid} =
         Diagnostics.emit(diags, nid, :parser, :error, :keyword_not_allowed, cst_span(t, first), %{
-          in: :tuple
+          in: kind
         })
 
       {diags, nid}
@@ -1289,7 +1319,7 @@ defmodule Toxic2.Parser do
     end
   end
 
-  defp check_tuple_lead(_kind, _t, _elems, diags, nid), do: {diags, nid}
+  defp check_container_lead(_kind, _t, _elems, diags, nid), do: {diags, nid}
 
   defp kw_pair_node?(cst), do: CST.tag(cst) == :node and CST.node_kind(cst) == :kw_pair
 
@@ -1431,9 +1461,9 @@ defmodule Toxic2.Parser do
   defp check_kw_last(_seen, _is_kw, _t, _el, diags, nid), do: {diags, nid}
 
   # Keyword pairs are not allowed inside tuples / bitstrings.
-  # Keyword pairs are allowed in lists, calls, and tuples (tuples additionally require a leading
-  # positional element — see `check_tuple_lead`). Bitstrings reject them.
-  defp check_kw_allowed(mode, _t, _i, diags, nid) when mode in [:list, :call, :tuple],
+  # Keyword pairs are allowed in lists, calls, tuples, and bitstrings (tuples/bitstrings
+  # additionally require a leading positional element — see `check_container_lead`).
+  defp check_kw_allowed(mode, _t, _i, diags, nid) when mode in [:list, :call, :tuple, :bitstring],
     do: {diags, nid}
 
   defp check_kw_allowed(mode, t, i, diags, nid) do
@@ -1448,9 +1478,9 @@ defmodule Toxic2.Parser do
   defp parse_unary(t, i, prefix_bp, _ctx, diags, nid, fuel) do
     op_leaf = CST.token(i)
     operand_start = skip_eols(t, i + 1)
-    # A unary operand is `matched_expr` (no-parens here takes a single argument).
+
     {operand, k, diags, nid, fuel} =
-      parse_expr(t, operand_start, prefix_bp, :matched, diags, nid, fuel - 1)
+      parse_unary_operand(prefix_bp, t, operand_start, diags, nid, fuel)
 
     node =
       CST.node(
@@ -1463,6 +1493,21 @@ defmodule Toxic2.Parser do
 
     {node, k, diags, nid, fuel}
   end
+
+  # `@` (at_op, 320) binds TIGHTER than the dot/call/access postfixes (310), so they attach to the
+  # `@x` result — `@x.y` => `(@x).y`, `@x[i]` => `(@x)[i]`. But `@` still takes a NO-PARENS operand
+  # (`@moduledoc false`, `@spec f() :: t`, `@derive {A, B}`). So its operand is the `parse_expr`
+  # pipeline MINUS postfix and led: prefix, then a no-parens call, then a do-block. Lower unaries
+  # (`!`/`^`/`+`/`-`/`not`, 300) bind LOOSER than postfix — their operand is a full matched_expr
+  # (`!x.y` => `!(x.y)`).
+  defp parse_unary_operand(prefix_bp, t, i, diags, nid, fuel) when prefix_bp >= 310 do
+    {lhs, j, diags, nid, fuel} = parse_prefix(t, i, :matched, diags, nid, fuel)
+    {lhs, j, diags, nid, fuel} = maybe_no_parens(t, j, lhs, :matched, diags, nid, fuel)
+    maybe_do_block(t, j, lhs, :matched, diags, nid, fuel)
+  end
+
+  defp parse_unary_operand(prefix_bp, t, i, diags, nid, fuel),
+    do: parse_expr(t, i, prefix_bp, :matched, diags, nid, fuel - 1)
 
   # A single parenthesised expression. Multi-statement parens `(a; b)` are deferred; here a `;`
   # before `)` is reported as a missing `)` and recovered by the expr-list loop.

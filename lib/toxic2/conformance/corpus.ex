@@ -101,6 +101,24 @@ defmodule Toxic2.Conformance.Corpus do
     {":\"a\#{x}b\"", [:quoted_atom]},
     {":\"\#{x}\"", [:quoted_atom]},
     {"foo(:\"bar\")", [:quoted_atom]},
+    # struct with a non-alias base (dynamic struct)
+    {"%mod{a: 1}", [:struct]},
+    {"%nil{}", [:struct]},
+    {"%var{x | a: 1}", [:struct]},
+    # `@` (320) binds tighter than dot/access (310): @x.y == (@x).y; still takes no-parens operands
+    {"@foo.bar", [:operator]},
+    {"@config.value", [:operator]},
+    {"@foo[x]", [:operator]},
+    {"@moduledoc false", [:operator]},
+    {"@spec foo() :: t", [:operator]},
+    # no-parens calls with string / sigil / charlist arguments
+    {"@doc \"x\"", [:no_parens]},
+    {"IO.puts \"hello\"", [:no_parens]},
+    {"raise \"msg\"", [:no_parens]},
+    {"foo ~w(a b)", [:no_parens]},
+    # trailing keywords in bitstrings / dot-tuples
+    {"<<foo, bar: baz>>", [:bitstring]},
+    {"Foo.{A, foo: x}", [:dot_tuple]},
     # charlists
     {"'abc'", [:charlist]},
     {"''", [:charlist]},
