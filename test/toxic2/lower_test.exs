@@ -31,6 +31,36 @@ defmodule Toxic2.LowerTest do
       assert {:__error__, _meta, %{diag_ids: [_ | _]}} = ast
       assert [{_id, :lowerer, :error, :nonexistent_atom, _, _, _, _, _}] = diags
     end
+
+    test "existing_atoms_only gates EVERY source-derived name (no atom-table growth)" do
+      # Each of these would mint a fresh atom; under the policy they must error, not create it.
+      fresh = fn kind -> "zz_t2_#{kind}_#{:erlang.unique_integer([:positive])}" end
+
+      sources = [
+        "[#{fresh.(:kw)}: 1]",
+        "a.\"#{fresh.(:remote)}\"",
+        "Zz_T2_Alias_#{:erlang.unique_integer([:positive])}.Bar",
+        "Zz_T2_Alias_#{:erlang.unique_integer([:positive])}",
+        ":\"#{fresh.(:atom)}\"",
+        fresh.(:var)
+      ]
+
+      for src <- sources do
+        {_ast, diags} = Toxic2.parse_to_ast(src, existing_atoms_only: true)
+
+        assert Enum.any?(diags, &(elem(&1, 2) == :error and elem(&1, 3) == :nonexistent_atom)),
+               "expected #{inspect(src)} to be gated (no atom minted)"
+      end
+    end
+
+    test "existing_atoms_only still accepts pre-existing names everywhere" do
+      _ = [:ok_kw_key, :ok_remote, :ok_atom_lit]
+
+      for src <- ["[ok_kw_key: 1]", "Enum.map", ":ok_atom_lit", "Map.get"] do
+        {_ast, diags} = Toxic2.parse_to_ast(src, existing_atoms_only: true)
+        refute Enum.any?(diags, &(elem(&1, 2) == :error)), "#{inspect(src)} should be clean"
+      end
+    end
   end
 
   describe "invalid input lowers tolerantly (never raises)" do

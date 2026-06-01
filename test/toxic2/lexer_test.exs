@@ -30,8 +30,86 @@ defmodule Toxic2.LexerTest do
              ]
     end
 
+    test "`:::` is the atom `:\"::\"`, not `::` + `:` (leading colon takes `::` as its name)" do
+      assert shapes(":::") == [{:atom, "::"}]
+      assert shapes(":::;") == [{:atom, "::"}, {:";", nil}]
+      # `::` on its own and between operands stays the type operator
+      assert shapes("::") == [{:type_op, :"::"}]
+      assert shapes("a :: b") == [{:identifier, "a"}, {:type_op, :"::"}, {:identifier, "b"}]
+    end
+
     test "keyword keys carry binary values" do
       assert shapes("foo: bar") == [{:kw_identifier, "foo"}, {:identifier, "bar"}]
+    end
+
+    test "atom names may contain `@` (`:nonode@nohost`), but identifiers may not" do
+      assert shapes(":nonode@nohost") == [{:atom, "nonode@nohost"}]
+      assert shapes(":foo@") == [{:atom, "foo@"}]
+      assert shapes(":a@b@c") == [{:atom, "a@b@c"}]
+    end
+
+    test "operator/bracket names before a separator colon are keyword keys" do
+      assert shapes("[<<>>: 1]") ==
+               [{:"[", nil}, {:kw_identifier, "<<>>"}, {:int, 1}, {:"]", nil}]
+
+      assert shapes("[%{}: 1]") ==
+               [{:"[", nil}, {:kw_identifier, "%{}"}, {:int, 1}, {:"]", nil}]
+
+      assert shapes("[{}: 1]") ==
+               [{:"[", nil}, {:kw_identifier, "{}"}, {:int, 1}, {:"]", nil}]
+
+      assert shapes("[+: 1]") == [{:"[", nil}, {:kw_identifier, "+"}, {:int, 1}, {:"]", nil}]
+      assert shapes("[%: 1]") == [{:"[", nil}, {:kw_identifier, "%"}, {:int, 1}, {:"]", nil}]
+      assert shapes("[&: 1]") == [{:"[", nil}, {:kw_identifier, "&"}, {:int, 1}, {:"]", nil}]
+    end
+
+    test "`op:name` (no separator) is the operator plus an `:atom`, not a keyword key" do
+      assert [{:capture_op, _}, {:atom, "foo"}] = shapes("&:foo")
+      assert [{:dual_op, _}, {:atom, "foo"}] = shapes("+:foo")
+    end
+
+    test "`::` and `//` are never keyword keys" do
+      refute match?([{:kw_identifier, _} | _], shapes(":::"))
+      refute match?([{:kw_identifier, _} | _], shapes("//: 1"))
+    end
+  end
+
+  describe "unicode identifiers/atoms (vendored Toxic2.String.Tokenizer)" do
+    test "ascii-started words flowing into unicode stay a single identifier" do
+      assert shapes("café") == [{:identifier, "café"}]
+      assert shapes("módulo") == [{:identifier, "módulo"}]
+      assert shapes("naïve_x") == [{:identifier, "naïve_x"}]
+      assert shapes("café?") == [{:identifier, "café?"}]
+    end
+
+    test "non-ascii-started identifiers" do
+      assert shapes("αβγ") == [{:identifier, "αβγ"}]
+      assert shapes("привет") == [{:identifier, "привет"}]
+      assert shapes("_αβ") == [{:identifier, "_αβ"}]
+    end
+
+    test "names are NFC/NFKC normalized (µ U+00B5 → μ U+03BC)" do
+      assert shapes("µ") == [{:identifier, "μ"}]
+    end
+
+    test "unicode atom literals, incl. unicode-uppercase usable only as an atom" do
+      assert shapes(":café") == [{:atom, "café"}]
+      assert shapes(":αβγ") == [{:atom, "αβγ"}]
+      assert shapes(":Σ") == [{:atom, "Σ"}]
+      assert shapes(":café?") == [{:atom, "café?"}]
+    end
+
+    test "unicode keyword keys" do
+      assert shapes("[αβ: 1]") ==
+               [{:"[", nil}, {:kw_identifier, "αβ"}, {:int, 1}, {:"]", nil}]
+    end
+
+    test "a lone unicode-uppercase word is an error (valid only inside an atom literal)" do
+      assert [{:error, %Toxic2.LexError{}}] = shapes("Σ")
+    end
+
+    test "mixed-script identifiers are rejected (UTS-39), as a single error token" do
+      assert [{:error, %Toxic2.LexError{}}] = shapes("aαb")
     end
   end
 
@@ -434,6 +512,59 @@ defmodule Toxic2.LexerTest do
       kinds = "\"\"\"\n#{"x\#{ %{a: 1} }y"}\n\"\"\"" |> tokens() |> Enum.map(&Token.kind/1)
       assert :string_start == hd(kinds)
       assert :string_end == List.last(kinds)
+    end
+
+    test "`\\`-newline inside a heredoc is a line continuation (newline dropped, `\"\"\"` still closes)" do
+      assert shapes("\"\"\"\nfoo\\\n\"\"\"") == [
+               {:string_start, nil},
+               {:string_fragment, "foo"},
+               {:string_end, nil}
+             ]
+
+      # the continuation joins the two lines
+      assert shapes("\"\"\"\nfoo\\\nbar\n\"\"\"") == [
+               {:string_start, nil},
+               {:string_fragment, "foobar\n"},
+               {:string_end, nil}
+             ]
+    end
+
+    test "a sigil name at EOF with no delimiter is dropped wholesale (matches the reference)" do
+      assert shapes("~x") == []
+      assert shapes("~X123") == []
+      # a trailing incomplete sigil drops without disturbing earlier tokens
+      assert shapes("1\n~x") == [{:int, 1}, {:eol, 1}]
+    end
+
+    test "a sigil with a non-EOF invalid delimiter still errors (only the EOF case is dropped)" do
+      assert [{:sigil_start, "x"}, {:error, %Toxic2.LexError{code: :invalid_sigil_delimiter}}] =
+               shapes("~x ")
+    end
+
+    test "the indentation pre-scan treats a `\\`-newline as a line boundary (finds the closer)" do
+      # closing `"""` is indented 6; content lines use `\`-continuation, indentation still stripped
+      assert shapes("      \"\"\"\n      a \\\n      b\n      \"\"\"") == [
+               {:string_start, nil},
+               {:string_fragment, "a b\n"},
+               {:string_end, nil}
+             ]
+    end
+
+    test "a raw heredoc unescapes `\\` before the full delimiter (`\\\"\"\"` => `\"\"\"`)" do
+      assert [{:sigil_start, "S"}, {:string_fragment, "foo\"\"\"\n"}, {:sigil_end, ""}] =
+               shapes("~S\"\"\"\nfoo\\\"\"\"\n\"\"\"")
+    end
+
+    test "a heredoc opening with an interpolation keeps a leading empty fragment" do
+      assert [
+               {:string_start, nil},
+               {:string_fragment, ""},
+               {:begin_interpolation, nil},
+               {:identifier, "x"},
+               {:end_interpolation, nil},
+               {:string_fragment, "\n"},
+               {:string_end, nil}
+             ] = shapes("\"\"\"\n\#{x}\n\"\"\"")
     end
 
     test "charlists share the linear form with charlist_* token kinds" do

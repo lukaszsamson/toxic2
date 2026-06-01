@@ -91,6 +91,21 @@ defmodule Toxic2.ParserTest do
       assert CST.node_kind(e) == :binary_op
       assert CST.node_kind(child(e, 0)) == :unary_op
     end
+
+    test "`..`/`...` are nullary, and `...` is a low-precedence unary prefix" do
+      assert {{:.., _, []}, []} = Toxic2.parse_to_ast("..")
+      assert {{:..., _, []}, []} = Toxic2.parse_to_ast("...")
+      assert {{:..., _, [{:x, _, nil}]}, []} = Toxic2.parse_to_ast("...x")
+      # unary `...` grabs the whole following expression
+      assert {{:..., _, [{:+, _, [{:a, _, nil}, {:b, _, nil}]}]}, []} =
+               Toxic2.parse_to_ast("...a + b")
+
+      # `..` is never unary: `..-a` is `(..) - a`, and nullary `...` is a normal RHS operand
+      assert {{:-, _, [{:.., _, []}, {:a, _, nil}]}, []} = Toxic2.parse_to_ast("..-a")
+      assert {{:+, _, [1, {:..., _, []}]}, []} = Toxic2.parse_to_ast("1 + ...")
+      # binary range is unaffected
+      assert {{:.., _, [1, 10]}, []} = Toxic2.parse_to_ast("1..10")
+    end
   end
 
   describe "parentheses" do
@@ -300,6 +315,15 @@ defmodule Toxic2.ParserTest do
       assert Enum.any?(diags, &(elem(&1, 3) == :unexpected_trailing_comma))
     end
 
+    test "a paren call allows a trailing comma only after a keyword arg" do
+      assert {{:foo, _, [[bar: 1]]}, []} = Toxic2.parse_to_ast("foo(bar: 1,)")
+      assert {{:foo, _, [1, [a: 2]]}, []} = Toxic2.parse_to_ast("foo(1, a: 2,)")
+
+      # a trailing comma after a positional arg is still rejected
+      {_v, _es, diags} = exprs("foo(1, 2,)")
+      assert Enum.any?(diags, &(elem(&1, 3) == :unexpected_trailing_comma))
+    end
+
     test "keyword-last is enforced" do
       for src <- ["f(a: 1, 2)", "[a: 1, 2]", "[1, a: 2, 3]"] do
         {_v, _es, diags} = exprs(src)
@@ -362,6 +386,32 @@ defmodule Toxic2.ParserTest do
       assert {[{:f, _, [{:a, _, nil}]}], []} = Toxic2.parse_to_ast("[f a]")
     end
 
+    test "a string/heredoc adjacent to the callee (no space) is a no-parens argument" do
+      assert {{:foo, _, ["bar"]}, []} = Toxic2.parse_to_ast(~S|foo"bar"|)
+      assert {{{:., _, [{:a, _, nil}, :b]}, _, ["str"]}, []} = Toxic2.parse_to_ast(~S|a.b"str"|)
+
+      # `f -1` stays a call with a (unary-minus) arg; `f - 1` stays subtraction (no string involved)
+      assert {{:f, _, [{:-, _, [1]}]}, []} = Toxic2.parse_to_ast("f -1")
+      assert {{:-, _, [{:f, _, nil}, 1]}, []} = Toxic2.parse_to_ast("f - 1")
+    end
+
+    test "a `\\`-newline joins a no-parens callee with an arg on the next line" do
+      assert {{:@, _, [{:x, _, [{{:., _, [{:__aliases__, _, [:File]}, :foo]}, _, []}]}]}, []} =
+               Toxic2.parse_to_ast("@x \\\nFile.foo()")
+
+      # but `+`/`-` across the continuation are binary, not a unary arg
+      assert {{:+, _, [{:foo, _, nil}, 1]}, []} = Toxic2.parse_to_ast("foo \\\n+1")
+    end
+
+    test "a multi-arg no-parens call ending in `do…end` is a valid container element" do
+      assert {[{:for, _, [{:<-, _, _}, {:<-, _, _}, [do: _]]}], []} =
+               Toxic2.parse_to_ast("[for x <- a, y <- b do x end]")
+
+      # a bare no-parens call (no do-block) is still ambiguous as a non-last element
+      {_a, diags} = Toxic2.parse_to_ast("[f a, b]")
+      assert Enum.any?(diags, &(elem(&1, 3) == :ambiguous_no_parens))
+    end
+
     test "remote no-parens calls" do
       assert {{{:., _, [{:a, _, nil}, :b]}, _, [{:c, _, nil}]}, []} = Toxic2.parse_to_ast("a.b c")
 
@@ -369,11 +419,80 @@ defmodule Toxic2.ParserTest do
                Toxic2.parse_to_ast("a.b c, d")
     end
 
+    test "a newline is allowed after `[` before the index (`foo[\\n:bar]`)" do
+      assert {{{:., _, [Access, :get]}, _, [{:foo, _, nil}, :bar]}, []} =
+               Toxic2.parse_to_ast("foo[\n:bar]")
+    end
+
+    test "access takes one index, with an optional trailing comma (`foo[1,]`)" do
+      assert {{{:., _, [Access, :get]}, _, [{:foo, _, nil}, 1]}, []} =
+               Toxic2.parse_to_ast("foo[1,]")
+
+      # a real second index is still rejected
+      {_a, diags} = Toxic2.parse_to_ast("foo[a, b]")
+      assert diags != []
+    end
+
     test "a no-parens call as a non-last container element is ambiguous (error)" do
       {_v, _es, diags} = exprs("[f a, b]")
       assert Enum.any?(diags, &(elem(&1, 3) == :ambiguous_no_parens))
       # but as the last element it is fine
       assert {[{:b, _, nil}, {:f, _, [{:a, _, nil}]}], []} = Toxic2.parse_to_ast("[b, f a]")
+    end
+
+    test "an operator's rightmost operand may be a multi-arg no-parens call (no_parens_op_expr)" do
+      assert {{:+, _, [1, {:foo, _, [2, 3]}]}, []} = Toxic2.parse_to_ast("1 + foo 2, 3")
+
+      assert {{:|>, _, [{:a, _, nil}, {:foo, _, [1, 2]}]}, []} =
+               Toxic2.parse_to_ast("a |> foo 1, 2")
+
+      # a do-block still attaches to that rightmost operand
+      assert {{:+, _, [1, {:if, _, [{:x, _, nil}, [do: :ok]]}]}, []} =
+               Toxic2.parse_to_ast("1 + if x do :ok end")
+
+      # but inside brackets the element stays single-arg (the comma is the delimiter)
+      assert {[{:+, _, [1, {:foo, _, [2]}]}, 3], []} = Toxic2.parse_to_ast("[1 + foo 2, 3]")
+    end
+
+    test "a unary prefix's rightmost operand may be a multi-arg no-parens call" do
+      assert {{:@, _, [{:foo, _, [1, 2]}]}, []} = Toxic2.parse_to_ast("@foo 1, 2")
+      assert {{:-, _, [{:foo, _, [1, 2]}]}, []} = Toxic2.parse_to_ast("-foo 1, 2")
+      assert {{:not, _, [{:bar, _, [:a, :b]}]}, []} = Toxic2.parse_to_ast("not bar :a, :b")
+    end
+
+    test "reserved words and operators are valid remote-call member names" do
+      assert {{{:., _, [{:flags, _, nil}, true]}, _, []}, []} = Toxic2.parse_to_ast("flags.true")
+      assert {{{:., _, [{:c, _, nil}, nil]}, _, []}, []} = Toxic2.parse_to_ast("c.nil")
+      assert {{{:., _, [{:a, _, nil}, :when]}, _, []}, []} = Toxic2.parse_to_ast("a.when")
+      assert {{{:., _, [{:a, _, nil}, :do]}, _, []}, []} = Toxic2.parse_to_ast("a.do")
+
+      assert {{{:., _, [{:__aliases__, _, [:Kernel]}, :+]}, _, []}, []} =
+               Toxic2.parse_to_ast("Kernel.+")
+
+      assert {{{:., _, [{:foo, _, nil}, :++]}, _, [1, 2]}, []} =
+               Toxic2.parse_to_ast("foo.++(1, 2)")
+
+      # `->` / `=>` / `//` are NOT valid members
+      {_a, diags} = Toxic2.parse_to_ast("a.->")
+      assert Enum.any?(diags, &(elem(&1, 3) == :unexpected_after_dot))
+    end
+
+    test "operator function references (`op/arity`) — bare and captured" do
+      assert {{:/, _, [{:+, _, nil}, 2]}, []} = Toxic2.parse_to_ast("+/2")
+      assert {{:/, _, [{:>=, _, nil}, 2]}, []} = Toxic2.parse_to_ast(">=/2")
+      assert {{:&, _, [{:/, _, [{:++, _, nil}, 2]}]}, []} = Toxic2.parse_to_ast("&++/2")
+      # ordinary division is unaffected
+      assert {{:/, _, [{:a, _, nil}, {:b, _, nil}]}, []} = Toxic2.parse_to_ast("a / b")
+    end
+
+    test "`when` uniquely takes a bare keyword list on the right" do
+      assert {{:when, _, [{:x, _, nil}, [foo: 1]]}, []} = Toxic2.parse_to_ast("x when foo: 1")
+
+      assert {{:when, _, [{:x, _, nil}, [foo: 1, bar: 2]]}, []} =
+               Toxic2.parse_to_ast("x when foo: 1, bar: 2")
+
+      assert {{:when, _, [{:x, _, nil}, [foo: {:bar, _, [1, 2]}]]}, []} =
+               Toxic2.parse_to_ast("x when foo: bar 1, 2")
     end
 
     test "leftover same-line tokens are an error; chained no-parens is fine" do
@@ -428,6 +547,41 @@ defmodule Toxic2.ParserTest do
     test "multi-statement body lowers to a block" do
       assert {{:fn, _, [{:->, _, [[{:x, _, nil}], {:__block__, _, [_, _]}]}]}, []} =
                Toxic2.parse_to_ast("fn x -> y = x\n y end")
+    end
+
+    test "a trailing keyword run in the head groups into one keyword-list arg" do
+      assert {{:fn, _, [{:->, _, [[{:x, _, nil}, [a: 1]], {:y, _, nil}]}]}, []} =
+               Toxic2.parse_to_ast("fn x, a: 1 -> y end")
+
+      assert {{:fn, _, [{:->, _, [[[a: 1, b: 2]], {:y, _, nil}]}]}, []} =
+               Toxic2.parse_to_ast("fn a: 1, b: 2 -> y end")
+    end
+
+    test "a parenthesised arg list is a stab head (`(a, b) ->`)" do
+      assert {{:fn, _, [{:->, _, [[{:a, _, nil}, {:b, _, nil}], {:c, _, nil}]}]}, []} =
+               Toxic2.parse_to_ast("fn (a, b) -> c end")
+    end
+
+    test "a clause head takes a keyword-list guard and quoted keyword keys" do
+      assert {{:fn, _, [{:->, _, [[{:when, _, [{:a, _, nil}, [foo: 1]]}], {:x, _, nil}]}]}, []} =
+               Toxic2.parse_to_ast("fn (a) when foo: 1 -> x end")
+
+      assert {[{:->, _, [[[a: 1]], {:foo, _, []}]}], []} =
+               Toxic2.parse_to_ast("(('a': 1) -> foo())")
+    end
+
+    test "stab clauses inside parens lower to the bare clause list" do
+      assert {[{:->, _, [[{:x, _, nil}], {:y, _, nil}]}], []} = Toxic2.parse_to_ast("(x -> y)")
+
+      assert {[{:->, _, [[{:a, _, nil}, {:b, _, nil}], {:c, _, nil}]}], []} =
+               Toxic2.parse_to_ast("(a, b -> c)")
+
+      assert {[{:->, _, [[{:a, _, nil}], _]}, {:->, _, [[{:c, _, nil}], _]}], []} =
+               Toxic2.parse_to_ast("(a -> b; c -> d)")
+
+      # a paren-wrapped arg list with a keyword pair, and a `when` guard
+      assert {[{:->, _, [[{:when, _, [{:x, _, nil}, [a: 1], {:g, _, []}]}], {:y, _, nil}]}], []} =
+               Toxic2.parse_to_ast("((x, a: 1) when g() -> y)")
     end
 
     test "fn missing end is tolerant" do
@@ -774,6 +928,43 @@ defmodule Toxic2.ParserTest do
 
       assert {{:foo, _, [{:a, _, nil}, {:b, _, nil}, [do: {:x, _, nil}]]}, []} =
                Toxic2.parse_to_ast("foo a, b do x end")
+    end
+
+    test "a do-block attaches to an anonymous call (`f.() do … end`)" do
+      assert {{{:., _, [{:foo, _, nil}]}, _, [[do: :ok]]}, []} =
+               Toxic2.parse_to_ast("foo.() do :ok end")
+    end
+
+    test "a `do` block after a `when` guard attaches to the call, not the guard operand" do
+      assert {{:def, _, [{:when, _, [{:foo, _, [{:x, _, nil}]}, {:>, _, _}]}, [do: _]]}, []} =
+               Toxic2.parse_to_ast("def foo(x) when x > 0 do x end")
+    end
+
+    test "a clause head may span lines (pattern, then `when guard ->`)" do
+      assert {{:case, _, [{:x, _, nil}, [do: [{:->, _, [[{:when, _, _}], :ok]}]]]}, []} =
+               Toxic2.parse_to_ast("case x do\n%{a: y}\nwhen y > 0 -> :ok\nend")
+    end
+
+    test "a sole `unquote_splicing` statement in a block is wrapped in a `__block__`" do
+      assert {{:__block__, _, [{:unquote_splicing, _, [{:x, _, nil}]}]}, []} =
+               Toxic2.parse_to_ast("(unquote_splicing(x))")
+    end
+
+    test "`@attr(args)` includes an adjacent paren call in the `@` operand" do
+      assert {{:@, _, [{:callback, _, [{:spec, _, nil}]}]}, []} =
+               Toxic2.parse_to_ast("@callback(spec)")
+    end
+
+    test "a parenthesised boolean negation is wrapped in a `__block__`" do
+      assert {{:__block__, _, [{:not, _, [{:x, _, nil}]}]}, []} = Toxic2.parse_to_ast("(not x)")
+      assert {{:__block__, _, [{:!, _, [{:x, _, nil}]}]}, []} = Toxic2.parse_to_ast("(! x)")
+      # `-`/binary are not wrapped
+      assert {{:-, _, [{:x, _, nil}]}, []} = Toxic2.parse_to_ast("(- x)")
+    end
+
+    test "a `not in` guard's `do` block attaches to the enclosing call" do
+      assert {{:def, _, [{:when, _, [_, {:not, _, _}]}, [do: :ok]]}, []} =
+               Toxic2.parse_to_ast("def f(h) when h not in @x do :ok end")
     end
 
     test "do attaches to the OUTER call (foo bar do end)" do

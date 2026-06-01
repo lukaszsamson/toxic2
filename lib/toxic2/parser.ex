@@ -44,15 +44,32 @@ defmodule Toxic2.Parser do
 
   Also: multi-statement parens `(a; b)` => block; maps/structs with bare-expression entries
   (`%{x}`, `%Foo{x}`); struct bases beyond aliases (`%mod{}`, `%nil{}`, spaced `% (){}`);
-  dot-quoted remote calls (`a."foo"`); quoted keyword keys (`"foo": 1`); a no-parens-call keyword
-  value must be last (`f(a: g b, c)` rejected); `&` capture; `..//` step range.
-
-  Not yet handled (later islands): **unicode identifiers/atoms** (needs Unicode XID classification
-  + NFC normalisation) and **operator-named keyword keys** (`<<>>: 1`). Encountering those yields
-  error/leaf nodes rather than crashing.
+  dot-quoted remote calls (`a."foo"`); quoted keyword keys (`"foo": 1`); operator-named keyword
+  keys (`<<>>: 1`, `+: 1`); unicode identifiers/atoms (`café`, `:αβγ` — the lexer carries the NFC
+  name); a no-parens-call keyword value must be last (`f(a: g b, c)` rejected); `&` capture;
+  `..//` step range.
   """
 
   alias Toxic2.{CST, Diagnostics, LexError, Precedence, Tokens}
+
+  # Narrow inlining of the tiny LOCAL span builders on the hot node-construction path (A/B-measured).
+  @compile {:inline, merge: 2, merge_tt: 3, merge_ct: 3, merge_tc: 3}
+
+  # Parser-LOCAL token-view reads. `Tokens.kind/value/token/at_eof?` are cross-module, so a callee-
+  # module `@compile :inline` can't reach them — and `Tokens.kind/2` alone was ~12 % of ALL calls.
+  # These read the view tuple `{toks, size}` directly and inline into the hot dispatch.
+  @compile {:inline, tk: 2, tv: 2, tt: 2, t_eof?: 2}
+
+  defp tk({toks, size}, i) when i >= 0 and i < size, do: elem(elem(toks, i), 0)
+  defp tk(_t, _i), do: :eof
+
+  defp tv({toks, size}, i) when i >= 0 and i < size, do: elem(elem(toks, i), 5)
+  defp tv(_t, _i), do: nil
+
+  defp tt({toks, size}, i) when i >= 0 and i < size, do: elem(toks, i)
+  defp tt(_t, _i), do: :eof
+
+  defp t_eof?({_toks, size}, i), do: i >= size
 
   @fuel_base 1_000
 
@@ -103,7 +120,7 @@ defmodule Toxic2.Parser do
   defp collect(t, i, acc, diags, nid, fuel) do
     cond do
       fuel <= 0 -> {:lists.reverse(acc), i, diags, nid, fuel}
-      Tokens.at_eof?(t, i) -> {:lists.reverse(acc), i, diags, nid, fuel}
+      t_eof?(t, i) -> {:lists.reverse(acc), i, diags, nid, fuel}
       true -> collect_one(t, i, acc, diags, nid, fuel)
     end
   end
@@ -120,7 +137,7 @@ defmodule Toxic2.Parser do
   # A statement must end at EOE / EOF. Anything else is a leftover token on the same line that
   # no grammar routine consumed (`1 2`, `Foo bar`) — an error; skip to the next boundary.
   defp end_statement(t, i, diags, nid) do
-    case Tokens.kind(t, i) do
+    case tk(t, i) do
       k when k in [:eol, :";"] ->
         {skip_eoe(t, i), diags, nid}
 
@@ -143,7 +160,7 @@ defmodule Toxic2.Parser do
   end
 
   defp skip_to_eoe(t, i) do
-    case Tokens.kind(t, i) do
+    case tk(t, i) do
       k when k in [:eol, :";"] -> skip_eoe(t, i)
       :eof -> i
       _ -> skip_to_eoe(t, i + 1)
@@ -152,32 +169,80 @@ defmodule Toxic2.Parser do
 
   # --- Pratt ------------------------------------------------------------
 
+  # `parse_expr` is the hottest path. Each of the three post-prefix combinators (`postfix`,
+  # `maybe_no_parens`, `maybe_do_block`) returns a fresh `{lhs, i, diags, nid, fuel}` state tuple
+  # EVEN WHEN IT DOES NOTHING — tprof showed those no-op tuples are a big share of parser allocation.
+  # `postfix` loops internally so we keep it unguarded, but the other two are gated by their exact
+  # entry predicate and only CALLED when they'll do work; otherwise we tail-call onward with the
+  # variables unchanged, allocating nothing. Behaviour-preserving (the guards equal the combinators'
+  # own `if`/`cond` conditions).
   defp parse_expr(t, i, min_bp, ctx, diags, nid, fuel) do
     {lhs, i, diags, nid, fuel} = parse_prefix(t, i, ctx, diags, nid, fuel)
+    # `postfix` loops internally and applies often (every paren call), so guarding its entry only
+    # double-evaluates its predicate — left unguarded. The next two combinators ARE worth gating.
     {lhs, i, diags, nid, fuel} = postfix(t, i, lhs, ctx, diags, nid, fuel)
-    {lhs, i, diags, nid, fuel} = maybe_no_parens(t, i, lhs, ctx, diags, nid, fuel)
-    {lhs, i, diags, nid, fuel} = maybe_do_block(t, i, lhs, ctx, diags, nid, fuel)
-    led(t, i, lhs, min_bp, ctx, diags, nid, fuel)
+    parse_expr_np(t, i, lhs, min_bp, ctx, diags, nid, fuel)
   end
 
-  # `<call> do ... end`: the do-block attaches to the call as a trailing `[do: ..., else: ...]`
-  # keyword list. Suppressed in `:no_parens_arg` so the do attaches to the OUTER call:
-  # `foo bar do end` => `foo(bar, do: ...)`, not `foo(bar(do: ...))`.
-  defp maybe_do_block(t, i, lhs, ctx, diags, nid, fuel) do
-    if ctx != :no_parens_arg and Tokens.kind(t, i) == :do and do_attachable?(lhs, t) do
-      {db, j, diags, nid, fuel} = parse_do_block(t, i, diags, nid, fuel)
-      {attach_do(t, lhs, db, j), j, diags, nid, fuel}
+  defp parse_expr_np(t, i, lhs, min_bp, ctx, diags, nid, fuel) do
+    if np_callee?(lhs, t) and np_arg_start?(t, lhs, i) do
+      {lhs, i, diags, nid, fuel} = maybe_no_parens(t, i, lhs, ctx, diags, nid, fuel)
+      parse_expr_do(t, i, lhs, min_bp, ctx, diags, nid, fuel)
     else
-      {lhs, i, diags, nid, fuel}
+      parse_expr_do(t, i, lhs, min_bp, ctx, diags, nid, fuel)
     end
   end
 
-  defp do_attachable?({:token, idx, _f, _d}, t), do: Tokens.kind(t, idx) == :identifier
-  defp do_attachable?({:node, k, _sp, _ch, _f, _d}, _t), do: k in [:call, :np_call, :remote_call]
-  defp do_attachable?(_lhs, _t), do: false
+  defp parse_expr_do(t, i, lhs, min_bp, ctx, diags, nid, fuel) do
+    if ctx != :no_parens_arg and do_block_ahead?(t, i) do
+      {lhs, i, diags, nid, fuel} = maybe_do_block(t, i, lhs, ctx, diags, nid, fuel)
+      led(t, i, lhs, min_bp, ctx, diags, nid, fuel)
+    else
+      led(t, i, lhs, min_bp, ctx, diags, nid, fuel)
+    end
+  end
+
+  defp do_block_ahead?(t, i),
+    do: tk(t, i) == :do or tk(t, skip_eols(t, i)) == :do
+
+  # `<call> do ... end`: the do-block attaches to the call as a trailing `[do: ..., else: ...]`
+  # keyword list. Suppressed in `:no_parens_arg` so the do attaches to the OUTER call:
+  # `foo bar do end` => `foo(bar, do: ...)`, not `foo(bar(do: ...))`. The `do` may sit on the NEXT
+  # line after a multi-line head (`def f(x) when g\ndo … end`), but only for a call that already
+  # has args (a node) — a bare callee on its own line does not take a newline `do` (`foo\ndo` is
+  # invalid), so a same-line `do` is needed there.
+  defp maybe_do_block(t, i, lhs, ctx, diags, nid, fuel) do
+    cond do
+      ctx == :no_parens_arg ->
+        {lhs, i, diags, nid, fuel}
+
+      tk(t, i) == :do and do_attachable?(lhs, t) ->
+        attach_do_block(t, i, lhs, diags, nid, fuel)
+
+      tk(t, skip_eols(t, i)) == :do and do_attachable_node?(lhs) ->
+        attach_do_block(t, skip_eols(t, i), lhs, diags, nid, fuel)
+
+      true ->
+        {lhs, i, diags, nid, fuel}
+    end
+  end
+
+  defp attach_do_block(t, do_i, lhs, diags, nid, fuel) do
+    {db, j, diags, nid, fuel} = parse_do_block(t, do_i, diags, nid, fuel)
+    {attach_do(t, lhs, db, j), j, diags, nid, fuel}
+  end
+
+  defp do_attachable?({:token, idx, _f, _d}, t), do: tk(t, idx) == :identifier
+  defp do_attachable?(lhs, _t), do: do_attachable_node?(lhs)
+
+  # A call NODE (has args / parens) — the only form that takes a `do` on a following line.
+  defp do_attachable_node?({:node, k, _sp, _ch, _f, _d}),
+    do: k in [:call, :np_call, :remote_call, :anon_call]
+
+  defp do_attachable_node?(_lhs), do: false
 
   defp attach_do(t, lhs, db, end_i) do
-    span = merge(cst_span(t, lhs), tok_span(t, end_i - 1))
+    span = merge_ct(t, lhs, end_i - 1)
 
     case lhs do
       {:token, _idx, _f, _d} ->
@@ -197,8 +262,10 @@ defmodule Toxic2.Parser do
     if np_callee?(lhs, t) and np_arg_start?(t, lhs, i) do
       {arg, j, is_kw, diags, nid, fuel} = parse_np_arg(t, i, diags, nid, fuel)
 
+      # `:matched` normally caps a no-parens call at one arg, but a trailing `do` block makes a
+      # multi-arg call unambiguous even there (`[for x <- a, y <- b do … end]`), so collect many.
       {args, k, diags, nid, fuel} =
-        if ctx in [:no_parens, :no_parens_arg],
+        if ctx in [:no_parens, :no_parens_arg] or np_call_has_do?(t, j, 0),
           do: np_more_args(t, j, [arg], is_kw, diags, nid, fuel),
           else: {[arg], j, diags, nid, fuel}
 
@@ -208,10 +275,27 @@ defmodule Toxic2.Parser do
     end
   end
 
+  # Is this no-parens call (args starting at `i`) terminated by a depth-0 `do` block before any
+  # closer / end-of-expression? Such a call may carry many args even in a `:matched` position.
+  defp np_call_has_do?(t, i, depth), do: np_call_has_do?(t, i, depth, :eol)
+
+  defp np_call_has_do?(t, i, depth, prev) do
+    k = tk(t, i)
+
+    cond do
+      # A reserved word as a dot member (`a.do`, `a.end`) is a name, not a block delimiter.
+      prev == :dot and k in [:end, :do, :fn, :block_label] -> np_call_has_do?(t, i + 1, depth, k)
+      k == :do and depth == 0 -> true
+      k == :eof -> false
+      depth == 0 and k in [:eol, :";", :")", :"]", :"}", :">>", :end, :stab_op] -> false
+      true -> np_call_has_do?(t, i + 1, depth + depth_delta(k), k)
+    end
+  end
+
   # Additional comma-separated args. A newline is allowed after the comma (`f a,\n b`), and
   # keyword pairs must come last.
   defp np_more_args(t, i, args, seen_kw, diags, nid, fuel) do
-    if Tokens.kind(t, i) == :"," do
+    if tk(t, i) == :"," do
       {arg, j, is_kw, diags, nid, fuel} = parse_np_arg(t, skip_eols(t, i + 1), diags, nid, fuel)
       {diags, nid} = check_kw_last(seen_kw, is_kw, t, arg, diags, nid)
       np_more_args(t, j, [arg | args], seen_kw or is_kw, diags, nid, fuel)
@@ -223,7 +307,7 @@ defmodule Toxic2.Parser do
   # Build the no-parens call, marking it `:no_parens` (so a container can detect the ambiguous
   # `[f a, b]`). A plain identifier callee becomes `:np_call`; a bare remote (`a.b`) gains args.
   defp build_np_call(t, lhs, args, end_i) do
-    span = merge(cst_span(t, lhs), tok_span(t, end_i - 1))
+    span = merge_ct(t, lhs, end_i - 1)
 
     case lhs do
       {:node, :remote_call, _sp, [base, name], _f, _d} ->
@@ -237,14 +321,14 @@ defmodule Toxic2.Parser do
   # A no-parens argument is a keyword pair or a full expression, parsed in `:no_parens`. Returns
   # the node, next index, and whether it was a keyword pair (for keyword-last enforcement).
   defp parse_np_arg(t, i, diags, nid, fuel) do
-    if Tokens.kind(t, i) == :kw_identifier do
+    if tk(t, i) == :kw_identifier do
       key = CST.token(i)
       # A newline is allowed after `key:` before the value (`[a:\n1]`, `f(a:\n1)`).
       {val, j, diags, nid, fuel} =
         parse_expr(t, skip_eols(t, i + 1), 0, :no_parens_arg, diags, nid, fuel - 1)
 
       node =
-        CST.node(:kw_pair, merge(tok_span(t, i), cst_span(t, val)), [key, val], :matched, nil)
+        CST.node(:kw_pair, merge_tc(t, i, val), [key, val], :matched, nil)
 
       {node, j, true, diags, nid, fuel}
     else
@@ -262,18 +346,30 @@ defmodule Toxic2.Parser do
   end
 
   # A no-parens callee is a bare identifier, or a bare remote (`a.b` with no args yet).
-  defp np_callee?({:token, idx, _f, _d}, t), do: Tokens.kind(t, idx) == :identifier
+  defp np_callee?({:token, idx, _f, _d}, t), do: tk(t, idx) == :identifier
   defp np_callee?({:node, :remote_call, _sp, [_base, _name], _f, _d}, _t), do: true
   defp np_callee?(_lhs, _t), do: false
 
-  # Can a no-parens argument start at `i`, given the callee `lhs`? Requires a space after the
-  # callee (same line). `f -1` is a call (op adjacent to operand); `f - 1` is binary subtraction.
+  # Can a no-parens argument start at `i`, given the callee `lhs`? Generally requires a space after
+  # the callee (same line): `f -1` is a call (op adjacent to operand), `f - 1` is subtraction. A
+  # string/charlist/heredoc is unambiguous, so it may be ADJACENT — `foo"bar"` => `foo("bar")`,
+  # `Mix.shell().info"""…"""` => the heredoc is the argument.
   defp np_arg_start?(t, lhs, i) do
     case {cst_span(t, lhs), Tokens.span(t, i)} do
-      {{_, _, el, ec}, {sl, sc, _, _}} when el == sl and ec < sc ->
-        case Tokens.kind(t, i) do
-          :dual_op -> Tokens.adjacent?(t, i, i + 1) and np_first_kind?(Tokens.kind(t, i + 1))
-          # `not` starts an arg (`f not x`) unless it is the `not in` operator (`a not in b`).
+      {{_, _, el, ec}, {sl, sc, _, _}} when el == sl and ec <= sc ->
+        case tk(t, i) do
+          k when k in [:string_start, :charlist_start] -> true
+          _ when ec == sc -> false
+          k -> np_arg_kind?(t, i, k)
+        end
+
+      # The arg sits on a LATER line than the callee yet the cursor reached it with no `:eol` token
+      # between — only a `\`-newline line continuation does that, which joins them into one logical
+      # line: `@x \⏎ File.foo()` => `x(File.foo())`. A leading `+`/`-` across the continuation is
+      # binary, though (`foo \⏎ +1` => `foo + 1`), so `:dual_op` is NOT an argument start here.
+      {{_, _, el, _ec}, {sl, _sc, _, _}} when el < sl ->
+        case tk(t, i) do
+          :dual_op -> false
           :unary_op -> not not_in?(t, i)
           k -> np_first_kind?(k)
         end
@@ -283,9 +379,16 @@ defmodule Toxic2.Parser do
     end
   end
 
+  defp np_arg_kind?(t, i, :dual_op),
+    do: Tokens.adjacent?(t, i, i + 1) and np_first_kind?(tk(t, i + 1))
+
+  # `not` starts an arg (`f not x`) unless it is the `not in` operator (`a not in b`).
+  defp np_arg_kind?(t, i, :unary_op), do: not not_in?(t, i)
+  defp np_arg_kind?(_t, _i, k), do: np_first_kind?(k)
+
   defp not_in?(t, i) do
-    Tokens.kind(t, i) == :unary_op and Tokens.value(t, i) == :not and
-      Tokens.kind(t, skip_eols(t, i + 1)) == :in_op
+    tk(t, i) == :unary_op and tv(t, i) == :not and
+      tk(t, skip_eols(t, i + 1)) == :in_op
   end
 
   defp np_first_kind?(kind) do
@@ -330,7 +433,7 @@ defmodule Toxic2.Parser do
         call =
           CST.node(
             :call,
-            merge(cst_span(t, lhs), tok_span(t, j - 1)),
+            merge_ct(t, lhs, j - 1),
             [lhs | args],
             :matched,
             nil
@@ -350,11 +453,41 @@ defmodule Toxic2.Parser do
     end
   end
 
-  defp dot_continuation?(t, i), do: Tokens.kind(t, skip_eols(t, i)) == :dot
+  defp dot_continuation?(t, i), do: tk(t, skip_eols(t, i)) == :dot
+
+  # Token kinds that may name a remote-call member after a `.` (besides identifier/alias/quoted):
+  # the reserved words (`true`/`false`/`nil`, `do`/`end`/`fn`, block labels, `when`/`and`/`or`/
+  # `in`/`not`) and all operators EXCEPT `->`/`=>`/`//` and the structural `.`/`..`/`...`.
+  @dot_member_kinds [
+    :literal,
+    :do,
+    :end,
+    :fn,
+    :block_label,
+    :type_op,
+    :pipe_op,
+    :match_op,
+    :capture_op,
+    :at_op,
+    :arrow_op,
+    :unary_op,
+    :in_match_op,
+    :in_op,
+    :when_op,
+    :power_op,
+    :and_op,
+    :or_op,
+    :concat_op,
+    :comp_op,
+    :rel_op,
+    :mult_op,
+    :dual_op,
+    :xor_op
+  ]
 
   # `a[b]` access when `[` is adjacent to the primary (spaced `a [b]` is a no-parens call, phase 8).
   defp access?(t, lhs, i) do
-    Tokens.kind(t, i) == :"[" and adjacent_after?(cst_span(t, lhs), Tokens.span(t, i))
+    tk(t, i) == :"[" and adjacent_after?(cst_span(t, lhs), Tokens.span(t, i))
   end
 
   defp adjacent_after?({_, _, el, ec}, {sl, sc, _, _}), do: el == sl and ec == sc
@@ -363,12 +496,13 @@ defmodule Toxic2.Parser do
   # `a[b]`. A keyword-list index (`a[k: 1, j: 2]`) is the index `[k: 1, j: 2]`: parse the bracket
   # as a list sequence and use that list node as the single index.
   defp access(t, open, lhs, ctx, diags, nid, fuel) do
-    if Tokens.kind(t, skip_eols(t, open + 1)) == :kw_identifier do
+    # `a[foo: 1]` / `a['foo': 1]` — a keyword (bare or quoted key) index is a keyword-list arg.
+    if kw_data_start?(t, skip_eols(t, open + 1)) do
       {elems, j, diags, nid, fuel} = parse_seq(t, open + 1, :"]", :list, diags, nid, fuel)
-      idx = CST.node(:list, merge(tok_span(t, open), tok_span(t, j - 1)), elems, :matched, nil)
+      idx = CST.node(:list, merge_tt(t, open, j - 1), elems, :matched, nil)
 
       node =
-        CST.node(:access, merge(cst_span(t, lhs), tok_span(t, j - 1)), [lhs, idx], :matched, nil)
+        CST.node(:access, merge_ct(t, lhs, j - 1), [lhs, idx], :matched, nil)
 
       postfix(t, j, node, ctx, diags, nid, fuel)
     else
@@ -377,12 +511,21 @@ defmodule Toxic2.Parser do
   end
 
   defp access_index(t, open, lhs, ctx, diags, nid, fuel) do
-    {idx, j, diags, nid, fuel} = parse_expr(t, open + 1, 0, :matched, diags, nid, fuel - 1)
-    jj = skip_eols(t, j)
+    # A newline after `[` is allowed before the index (`foo[\n:bar]`).
+    {idx, j, diags, nid, fuel} =
+      parse_expr(t, skip_eols(t, open + 1), 0, :matched, diags, nid, fuel - 1)
 
-    if Tokens.kind(t, jj) == :"]" do
+    # A single trailing comma is allowed (`foo[1,]`); `foo[a, b]` (a real second index) is not.
+    jj0 = skip_eols(t, j)
+
+    jj =
+      if tk(t, jj0) == :"," and tk(t, skip_eols(t, jj0 + 1)) == :"]",
+        do: skip_eols(t, jj0 + 1),
+        else: jj0
+
+    if tk(t, jj) == :"]" do
       node =
-        CST.node(:access, merge(cst_span(t, lhs), tok_span(t, jj)), [lhs, idx], :matched, nil)
+        CST.node(:access, merge_ct(t, lhs, jj), [lhs, idx], :matched, nil)
 
       postfix(t, jj + 1, node, ctx, diags, nid, fuel)
     else
@@ -392,7 +535,7 @@ defmodule Toxic2.Parser do
       node =
         CST.node(
           :access,
-          merge(cst_span(t, lhs), tok_span(t, jj)),
+          merge_ct(t, lhs, jj),
           [lhs, idx, CST.missing(:"]", jj, diag: id)],
           :matched,
           nil
@@ -406,12 +549,12 @@ defmodule Toxic2.Parser do
   # bare local-call identifier (`foo(`), at depth 1 the call node it produced (the double
   # `foo()(`); never deeper, and never an alias / access / container / literal callee.
   defp paren_call?(t, lhs, i, pdepth) do
-    Tokens.kind(t, i) == :"(" and paren_callee?(t, lhs, pdepth) and
+    tk(t, i) == :"(" and paren_callee?(t, lhs, pdepth) and
       adjacent_after?(cst_span(t, lhs), Tokens.span(t, i))
   end
 
   defp paren_callee?(t, lhs, 0),
-    do: CST.tag(lhs) == :token and Tokens.kind(t, CST.token_index(lhs)) == :identifier
+    do: CST.tag(lhs) == :token and tk(t, CST.token_index(lhs)) == :identifier
 
   defp paren_callee?(_t, lhs, 1),
     do: CST.tag(lhs) == :node and CST.node_kind(lhs) in [:call, :remote_call, :anon_call]
@@ -423,14 +566,14 @@ defmodule Toxic2.Parser do
   defp dot(t, dot_i, lhs, ctx, diags, nid, fuel) do
     j = skip_eols(t, dot_i + 1)
 
-    case Tokens.kind(t, j) do
+    case tk(t, j) do
       :alias ->
         segs = if alias_node?(lhs), do: CST.children(lhs), else: [lhs]
 
         node =
           CST.node(
             :alias,
-            merge(cst_span(t, lhs), tok_span(t, j)),
+            merge_ct(t, lhs, j),
             Enum.concat(segs, [CST.token(j)]),
             :matched,
             nil
@@ -449,7 +592,7 @@ defmodule Toxic2.Parser do
         node =
           CST.node(
             :anon_call,
-            merge(cst_span(t, lhs), tok_span(t, k - 1)),
+            merge_ct(t, lhs, k - 1),
             [lhs | args],
             :matched,
             nil
@@ -466,7 +609,7 @@ defmodule Toxic2.Parser do
         node =
           CST.node(
             :dot_tuple,
-            merge(cst_span(t, lhs), tok_span(t, k - 1)),
+            merge_ct(t, lhs, k - 1),
             [lhs | elems],
             :matched,
             nil
@@ -480,6 +623,11 @@ defmodule Toxic2.Parser do
         qkind = if qk == :charlist_start, do: :charlist, else: :string
         {qname, k, diags, nid, fuel} = parse_quoted(t, j, qkind, diags, nid, fuel)
         remote_quoted_call(t, k, lhs, qname, ctx, diags, nid, fuel)
+
+      # A reserved word or operator is a valid member name: `flags.true`, `a.when`, `conn.do`,
+      # `Kernel.+`, `foo.++`, `foo.<>`. (`->`, `=>`, `//`, `.`, `..`, `...` are NOT members.)
+      k when k in @dot_member_kinds ->
+        remote_call(t, j, lhs, ctx, diags, nid, fuel)
 
       _ ->
         {id, diags, nid} =
@@ -496,7 +644,7 @@ defmodule Toxic2.Parser do
         node =
           CST.node(
             :remote_call,
-            merge(cst_span(t, lhs), tok_span(t, dot_i)),
+            merge_ct(t, lhs, dot_i),
             [lhs, CST.missing(:identifier, j, diag: id)],
             :matched,
             nil
@@ -509,13 +657,13 @@ defmodule Toxic2.Parser do
   defp remote_call(t, name_i, lhs, ctx, diags, nid, fuel) do
     name = CST.token(name_i)
 
-    if Tokens.kind(t, name_i + 1) == :"(" and Tokens.adjacent?(t, name_i, name_i + 1) do
+    if tk(t, name_i + 1) == :"(" and Tokens.adjacent?(t, name_i, name_i + 1) do
       {args, k, diags, nid, fuel} = parse_seq(t, name_i + 2, :")", :call, diags, nid, fuel)
 
       node =
         CST.node(
           :remote_call,
-          merge(cst_span(t, lhs), tok_span(t, k - 1)),
+          merge_ct(t, lhs, k - 1),
           [lhs, name | args],
           :matched,
           nil
@@ -527,7 +675,7 @@ defmodule Toxic2.Parser do
       node =
         CST.node(
           :remote_call,
-          merge(cst_span(t, lhs), tok_span(t, name_i)),
+          merge_ct(t, lhs, name_i),
           [lhs, name],
           :matched,
           nil
@@ -541,10 +689,10 @@ defmodule Toxic2.Parser do
   # `a."foo"` (quoted function name). An adjacent `(` makes it a call with args, else a 0-arg
   # remote call — same `:remote_call` node, but the name child is a `:string`/`:charlist` node.
   defp remote_quoted_call(t, after_q, lhs, qname, ctx, diags, nid, fuel) do
-    if Tokens.kind(t, after_q) == :"(" and
+    if tk(t, after_q) == :"(" and
          adjacent_after?(cst_span(t, qname), Tokens.span(t, after_q)) do
       {args, k, diags, nid, fuel} = parse_seq(t, after_q + 1, :")", :call, diags, nid, fuel)
-      span = merge(cst_span(t, lhs), tok_span(t, k - 1))
+      span = merge_ct(t, lhs, k - 1)
       node = CST.node(:remote_call, span, [lhs, qname | args], :matched, nil)
       postfix(t, k, node, ctx, diags, nid, fuel, 1)
     else
@@ -576,7 +724,7 @@ defmodule Toxic2.Parser do
   end
 
   defp led_skip_eol(t, i, min_bp) do
-    if Tokens.kind(t, i) == :eol do
+    if tk(t, i) == :eol do
       j = skip_eols(t, i)
       if continues_after_eol?(t, j, min_bp), do: j, else: i
     else
@@ -586,11 +734,28 @@ defmodule Toxic2.Parser do
 
   # The post-newline token continues the expression iff it's a binding infix that isn't `+`/`-`
   # (dual_op), or the two-token `not in`. "Binding" uses led_infix's threshold (`prec >= min_bp`).
+  # At a depth-0 newline mid-head: keep scanning for the `->` only if the head continues across it
+  # (the next line leads with an infix op / `when`, or the previous token expected more).
+  defp head_eol_ahead?(t, nxt, stop, prev) do
+    # The `->` itself may sit on the next line (`n when is_number(n)\n  -> …`), so a leading
+    # `:stab_op` after the newline also continues the head.
+    if tk(t, nxt) == :stab_op or continues_after_eol?(t, nxt, 0) or
+         head_expects_more?(prev),
+       do: clause_head_ahead?(t, nxt, 0, stop, prev),
+       else: false
+  end
+
+  # Does a token at the end of a line leave a clause head incomplete (so the next line continues
+  # it)? True for an infix op (`a &&\n…`), a prefix op (`-\n…`), or a pattern comma (`a,\n…`).
+  defp head_expects_more?(kind) do
+    Precedence.infix(kind) != nil or Precedence.prefix(kind) != nil or kind == :","
+  end
+
   defp continues_after_eol?(t, j, min_bp) do
     if not_in?(t, j) do
       170 >= min_bp
     else
-      kind = Tokens.kind(t, j)
+      kind = tk(t, j)
 
       case Precedence.infix(kind) do
         {prec, _assoc} -> kind != :dual_op and prec >= min_bp
@@ -602,7 +767,10 @@ defmodule Toxic2.Parser do
   defp led_not_in(t, not_i, lhs, min_bp, ctx, diags, nid, fuel) do
     in_i = skip_eols(t, not_i + 1)
     rhs_start = skip_eols(t, in_i + 1)
-    {rhs, k, diags, nid, fuel} = parse_expr(t, rhs_start, 171, :matched, diags, nid, fuel - 1)
+    # Propagate the no-parens context (like `led_infix`) so a `do` after the RHS attaches to the
+    # enclosing call, not the RHS operand — `def f(h) when h not in @x do … end`.
+    rhs_ctx = if ctx in [:no_parens, :no_parens_arg], do: ctx, else: :matched
+    {rhs, k, diags, nid, fuel} = parse_expr(t, rhs_start, 171, rhs_ctx, diags, nid, fuel - 1)
 
     node =
       CST.node(:not_in_op, merge(cst_span(t, lhs), cst_span(t, rhs)), [lhs, rhs], :matched, nil)
@@ -611,14 +779,28 @@ defmodule Toxic2.Parser do
   end
 
   defp led_infix(t, i, lhs, min_bp, ctx, diags, nid, fuel) do
-    case Precedence.infix(Tokens.kind(t, i)) do
+    case Precedence.infix(tk(t, i)) do
       {prec, assoc} when prec >= min_bp ->
         op_leaf = CST.token(i)
         next_min = if assoc == :left, do: prec + 1, else: prec
         rhs_start = skip_eols(t, i + 1)
-        # Operands are `matched_expr`: a no-parens call here may take only a single argument.
+
         {rhs, k, diags, nid, fuel} =
-          parse_expr(t, rhs_start, next_min, :matched, diags, nid, fuel - 1)
+          cond do
+            # `when` uniquely takes a bare keyword list on the right (`x when foo: 1, bar: 2`),
+            # incl. quoted keys (`x when 'foo': 1`).
+            tk(t, i) == :when_op and kw_data_start?(t, rhs_start) ->
+              when_kw_rhs(t, rhs_start, diags, nid, fuel)
+
+            # In a no-parens context the RIGHTMOST operand may be a no-parens call with several
+            # args (`1 + foo 2, 3` => `1 + foo(2, 3)`). The context is PRESERVED, not flattened to
+            # `:no_parens`: at top level (`:no_parens`) a `do` block attaches to the operand
+            # (`1 + if x do … end`), but inside a no-parens ARG (`:no_parens_arg`) it stays
+            # suppressed so the `do` attaches to the enclosing call (`def f when g do … end`).
+            true ->
+              rhs_ctx = if ctx in [:no_parens, :no_parens_arg], do: ctx, else: :matched
+              parse_expr(t, rhs_start, next_min, rhs_ctx, diags, nid, fuel - 1)
+          end
 
         node =
           CST.node(
@@ -636,8 +818,65 @@ defmodule Toxic2.Parser do
     end
   end
 
+  # Does a keyword list start at `i` — a bare `key:` or a quoted `"key":` key? (Used for the `when`
+  # right operand, keyword-list clause guards, and keyword indices in access `a[k: v]`.)
+  defp kw_data_start?(t, i) do
+    case tk(t, i) do
+      :kw_identifier -> true
+      k when k in [:string_start, :charlist_start] -> quoted_kw?(t, quote_end(t, i + 1, 0))
+      _ -> false
+    end
+  end
+
+  # Index just past a quoted literal's closing `string_end`/`charlist_end` (interpolation-aware).
+  defp quote_end(t, i, depth) do
+    case tk(t, i) do
+      :eof -> i
+      k when k in [:string_end, :charlist_end] and depth == 0 -> i + 1
+      :begin_interpolation -> quote_end(t, i + 1, depth + 1)
+      :end_interpolation -> quote_end(t, i + 1, depth - 1)
+      _ -> quote_end(t, i + 1, depth)
+    end
+  end
+
+  # The keyword-list right operand of `when` (`x when foo: 1, bar: 2` => `x when [foo: 1, …]`).
+  # Collected like no-parens keyword args, then wrapped in a list node (lowers to a keyword list).
+  defp when_kw_rhs(t, i, diags, nid, fuel) do
+    {first, j, is_kw, diags, nid, fuel} = parse_np_arg(t, i, diags, nid, fuel)
+    {pairs, k, diags, nid, fuel} = np_more_args(t, j, [first], is_kw, diags, nid, fuel)
+
+    # `:kw_list`, not `:list` — this keyword list is synthesized from a bare `when a: t` guard (no
+    # brackets in source), so it must NOT be treated as a list literal by the literal encoder.
+    {CST.node(:kw_list, list_span(t, pairs), pairs, :matched, nil), k, diags, nid, fuel}
+  end
+
+  # Operator families that may name a function reference (`op/arity`). `->`, `=>`, `..`, `...` and
+  # the structural `.` are excluded (`->/2` etc. are not captures).
+  @op_ref_kinds [
+    :dual_op,
+    :mult_op,
+    :concat_op,
+    :comp_op,
+    :rel_op,
+    :arrow_op,
+    :and_op,
+    :or_op,
+    :xor_op,
+    :power_op,
+    :in_op,
+    :when_op,
+    :unary_op,
+    :pipe_op,
+    :type_op,
+    :match_op,
+    :in_match_op,
+    :ternary_op
+  ]
+
+  defp op_ref_slash?(t, i), do: tk(t, i) == :mult_op and tv(t, i) == :/
+
   defp parse_prefix(t, i, ctx, diags, nid, fuel) do
-    kind = Tokens.kind(t, i)
+    kind = tk(t, i)
     prefix_bp = Precedence.prefix(kind)
 
     cond do
@@ -651,6 +890,19 @@ defmodule Toxic2.Parser do
       kind == :error ->
         {id, diags, nid} = emit_lex_error(t, i, diags, nid)
         {CST.token(i, error: true, diag: id), i + 1, diags, nid, fuel}
+
+      # An operator function reference: `+/2`, `>=/2`, `&++/2`. In nud position an operator name
+      # immediately followed by `/` is a bare operator value (`{:+, [], nil}`); the trailing
+      # `/arity` is an ordinary division in the led loop. The `/` guard keeps this from changing
+      # any other use of these operators.
+      kind in @op_ref_kinds and op_ref_slash?(t, i + 1) ->
+        {CST.node(:op_ref, tok_span(t, i), [CST.token(i)], :matched, nil), i + 1, diags, nid,
+         fuel}
+
+      # `..` / `...` with no left operand: `..` is nullary only (`{:.., [], []}`); `...` is nullary
+      # (`{:..., [], []}`) or unary when an operand follows (`...x` => `{:..., [], [x]}`).
+      kind in [:range_op, :ellipsis_op] ->
+        parse_dotdot(t, i, kind, ctx, diags, nid, fuel)
 
       prefix_bp != nil ->
         parse_unary(t, i, prefix_bp, ctx, diags, nid, fuel)
@@ -690,9 +942,9 @@ defmodule Toxic2.Parser do
 
   # `:"..."` / `:'...'` — a `:quoted_atom` marker at `i`, then the quoted literal's tokens at i+1.
   defp parse_primary(:quoted_atom, t, i, _ctx, diags, nid, fuel) do
-    kind = if Tokens.kind(t, i + 1) == :charlist_start, do: :charlist, else: :string
+    kind = if tk(t, i + 1) == :charlist_start, do: :charlist, else: :string
     {inner, j, diags, nid, fuel} = parse_quoted(t, i + 1, kind, diags, nid, fuel)
-    span = merge(tok_span(t, i), cst_span(t, inner))
+    span = merge_tc(t, i, inner)
     {CST.node(:quoted_atom, span, [inner], :matched, nil), j, diags, nid, fuel}
   end
 
@@ -706,14 +958,14 @@ defmodule Toxic2.Parser do
     {children, j, diags, nid, fuel} =
       sigil_parts(t, start_i + 1, [CST.token(start_i)], diags, nid, fuel)
 
-    span = merge(tok_span(t, start_i), tok_span(t, j - 1))
+    span = merge_tt(t, start_i, j - 1)
     {CST.node(:sigil, span, children, :matched, nil), j, diags, nid, fuel}
   end
 
   defp sigil_parts(t, i, acc, diags, nid, fuel) do
     cond do
       fuel <= 0 -> {:lists.reverse(acc), i, diags, nid, fuel}
-      true -> sigil_part(Tokens.kind(t, i), t, i, acc, diags, nid, fuel)
+      true -> sigil_part(tk(t, i), t, i, acc, diags, nid, fuel)
     end
   end
 
@@ -743,14 +995,14 @@ defmodule Toxic2.Parser do
   # `:charlist`) is set from the opener; lowering decides the concrete shape from it.
   defp parse_quoted(t, start_i, node_kind, diags, nid, fuel) do
     {parts, j, diags, nid, fuel} = quoted_parts(t, start_i + 1, [], diags, nid, fuel)
-    span = merge(tok_span(t, start_i), tok_span(t, j - 1))
+    span = merge_tt(t, start_i, j - 1)
     {CST.node(node_kind, span, parts, :matched, nil), j, diags, nid, fuel}
   end
 
   defp quoted_parts(t, i, acc, diags, nid, fuel) do
     cond do
       fuel <= 0 -> {:lists.reverse(acc), i, diags, nid, fuel}
-      true -> quoted_part(Tokens.kind(t, i), t, i, acc, diags, nid, fuel)
+      true -> quoted_part(tk(t, i), t, i, acc, diags, nid, fuel)
     end
   end
 
@@ -783,7 +1035,7 @@ defmodule Toxic2.Parser do
     {exprs, j, diags, nid, fuel} = collect_interp(t, begin_i + 1, [], diags, nid, fuel - 1)
 
     {end_i, diags, nid} =
-      if Tokens.kind(t, j) == :end_interpolation do
+      if tk(t, j) == :end_interpolation do
         {j + 1, diags, nid}
       else
         {_id, diags, nid} =
@@ -800,7 +1052,7 @@ defmodule Toxic2.Parser do
         {j, diags, nid}
       end
 
-    span = merge(tok_span(t, begin_i), tok_span(t, end_i - 1))
+    span = merge_tt(t, begin_i, end_i - 1)
     {CST.node(:interp, span, exprs, :matched, nil), end_i, diags, nid, fuel}
   end
 
@@ -809,10 +1061,10 @@ defmodule Toxic2.Parser do
       fuel <= 0 ->
         {:lists.reverse(acc), i, diags, nid, fuel}
 
-      Tokens.kind(t, i) in [:end_interpolation, :eof] ->
+      tk(t, i) in [:end_interpolation, :eof] ->
         {:lists.reverse(acc), i, diags, nid, fuel}
 
-      Tokens.kind(t, i) in [:eol, :";"] ->
+      tk(t, i) in [:eol, :";"] ->
         collect_interp(t, skip_eoe(t, i), acc, diags, nid, fuel)
 
       true ->
@@ -829,7 +1081,7 @@ defmodule Toxic2.Parser do
 
   # A statement inside `#{...}` ends at EOE or the closing `}`; anything else is leftover.
   defp end_interp_stmt(t, i, diags, nid) do
-    case Tokens.kind(t, i) do
+    case tk(t, i) do
       k when k in [:eol, :";"] ->
         {skip_eoe(t, i), diags, nid}
 
@@ -851,7 +1103,7 @@ defmodule Toxic2.Parser do
   end
 
   defp skip_to_interp_eoe(t, i) do
-    case Tokens.kind(t, i) do
+    case tk(t, i) do
       k when k in [:eol, :";", :end_interpolation, :eof] -> i
       _ -> skip_to_interp_eoe(t, i + 1)
     end
@@ -863,15 +1115,14 @@ defmodule Toxic2.Parser do
   defp parse_fn(t, fn_i, diags, nid, fuel) do
     {clauses, j, diags, nid, fuel} = parse_clauses(t, fn_i + 1, [], diags, nid, fuel)
 
-    {CST.node(:fn, merge(tok_span(t, fn_i), tok_span(t, j - 1)), clauses, :matched, nil), j,
-     diags, nid, fuel}
+    {CST.node(:fn, merge_tt(t, fn_i, j - 1), clauses, :matched, nil), j, diags, nid, fuel}
   end
 
   defp parse_clauses(t, i, acc, diags, nid, fuel) do
     i = skip_eoe(t, i)
 
     cond do
-      Tokens.kind(t, i) == :end ->
+      tk(t, i) == :end ->
         # `fn end` (no clauses) is invalid in Elixir.
         {diags, nid} =
           if acc == [] do
@@ -885,24 +1136,24 @@ defmodule Toxic2.Parser do
 
         {:lists.reverse(acc), i + 1, diags, nid, fuel}
 
-      Tokens.at_eof?(t, i) ->
+      t_eof?(t, i) ->
         {id, diags, nid} =
           Diagnostics.emit(diags, nid, :parser, :error, :expected_end, eof_span(t), %{})
 
         {:lists.reverse([CST.missing(:end, i, diag: id) | acc]), i, diags, nid, fuel}
 
       true ->
-        {clause, j, diags, nid, fuel} = parse_clause(t, i, diags, nid, fuel)
+        {clause, j, diags, nid, fuel} = parse_clause(t, i, :end, diags, nid, fuel)
         j = if j > i, do: j, else: i + 1
         parse_clauses(t, j, [clause | acc], diags, nid, fuel)
     end
   end
 
-  defp parse_clause(t, i, diags, nid, fuel) do
+  defp parse_clause(t, i, stop, diags, nid, fuel) do
     {head, arrow_i, diags, nid, fuel} = parse_clause_head(t, i, diags, nid, fuel)
 
-    if Tokens.kind(t, arrow_i) == :stab_op do
-      {body, k, diags, nid, fuel} = parse_clause_body(t, arrow_i + 1, [], diags, nid, fuel)
+    if tk(t, arrow_i) == :stab_op do
+      {body, k, diags, nid, fuel} = parse_clause_body(t, arrow_i + 1, [], stop, diags, nid, fuel)
 
       {CST.node(:stab, merge(cst_span(t, head), cst_span(t, body)), [head, body], :matched, nil),
        k, diags, nid, fuel}
@@ -925,19 +1176,79 @@ defmodule Toxic2.Parser do
   defp parse_clause_head(t, i, diags, nid, fuel) do
     i = skip_eols(t, i)
 
-    if Tokens.kind(t, i) == :stab_op do
-      {CST.node(:stab_args, tok_span(t, i), [], :matched, nil), i, diags, nid, fuel}
-    else
-      {patterns, j, diags, nid, fuel} = head_patterns(t, i, [], diags, nid, fuel)
-      jj = skip_eols(t, j)
-      clause_head_guard(t, jj, patterns, diags, nid, fuel)
+    cond do
+      tk(t, i) == :stab_op ->
+        {CST.node(:stab_args, tok_span(t, i), [], :matched, nil), i, diags, nid, fuel}
+
+      # A parenthesised multi-arg head — `(a, b) -> …`, `(x, a: 1) when g -> …`: the parens wrap
+      # the comma-separated arg list (`stab_parens_many`), so parse the interior as the patterns.
+      stab_parens_head?(t, i) ->
+        {patterns, j, diags, nid, fuel} = head_patterns(t, i + 1, [], diags, nid, fuel)
+        close = skip_eols(t, j)
+        after_close = if tk(t, close) == :")", do: close + 1, else: close
+        clause_head_guard(t, skip_eols(t, after_close), patterns, diags, nid, fuel)
+
+      true ->
+        {patterns, j, diags, nid, fuel} = head_patterns(t, i, [], diags, nid, fuel)
+        jj = skip_eols(t, j)
+        clause_head_guard(t, jj, patterns, diags, nid, fuel)
+    end
+  end
+
+  # Is the head a single parenthesised arg list (`(a, b) ->`, `(a: 1) ->`)? True when a `(` opens,
+  # its body carries a depth-0 comma or keyword (so it can't be a plain single-pattern paren), and
+  # the matching `)` is immediately followed by `->`/`when`. Single-arg `(a)` and empty `()` keep
+  # their existing paren-expr path (same resulting AST).
+  defp stab_parens_head?(t, i) do
+    tk(t, i) == :"(" and
+      case scan_paren(t, i + 1, 1, false) do
+        {true, close} ->
+          tk(t, close) == :")" and
+            tk(t, skip_eols(t, close + 1)) in [:stab_op, :when_op]
+
+        {false, _} ->
+          false
+      end
+  end
+
+  # Scan a paren whose `(` precedes `i`; returns {arg_list?, matching_close_index}, where
+  # `arg_list?` is true if a depth-0 comma or keyword key was seen (marks a multi/keyword arg list).
+  defp scan_paren(t, i, depth, args?), do: scan_paren(t, i, depth, args?, :eol)
+
+  defp scan_paren(t, i, depth, args?, prev) do
+    k = tk(t, i)
+
+    cond do
+      k == :eof ->
+        {args?, i}
+
+      # A reserved word as a dot member (`a.end`) is a name, not a block delimiter.
+      prev == :dot and k in [:end, :do, :fn, :block_label] ->
+        scan_paren(t, i + 1, depth, args?, k)
+
+      depth == 1 and k == :")" ->
+        {args?, i}
+
+      depth == 1 and k in [:",", :kw_identifier, :kw_quote] ->
+        scan_paren(t, i + 1, depth, true, k)
+
+      true ->
+        scan_paren(t, i + 1, depth + depth_delta(k), args?, k)
     end
   end
 
   defp clause_head_guard(t, i, patterns, diags, nid, fuel) do
-    if Tokens.kind(t, i) == :when_op do
+    if tk(t, i) == :when_op do
+      guard_start = skip_eols(t, i + 1)
+
       {guard, j, diags, nid, fuel} =
-        parse_expr(t, skip_eols(t, i + 1), 0, :matched, diags, nid, fuel - 1)
+        if kw_data_start?(t, guard_start) do
+          # `fn (a) when foo: 1 -> …`: a keyword-list guard, like the expression-level `when`.
+          when_kw_rhs(t, guard_start, diags, nid, fuel)
+        else
+          # `:no_parens` so a guard that is a no-parens call takes several args (`when baz a, b`).
+          parse_expr(t, guard_start, 0, :no_parens, diags, nid, fuel - 1)
+        end
 
       when_node =
         CST.node(
@@ -956,29 +1267,70 @@ defmodule Toxic2.Parser do
     end
   end
 
-  # Comma-separated patterns, each parsed stopping before `when` (50) and `->` (not infix).
+  # Comma-separated patterns, each parsed stopping before `when` (50) and `->` (not infix). A
+  # trailing run of keyword pairs (`fn x, a: 1 -> …`) is collected like call/list args — kept as
+  # `:kw_pair` nodes here and grouped into one keyword-list arg at lowering.
   defp head_patterns(t, i, acc, diags, nid, fuel) do
     i = skip_eols(t, i)
-
-    {pat, j, diags, nid, fuel} =
-      parse_expr(t, i, @clause_pattern_bp, :matched, diags, nid, fuel - 1)
+    {pat, j, diags, nid, fuel} = head_pattern(t, i, diags, nid, fuel)
 
     j = if j > i, do: j, else: i + 1
     jj = skip_eols(t, j)
 
-    if Tokens.kind(t, jj) == :"," do
+    if tk(t, jj) == :"," do
       head_patterns(t, jj + 1, [pat | acc], diags, nid, fuel)
     else
       {:lists.reverse([pat | acc]), j, diags, nid, fuel}
     end
   end
 
-  # Clause body: statements until `end`, EOF, or the next clause head (a `->` on the line ahead).
-  defp parse_clause_body(t, i, acc, diags, nid, fuel) do
-    i = skip_eoe(t, i)
+  # One stab-head pattern: a keyword pair (`a: 1`) or an ordinary pattern (stopping before `when`).
+  # Parsed in `:no_parens` so a pattern that is a no-parens call takes several args — the whole
+  # `x 1, 2, 3` is ONE pattern (`x(1, 2, 3)`), and a keyword value may be one too (`a: b c, d`).
+  defp head_pattern(t, i, diags, nid, fuel) do
+    if tk(t, i) == :kw_identifier do
+      key = CST.token(i)
 
+      {val, j, diags, nid, fuel} =
+        parse_expr(t, skip_eols(t, i + 1), 0, :no_parens, diags, nid, fuel - 1)
+
+      node =
+        CST.node(:kw_pair, merge_tc(t, i, val), [key, val], :matched, nil)
+
+      {node, j, diags, nid, fuel}
+    else
+      {expr, j, diags, nid, fuel} =
+        parse_expr(t, i, @clause_pattern_bp, :no_parens, diags, nid, fuel - 1)
+
+      # A quoted keyword key in a stab head (`('a': 1) -> …`).
+      if quoted_kw?(t, j) do
+        parse_quoted_kw(t, expr, j, :matched, diags, nid, fuel)
+      else
+        {expr, j, diags, nid, fuel}
+      end
+    end
+  end
+
+  # Clause body: statements until the section terminator (`end`, or `)` for a parenthesised stab),
+  # EOF, or the next clause head (a `->` on the line ahead).
+  defp parse_clause_body(t, i, acc, stop, diags, nid, fuel) do
+    # A single `;` at the very START of a stab body is an empty first statement: `-> ;t` =>
+    # `__block__([nil, t])`, `-> ;` => `nil`. This is stab-specific (a paren block drops a leading
+    # `;`). Newlines before it are insignificant; after the first statement `;`/newlines are plain
+    # separators handled by `body_boundary`/`skip_eoe`.
+    if acc == [] and tk(t, skip_eols(t, i)) == :";" do
+      semi = skip_eols(t, i)
+      parse_clause_body(t, semi + 1, [empty_stmt(t, semi)], stop, diags, nid, fuel)
+    else
+      parse_clause_body_cont(t, skip_eoe(t, i), acc, stop, diags, nid, fuel)
+    end
+  end
+
+  defp empty_stmt(t, i), do: CST.node(:empty_stmt, tok_span(t, i), [], :matched, nil)
+
+  defp parse_clause_body_cont(t, i, acc, stop, diags, nid, fuel) do
     cond do
-      at_section_end?(t, i) or clause_head_ahead?(t, i, 0) ->
+      clause_section_end?(t, i, stop) or clause_head_ahead?(t, i, 0, stop) ->
         {CST.node(
            :stab_body,
            list_span(t, :lists.reverse(acc)),
@@ -990,22 +1342,28 @@ defmodule Toxic2.Parser do
       true ->
         {stmt, j, diags, nid, fuel} = parse_expr(t, i, 0, :no_parens, diags, nid, fuel - 1)
         j = if j > i, do: j, else: i + 1
-        {j, diags, nid} = body_boundary(t, j, diags, nid)
-        parse_clause_body(t, j, [stmt | acc], diags, nid, fuel)
+        {j, diags, nid} = body_boundary(t, j, stop, diags, nid)
+        parse_clause_body(t, j, [stmt | acc], stop, diags, nid, fuel)
     end
   end
 
+  # A clause body ends at the section terminator: `end` / block label / EOF (always), plus the
+  # caller's `stop` token — `:end` for `fn`/`do` (already covered) or `:")"` for a paren stab.
+  defp clause_section_end?(t, i, stop),
+    do: at_section_end?(t, i) or tk(t, i) == stop
+
   # After a body statement, the cursor must be at a boundary (EOE / `end` / block label / EOF /
   # next clause head). A same-line leftover token (`fn -> 1 2 end`) is an error; skip to a boundary.
-  defp body_boundary(t, i, diags, nid) do
+  defp body_boundary(t, i, stop, diags, nid) do
     cond do
-      at_section_end?(t, i) or Tokens.kind(t, i) in [:eol, :";"] or clause_head_ahead?(t, i, 0) ->
+      clause_section_end?(t, i, stop) or tk(t, i) in [:eol, :";"] or
+          clause_head_ahead?(t, i, 0, stop) ->
         {i, diags, nid}
 
       true ->
         {_id, diags, nid} =
           Diagnostics.emit(diags, nid, :parser, :error, :unexpected_token, tok_span(t, i), %{
-            kind: Tokens.kind(t, i)
+            kind: tk(t, i)
           })
 
         {skip_to_body_boundary(t, i + 1), diags, nid}
@@ -1013,7 +1371,7 @@ defmodule Toxic2.Parser do
   end
 
   defp skip_to_body_boundary(t, i) do
-    if at_section_end?(t, i) or Tokens.kind(t, i) in [:eol, :";"] do
+    if at_section_end?(t, i) or tk(t, i) in [:eol, :";"] do
       i
     else
       skip_to_body_boundary(t, i + 1)
@@ -1022,22 +1380,48 @@ defmodule Toxic2.Parser do
 
   # A clause/section body ends at `end`, a block label (`else`/`catch`/`rescue`/`after`), or EOF.
   defp at_section_end?(t, i),
-    do: Tokens.kind(t, i) in [:end, :block_label] or Tokens.at_eof?(t, i)
+    do: tk(t, i) in [:end, :block_label] or t_eof?(t, i)
 
-  # Is the upcoming line a clause head? True if a depth-0 `->` precedes the next EOE / `end` / EOF.
-  defp clause_head_ahead?(t, i, depth) do
-    case Tokens.kind(t, i) do
-      :eof -> false
-      :stab_op when depth == 0 -> true
-      :end when depth == 0 -> false
-      # A block label ends the current section, so a `->` beyond it belongs to a later section.
-      :block_label when depth == 0 -> false
-      k when depth == 0 and k in [:eol, :";"] -> false
-      k when k in [:"(", :"[", :"{", :"<<", :fn, :do] -> clause_head_ahead?(t, i + 1, depth + 1)
-      k when k in [:")", :"]", :"}", :">>", :end] -> clause_head_ahead?(t, i + 1, depth - 1)
-      _ -> clause_head_ahead?(t, i + 1, depth)
+  defp clause_head_ahead?(t, i, depth, stop), do: clause_head_ahead?(t, i, depth, stop, :eol)
+
+  # Is the upcoming line a clause head? True if a depth-0 `->` precedes the section terminator
+  # (`stop` — `:end` or `)` for a paren stab), a hard statement boundary, or EOF. A clause head may
+  # span several physical lines (`pattern\nwhen g ->`, `a &&\n b ->`), so a depth-0 NEWLINE only
+  # stops the scan when the head is COMPLETE there — i.e. neither the previous token expects more
+  # (an infix/prefix op or `,`) nor the next one continues it (a leading infix op / `when`). `prev`
+  # is the last significant token kind. The depth-0 `stop` check comes first so a paren stab body
+  # (`(-> 1) | (-> 2)`) doesn't scan past its `)` into a later clause.
+  defp clause_head_ahead?(t, i, depth, stop, prev) do
+    k = tk(t, i)
+
+    cond do
+      k == :eof ->
+        false
+
+      # A reserved word used as a dot member (`r.end`, `r.do`, `r.else`) is a NAME, not a section
+      # terminator or a bracket — it must not move the depth or end the scan.
+      prev == :dot and k in [:end, :do, :fn, :block_label] ->
+        clause_head_ahead?(t, i + 1, depth, stop, k)
+
+      depth == 0 and k == :stab_op ->
+        true
+
+      # The section terminator (`stop`/`end`), a block label, or a `;` ends the scan at depth 0.
+      depth == 0 and k in [stop, :end, :block_label, :";"] ->
+        false
+
+      depth == 0 and k == :eol ->
+        head_eol_ahead?(t, skip_eols(t, i), stop, prev)
+
+      true ->
+        clause_head_ahead?(t, i + 1, depth + depth_delta(k), stop, k)
     end
   end
+
+  # Bracket/`fn`/`do`/`end` depth change for the clause-head scan (other tokens are depth-neutral).
+  defp depth_delta(k) when k in [:"(", :"[", :"{", :"<<", :fn, :do], do: 1
+  defp depth_delta(k) when k in [:")", :"]", :"}", :">>", :end], do: -1
+  defp depth_delta(_k), do: 0
 
   # `head_patterns` always returns at least one pattern, so `patterns` is non-empty here.
   defp head_span(t, patterns, nil), do: list_span(t, patterns)
@@ -1050,8 +1434,7 @@ defmodule Toxic2.Parser do
   defp parse_do_block(t, do_i, diags, nid, fuel) do
     {sections, j, diags, nid, fuel} = parse_sections(t, do_i, [], diags, nid, fuel)
 
-    {CST.node(:do_block, merge(tok_span(t, do_i), tok_span(t, j - 1)), sections, :matched, nil),
-     j, diags, nid, fuel}
+    {CST.node(:do_block, merge_tt(t, do_i, j - 1), sections, :matched, nil), j, diags, nid, fuel}
   end
 
   defp parse_sections(t, i, acc, diags, nid, fuel) do
@@ -1061,17 +1444,17 @@ defmodule Toxic2.Parser do
     section =
       CST.node(
         :do_section,
-        merge(tok_span(t, i), cst_span(t, body)),
+        merge_tc(t, i, body),
         [label, body],
         :matched,
         nil
       )
 
     cond do
-      Tokens.kind(t, j) == :block_label ->
+      tk(t, j) == :block_label ->
         parse_sections(t, j, [section | acc], diags, nid, fuel)
 
-      Tokens.kind(t, j) == :end ->
+      tk(t, j) == :end ->
         {:lists.reverse([section | acc]), j + 1, diags, nid, fuel}
 
       true ->
@@ -1086,7 +1469,7 @@ defmodule Toxic2.Parser do
   defp parse_section_body(t, i, diags, nid, fuel) do
     i = skip_eoe(t, i)
 
-    if not at_section_end?(t, i) and clause_head_ahead?(t, i, 0) do
+    if not at_section_end?(t, i) and clause_head_ahead?(t, i, 0, :end) do
       {clauses, j, diags, nid, fuel} = parse_block_clauses(t, i, [], diags, nid, fuel)
       {CST.node(:do_clauses, list_span(t, clauses), clauses, :matched, nil), j, diags, nid, fuel}
     else
@@ -1101,7 +1484,7 @@ defmodule Toxic2.Parser do
     if at_section_end?(t, i) do
       {:lists.reverse(acc), i, diags, nid, fuel}
     else
-      {clause, j, diags, nid, fuel} = parse_clause(t, i, diags, nid, fuel)
+      {clause, j, diags, nid, fuel} = parse_clause(t, i, :end, diags, nid, fuel)
       j = if j > i, do: j, else: i + 1
       parse_block_clauses(t, j, [clause | acc], diags, nid, fuel)
     end
@@ -1115,7 +1498,7 @@ defmodule Toxic2.Parser do
     else
       {stmt, j, diags, nid, fuel} = parse_expr(t, i, 0, :no_parens, diags, nid, fuel - 1)
       j = if j > i, do: j, else: i + 1
-      {j, diags, nid} = body_boundary(t, j, diags, nid)
+      {j, diags, nid} = body_boundary(t, j, :end, diags, nid)
       parse_block_stmts(t, j, [stmt | acc], diags, nid, fuel)
     end
   end
@@ -1125,15 +1508,15 @@ defmodule Toxic2.Parser do
     j = i + 1
 
     cond do
-      Tokens.kind(t, j) == :"{" ->
+      tk(t, j) == :"{" ->
         parse_map_body(t, j, i, diags, nid, fuel)
 
-      struct_base_start?(Tokens.kind(t, j)) ->
+      struct_base_start?(tk(t, j)) ->
         parse_struct(t, i, diags, nid, fuel)
 
       # A `(`/`[` base is valid only when SPACED from `%`: `% (){}` is a struct on `()`, but the
       # adjacent `%(...)` / `%[...]` is rejected by Elixir.
-      Tokens.kind(t, j) in [:"(", :"["] and not adjacent_after?(tok_span(t, i), tok_span(t, j)) ->
+      tk(t, j) in [:"(", :"["] and not adjacent_after?(tok_span(t, i), tok_span(t, j)) ->
         parse_struct(t, i, diags, nid, fuel)
 
       true ->
@@ -1171,6 +1554,7 @@ defmodule Toxic2.Parser do
       :at_op,
       :unary_op,
       :dual_op,
+      :ellipsis_op,
       :"<<",
       :percent
     ]
@@ -1180,18 +1564,17 @@ defmodule Toxic2.Parser do
     {name, j, diags, nid, fuel} =
       parse_expr(t, pct + 1, @struct_name_bp, :matched, diags, nid, fuel - 1)
 
-    if Tokens.kind(t, j) == :"{" do
+    if tk(t, j) == :"{" do
       {map, k, diags, nid, fuel} = parse_map_body(t, j, j, diags, nid, fuel)
 
-      {CST.node(:struct, merge(tok_span(t, pct), cst_span(t, map)), [name, map], :matched, nil),
-       k, diags, nid, fuel}
+      {CST.node(:struct, merge_tc(t, pct, map), [name, map], :matched, nil), k, diags, nid, fuel}
     else
       {id, diags, nid} =
         Diagnostics.emit(diags, nid, :parser, :error, :expected_struct_body, tok_span(t, j), %{})
 
       {CST.node(
          :struct,
-         merge(tok_span(t, pct), cst_span(t, name)),
+         merge_tc(t, pct, name),
          [name, CST.missing(:"{", j, diag: id)],
          :matched,
          nil
@@ -1205,16 +1588,15 @@ defmodule Toxic2.Parser do
     i = skip_eols(t, brace + 1)
 
     cond do
-      Tokens.kind(t, i) == :"}" ->
-        {CST.node(:map, merge(tok_span(t, span_start), tok_span(t, i)), [], :matched, nil), i + 1,
-         diags, nid, fuel}
+      tk(t, i) == :"}" ->
+        {CST.node(:map, merge_tt(t, span_start, i), [], :matched, nil), i + 1, diags, nid, fuel}
 
-      Tokens.kind(t, i) == :kw_identifier ->
+      tk(t, i) == :kw_identifier ->
         {entries, j, diags, nid, fuel} = map_entries(t, i, [], false, diags, nid, fuel)
 
         {CST.node(
            :map,
-           merge(tok_span(t, span_start), tok_span(t, j - 1)),
+           merge_tt(t, span_start, j - 1),
            entries,
            :matched,
            nil
@@ -1231,7 +1613,7 @@ defmodule Toxic2.Parser do
     jj = skip_eols(t, j)
 
     cond do
-      Tokens.kind(t, jj) == :pipe_op ->
+      tk(t, jj) == :pipe_op ->
         {entries, k, diags, nid, fuel} =
           map_entries(t, skip_eols(t, jj + 1), [], false, diags, nid, fuel)
 
@@ -1255,13 +1637,13 @@ defmodule Toxic2.Parser do
 
         {CST.node(
            :map_update,
-           merge(tok_span(t, span_start), tok_span(t, k - 1)),
+           merge_tt(t, span_start, k - 1),
            [key | entries],
            :matched,
            nil
          ), k, diags, nid, fuel}
 
-      Tokens.kind(t, jj) == :assoc_op ->
+      tk(t, jj) == :assoc_op ->
         {val, k, diags, nid, fuel} =
           parse_expr(t, skip_eols(t, jj + 1), 0, :matched, diags, nid, fuel - 1)
 
@@ -1272,7 +1654,7 @@ defmodule Toxic2.Parser do
 
         {CST.node(
            :map,
-           merge(tok_span(t, span_start), tok_span(t, m - 1)),
+           merge_tt(t, span_start, m - 1),
            entries,
            :matched,
            nil
@@ -1285,7 +1667,7 @@ defmodule Toxic2.Parser do
 
         {CST.node(
            :map,
-           merge(tok_span(t, span_start), tok_span(t, m - 1)),
+           merge_tt(t, span_start, m - 1),
            entries,
            :matched,
            nil
@@ -1297,7 +1679,7 @@ defmodule Toxic2.Parser do
 
         {CST.node(
            :map,
-           merge(tok_span(t, span_start), tok_span(t, m - 1)),
+           merge_tt(t, span_start, m - 1),
            entries,
            :matched,
            nil
@@ -1310,10 +1692,10 @@ defmodule Toxic2.Parser do
     i2 = skip_eols(t, i)
 
     cond do
-      Tokens.kind(t, i2) == :"}" ->
+      tk(t, i2) == :"}" ->
         {:lists.reverse(acc), i2 + 1, diags, nid, fuel}
 
-      Tokens.kind(t, i2) == :"," ->
+      tk(t, i2) == :"," ->
         map_entries(t, skip_eols(t, i2 + 1), acc, seen_kw, diags, nid, fuel)
 
       true ->
@@ -1325,7 +1707,7 @@ defmodule Toxic2.Parser do
   defp map_entries(t, i, acc, seen_kw, diags, nid, fuel) do
     i = skip_eols(t, i)
 
-    if Tokens.kind(t, i) == :"}" do
+    if tk(t, i) == :"}" do
       {:lists.reverse(acc), i + 1, diags, nid, fuel}
     else
       {entry, j, diags, nid, fuel} = parse_map_entry(t, i, diags, nid, fuel)
@@ -1336,20 +1718,19 @@ defmodule Toxic2.Parser do
   end
 
   defp parse_map_entry(t, i, diags, nid, fuel) do
-    if Tokens.kind(t, i) == :kw_identifier do
+    if tk(t, i) == :kw_identifier do
       key = CST.token(i)
 
       {val, j, diags, nid, fuel} =
         parse_expr(t, skip_eols(t, i + 1), 0, :matched, diags, nid, fuel - 1)
 
-      {CST.node(:kw_pair, merge(tok_span(t, i), cst_span(t, val)), [key, val], :matched, nil), j,
-       diags, nid, fuel}
+      {CST.node(:kw_pair, merge_tc(t, i, val), [key, val], :matched, nil), j, diags, nid, fuel}
     else
       {key, j, diags, nid, fuel} = parse_expr(t, i, @map_key_bp, :matched, diags, nid, fuel - 1)
       jj = skip_eols(t, j)
 
       cond do
-        Tokens.kind(t, jj) == :assoc_op ->
+        tk(t, jj) == :assoc_op ->
           {val, k, diags, nid, fuel} =
             parse_expr(t, skip_eols(t, jj + 1), 0, :matched, diags, nid, fuel - 1)
 
@@ -1382,8 +1763,7 @@ defmodule Toxic2.Parser do
     {elems, j, diags, nid, fuel} = parse_seq(t, open + 1, close, kind, diags, nid, fuel)
     {diags, nid} = check_container_lead(kind, t, elems, diags, nid)
 
-    {CST.node(kind, merge(tok_span(t, open), tok_span(t, j - 1)), elems, :matched, nil), j, diags,
-     nid, fuel}
+    {CST.node(kind, merge_tt(t, open, j - 1), elems, :matched, nil), j, diags, nid, fuel}
   end
 
   # A tuple/bitstring may carry trailing keywords (`{1, a: 1}` => `{1, [a: 1]}`) but its FIRST
@@ -1411,7 +1791,7 @@ defmodule Toxic2.Parser do
   defp parse_seq(t, i, close, mode, diags, nid, fuel) do
     i = skip_eols(t, i)
 
-    if Tokens.kind(t, i) == close do
+    if tk(t, i) == close do
       {[], i + 1, diags, nid, fuel}
     else
       seq_elems(t, i, [], false, close, mode, diags, nid, fuel)
@@ -1425,10 +1805,10 @@ defmodule Toxic2.Parser do
     i2 = skip_eols(t, i)
 
     cond do
-      Tokens.kind(t, i2) == close ->
+      tk(t, i2) == close ->
         {:lists.reverse(acc), i2 + 1, diags, nid, fuel}
 
-      Tokens.kind(t, i2) == :"," ->
+      tk(t, i2) == :"," ->
         {diags, nid} = check_np_comma(mode, el, t, i2, diags, nid)
         seq_after_comma(t, i2, acc, seen_kw or is_kw, close, mode, diags, nid, fuel)
 
@@ -1454,10 +1834,13 @@ defmodule Toxic2.Parser do
     nxt = skip_eols(t, comma_i + 1)
 
     cond do
-      Tokens.kind(t, nxt) != close ->
+      tk(t, nxt) != close ->
         seq_elems(t, nxt, acc, seen_kw, close, mode, diags, nid, fuel)
 
-      mode != :call ->
+      # Lists/tuples/bitstrings allow a trailing comma freely; a paren call allows it only after a
+      # keyword arg (`foo(a: 1,)` is ok, `foo(1,)` is not) — keywords must come last, so `seen_kw`
+      # means the final argument was a keyword pair.
+      mode != :call or seen_kw ->
         {:lists.reverse(acc), nxt + 1, diags, nid, fuel}
 
       true ->
@@ -1483,7 +1866,7 @@ defmodule Toxic2.Parser do
     # list/tuple/bitstring elements are `:matched` (a no-parens element may take only one arg).
     ctx = if mode == :call, do: :no_parens, else: :matched
 
-    if Tokens.kind(t, i) == :kw_identifier do
+    if tk(t, i) == :kw_identifier do
       key = CST.token(i)
 
       # A keyword VALUE is a single `matched_expr` (`f(a: g b)` => `g(b)`), NOT a `:no_parens`
@@ -1492,7 +1875,7 @@ defmodule Toxic2.Parser do
         parse_expr(t, skip_eols(t, i + 1), 0, :matched, diags, nid, fuel - 1)
 
       node =
-        CST.node(:kw_pair, merge(tok_span(t, i), cst_span(t, val)), [key, val], :matched, nil)
+        CST.node(:kw_pair, merge_tc(t, i, val), [key, val], :matched, nil)
 
       {diags, nid} = check_kw_allowed(mode, t, i, diags, nid)
       {diags, nid} = check_np_kw_last(val, t, j, diags, nid)
@@ -1514,8 +1897,10 @@ defmodule Toxic2.Parser do
   # `f(a: g b, c)` / `f(a: if e, do: x)`. (A parenthesised value `a: g(b)` is a `:call`, not
   # `:np_call`, so it may be followed by more.)
   defp check_np_kw_last(val, t, j, diags, nid) do
-    if CST.tag(val) == :node and CST.node_kind(val) == :np_call and
-         Tokens.kind(t, skip_eols(t, j)) == :"," do
+    # A no-parens-call value ending in a `do … end` block is unambiguous, so it may be followed by
+    # more keywords (`f(a: case x do … end, b: 1)`); only a bare no-parens call is keyword-last.
+    if CST.tag(val) == :node and CST.node_kind(val) == :np_call and not has_do_block?(val) and
+         tk(t, skip_eols(t, j)) == :"," do
       {_id, diags, nid} =
         Diagnostics.emit(
           diags,
@@ -1533,10 +1918,17 @@ defmodule Toxic2.Parser do
     end
   end
 
+  # Does a call node end in an attached `do … end` block (its last child is a `:do_block`)?
+  defp has_do_block?({:node, _k, _sp, children, _f, _d}) do
+    match?({:node, :do_block, _, _, _, _}, List.last(children))
+  end
+
+  defp has_do_block?(_), do: false
+
   # A quoted keyword key (`"foo": v`): the lexer marks the colon as `:kw_quote` right after the
   # close quote, so an expression that's a quoted literal followed by `:kw_quote` is a kw pair
   # whose key is the literal (atomized like a quoted atom in lowering).
-  defp quoted_kw?(t, j), do: Tokens.kind(t, j) == :kw_quote
+  defp quoted_kw?(t, j), do: tk(t, j) == :kw_quote
 
   defp parse_quoted_kw(t, key, kw_i, ctx, diags, nid, fuel) do
     {val, k, diags, nid, fuel} =
@@ -1552,7 +1944,9 @@ defmodule Toxic2.Parser do
   # parens. (In call args the comma is absorbed by the inner call, so this only fires in
   # list/tuple/bitstring.)
   defp check_np_comma(mode, el, t, comma_i, diags, nid) when mode != :call do
-    if CST.category(el) == :no_parens do
+    # A no-parens call ending in a `do … end` block is unambiguous, so it's a valid element even
+    # when not last (`[a, for x <- xs, into: [] do … end]`); only a bare no-parens call is ambiguous.
+    if CST.category(el) == :no_parens and not has_do_block?(el) do
       {_id, diags, nid} =
         Diagnostics.emit(
           diags,
@@ -1605,12 +1999,58 @@ defmodule Toxic2.Parser do
     {diags, nid}
   end
 
-  defp parse_unary(t, i, prefix_bp, _ctx, diags, nid, fuel) do
+  # `..` / `...` in prefix (nud) position. `...` takes a low-precedence operand when one follows
+  # (`...a + b` => `...(a + b)`); otherwise — and always for `..` — it's nullary (`{:.., [], []}`).
+  @ellipsis_operand_bp 90
+  defp parse_dotdot(t, i, kind, ctx, diags, nid, fuel) do
     op_leaf = CST.token(i)
     operand_start = skip_eols(t, i + 1)
+    op_ctx = if ctx in [:no_parens, :no_parens_arg], do: ctx, else: :matched
+
+    if kind == :ellipsis_op and dotdot_operand?(t, operand_start) do
+      {operand, k, diags, nid, fuel} =
+        parse_expr(t, operand_start, @ellipsis_operand_bp, op_ctx, diags, nid, fuel - 1)
+
+      span = merge(cst_span(t, op_leaf), cst_span(t, operand))
+      {CST.node(:unary_op, span, [op_leaf, operand], :matched, nil), k, diags, nid, fuel}
+    else
+      {CST.node(:unary_op, tok_span(t, i), [op_leaf], :matched, nil), i + 1, diags, nid, fuel}
+    end
+  end
+
+  # Does an operand for a prefix `...` start at `i`? (`+`/`-` lead a unary operand here: `... + 1`.)
+  defp dotdot_operand?(t, i) do
+    case tk(t, i) do
+      # `+`/`-` lead a unary operand (`... + 1`); a following `..` is NOT an operand — it's a
+      # binary range whose left side is the nullary `...` (`... .. 1` => `(...) .. 1`).
+      :dual_op -> true
+      :ellipsis_op -> true
+      k -> np_first_kind?(k)
+    end
+  end
+
+  defp parse_unary(t, i, prefix_bp, ctx, diags, nid, fuel) do
+    op_leaf = CST.token(i)
+    operand_start = skip_eols(t, i + 1)
+    # In a no-parens context the operand may itself be a multi-arg no-parens call: `@foo 1, 2`,
+    # `-foo 1, 2`, `not bar :a, :b`. Inside brackets/parens it stays a single-arg `matched_expr`.
+    # Context is preserved (`:no_parens_arg` keeps a `do` attaching to the enclosing call).
+    op_ctx = if ctx in [:no_parens, :no_parens_arg], do: ctx, else: :matched
 
     {operand, k, diags, nid, fuel} =
-      parse_unary_operand(prefix_bp, t, operand_start, diags, nid, fuel)
+      parse_unary_operand(prefix_bp, t, operand_start, op_ctx, diags, nid, fuel)
+
+    # Elixir's `unary_op_eol expr` for an UNMATCHED operand (one ending in a `do … end` block): the
+    # unary becomes greedy and captures the whole trailing operator chain, so `not quote do x end ||
+    # b` is `not(quote(…) || b)` (not `(not quote(…)) || b`) and `@foo try do 1 end..1//2` is
+    # `@(foo(try) do 1 end .. 1 // 2)`. A MATCHED operand keeps the normal tight binding
+    # (`not a || b` => `(not a) || b`, `@x..1` => `(@x)..1`). The distinction is the do-block.
+    {operand, k, diags, nid, fuel} =
+      if has_do_block?(operand) do
+        led(t, k, operand, 0, op_ctx, diags, nid, fuel)
+      else
+        {operand, k, diags, nid, fuel}
+      end
 
     node =
       CST.node(
@@ -1624,20 +2064,32 @@ defmodule Toxic2.Parser do
     {node, k, diags, nid, fuel}
   end
 
-  # `@` (at_op, 320) binds TIGHTER than the dot/call/access postfixes (310), so they attach to the
-  # `@x` result — `@x.y` => `(@x).y`, `@x[i]` => `(@x)[i]`. But `@` still takes a NO-PARENS operand
-  # (`@moduledoc false`, `@spec f() :: t`, `@derive {A, B}`). So its operand is the `parse_expr`
-  # pipeline MINUS postfix and led: prefix, then a no-parens call, then a do-block. Lower unaries
-  # (`!`/`^`/`+`/`-`/`not`, 300) bind LOOSER than postfix — their operand is a full matched_expr
-  # (`!x.y` => `!(x.y)`).
-  defp parse_unary_operand(prefix_bp, t, i, diags, nid, fuel) when prefix_bp >= 310 do
+  # `@` (at_op, 320) binds TIGHTER than the dot/access postfixes (310), so they attach to the
+  # `@x` result — `@x.y` => `(@x).y`, `@x[i]` => `(@x)[i]`. But an ADJACENT paren call IS part of
+  # the operand (`@callback(spec)` => `@(callback(spec))`), and `@` still takes a NO-PARENS operand
+  # (`@moduledoc false`, `@spec f() :: t`). So its operand is prefix, then an adjacent paren call,
+  # then a no-parens call, then a do-block. Lower unaries (`!`/`^`/`+`/`-`/`not`, 300) bind LOOSER
+  # than postfix — their operand is a full matched_expr (`!x.y` => `!(x.y)`).
+  defp parse_unary_operand(prefix_bp, t, i, op_ctx, diags, nid, fuel) when prefix_bp >= 310 do
     {lhs, j, diags, nid, fuel} = parse_prefix(t, i, :matched, diags, nid, fuel)
-    {lhs, j, diags, nid, fuel} = maybe_no_parens(t, j, lhs, :matched, diags, nid, fuel)
-    maybe_do_block(t, j, lhs, :matched, diags, nid, fuel)
+    {lhs, j, diags, nid, fuel} = maybe_paren_call(t, j, lhs, diags, nid, fuel)
+    {lhs, j, diags, nid, fuel} = maybe_no_parens(t, j, lhs, op_ctx, diags, nid, fuel)
+    maybe_do_block(t, j, lhs, op_ctx, diags, nid, fuel)
   end
 
-  defp parse_unary_operand(prefix_bp, t, i, diags, nid, fuel),
-    do: parse_expr(t, i, prefix_bp, :matched, diags, nid, fuel - 1)
+  defp parse_unary_operand(prefix_bp, t, i, op_ctx, diags, nid, fuel),
+    do: parse_expr(t, i, prefix_bp, op_ctx, diags, nid, fuel - 1)
+
+  # One adjacent paren call (`callback(spec)`), used by the `@` operand — `@foo(x)` => `@(foo(x))`.
+  defp maybe_paren_call(t, i, lhs, diags, nid, fuel) do
+    if paren_call?(t, lhs, i, 0) do
+      {args, j, diags, nid, fuel} = parse_seq(t, i + 1, :")", :call, diags, nid, fuel)
+      span = merge_ct(t, lhs, j - 1)
+      {CST.node(:call, span, [lhs | args], :matched, nil), j, diags, nid, fuel}
+    else
+      {lhs, i, diags, nid, fuel}
+    end
+  end
 
   # A single parenthesised expression. Multi-statement parens `(a; b)` are deferred; here a `;`
   # before `)` is reported as a missing `)` and recovered by the expr-list loop.
@@ -1646,26 +2098,76 @@ defmodule Toxic2.Parser do
   # `(;)`), 1 => the statement (transparent, `(a)` => a), n => a block (`(a; b)` => block). Inner
   # statements are a `:no_parens` context (`(f a, b)` => `f(a, b)`), separated by `;` / newline.
   defp parse_paren(t, open, _ctx, diags, nid, fuel) do
-    {stmts, close, diags, nid, fuel} = paren_stmts(t, skip_eoe(t, open + 1), [], diags, nid, fuel)
+    # A paren holding a depth-0 `->` is a stab-clause list (`(a -> b)`, `(a, b -> c; d -> e)`) —
+    # used for anonymous-fn-style clauses and typespecs; otherwise it's a statement group.
+    if paren_stab?(t, open + 1, 0) do
+      {clauses, close, diags, nid, fuel} =
+        paren_clauses(t, skip_eoe(t, open + 1), [], diags, nid, fuel)
 
-    if Tokens.kind(t, close) == :")" do
-      span = merge(tok_span(t, open), tok_span(t, close))
-      {CST.node(:paren, span, stmts, :matched, nil), close + 1, diags, nid, fuel}
+      close_paren(t, open, close, clauses, diags, nid, fuel)
+    else
+      {stmts, close, diags, nid, fuel} =
+        paren_stmts(t, skip_eoe(t, open + 1), [], diags, nid, fuel)
+
+      close_paren(t, open, close, stmts, diags, nid, fuel)
+    end
+  end
+
+  defp close_paren(t, open, close, children, diags, nid, fuel) do
+    if tk(t, close) == :")" do
+      span = merge_tt(t, open, close)
+      {CST.node(:paren, span, children, :matched, nil), close + 1, diags, nid, fuel}
     else
       {id, diags, nid} =
         Diagnostics.emit(diags, nid, :parser, :error, :expected_rparen, tok_span(t, close))
 
       miss = CST.missing(:")", close, diag: id)
-      span = merge(tok_span(t, open), tok_span(t, close))
-      {CST.node(:paren, span, Enum.concat(stmts, [miss]), :matched, nil), close, diags, nid, fuel}
+      span = merge_tt(t, open, close)
+
+      {CST.node(:paren, span, Enum.concat(children, [miss]), :matched, nil), close, diags, nid,
+       fuel}
     end
+  end
+
+  # Does the paren body (starting at `i`) hold a depth-0 `->` before its matching `)`?
+  defp paren_stab?(t, i, depth), do: paren_stab?(t, i, depth, :eol)
+
+  defp paren_stab?(t, i, depth, prev) do
+    k = tk(t, i)
+
+    cond do
+      k == :eof -> false
+      # A reserved word as a dot member (`a.end`, `a.do`) is a name, not a block delimiter.
+      prev == :dot and k in [:end, :do, :fn, :block_label] -> paren_stab?(t, i + 1, depth, k)
+      depth == 0 and k == :stab_op -> true
+      depth == 0 and k == :")" -> false
+      true -> paren_stab?(t, i + 1, depth + depth_delta(k), k)
+    end
+  end
+
+  # Stab clauses inside parens, terminated by `)` (each clause body stops at `)` too).
+  defp paren_clauses(t, i, acc, diags, nid, fuel) do
+    i = skip_eoe(t, i)
+
+    cond do
+      fuel <= 0 -> {:lists.reverse(acc), i, diags, nid, fuel}
+      tk(t, i) == :")" -> {:lists.reverse(acc), i, diags, nid, fuel}
+      t_eof?(t, i) -> {:lists.reverse(acc), i, diags, nid, fuel}
+      true -> paren_clause(t, i, acc, diags, nid, fuel)
+    end
+  end
+
+  defp paren_clause(t, i, acc, diags, nid, fuel) do
+    {clause, j, diags, nid, fuel} = parse_clause(t, i, :")", diags, nid, fuel)
+    j = if j > i, do: j, else: i + 1
+    paren_clauses(t, j, [clause | acc], diags, nid, fuel)
   end
 
   defp paren_stmts(t, i, acc, diags, nid, fuel) do
     cond do
       fuel <= 0 -> {:lists.reverse(acc), i, diags, nid, fuel}
-      Tokens.kind(t, i) == :")" -> {:lists.reverse(acc), i, diags, nid, fuel}
-      Tokens.at_eof?(t, i) -> {:lists.reverse(acc), i, diags, nid, fuel}
+      tk(t, i) == :")" -> {:lists.reverse(acc), i, diags, nid, fuel}
+      t_eof?(t, i) -> {:lists.reverse(acc), i, diags, nid, fuel}
       true -> paren_stmt(t, i, acc, diags, nid, fuel)
     end
   end
@@ -1679,7 +2181,7 @@ defmodule Toxic2.Parser do
 
   # A paren statement ends at `;` / newline (separator) or `)`; anything else is leftover (error).
   defp paren_end_stmt(t, i, diags, nid) do
-    case Tokens.kind(t, i) do
+    case tk(t, i) do
       k when k in [:eol, :";"] ->
         {skip_eoe(t, i), diags, nid}
 
@@ -1701,7 +2203,7 @@ defmodule Toxic2.Parser do
   end
 
   defp skip_to_paren_eoe(t, i) do
-    case Tokens.kind(t, i) do
+    case tk(t, i) do
       k when k in [:eol, :";"] -> skip_eoe(t, i)
       k when k in [:")", :eof] -> i
       _ -> skip_to_paren_eoe(t, i + 1)
@@ -1709,13 +2211,13 @@ defmodule Toxic2.Parser do
   end
 
   defp parse_unexpected(t, i, diags, nid, fuel) do
-    if Tokens.at_eof?(t, i) do
+    if t_eof?(t, i) do
       {id, diags, nid} =
         Diagnostics.emit(diags, nid, :parser, :error, :expected_expression, eof_span(t))
 
       {CST.missing(:expression, i, diag: id), i, diags, nid, fuel}
     else
-      details = %{kind: Tokens.kind(t, i)}
+      details = %{kind: tk(t, i)}
 
       {id, diags, nid} =
         Diagnostics.emit(diags, nid, :parser, :error, :unexpected_token, tok_span(t, i), details)
@@ -1727,14 +2229,14 @@ defmodule Toxic2.Parser do
   # --- diagnostics for lexer error tokens (sole transport, P3) -----------
 
   defp emit_lex_error(t, i, diags, nid) do
-    %LexError{code: code} = Tokens.value(t, i)
+    %LexError{code: code} = tv(t, i)
     Diagnostics.emit(diags, nid, :lexer, :error, code, tok_span(t, i))
   end
 
   # --- cursor helpers ----------------------------------------------------
 
   defp skip_eoe(t, i) do
-    case Tokens.kind(t, i) do
+    case tk(t, i) do
       :eol -> skip_eoe(t, i + 1)
       :";" -> skip_eoe(t, i + 1)
       _ -> i
@@ -1742,7 +2244,7 @@ defmodule Toxic2.Parser do
   end
 
   defp skip_eols(t, i) do
-    case Tokens.kind(t, i) do
+    case tk(t, i) do
       :eol -> skip_eols(t, i + 1)
       _ -> i
     end
@@ -1773,6 +2275,46 @@ defmodule Toxic2.Parser do
   defp merge(nil, b), do: b
   defp merge(a, nil), do: a
   defp merge({sl, sc, _, _}, {_, _, el, ec}), do: {sl, sc, el, ec}
+
+  # Span from the start of token `i` to the end of token `j` in ONE tuple — reads the two token
+  # tuples directly (no alloc) instead of `merge(tok_span(i), tok_span(j))`, which built two
+  # throwaway `{sl,sc,el,ec}` spans (tprof: `Token.span/1` was ~5% of full-pipeline allocation).
+  defp merge_tt(t, i, j) do
+    ti = tt(t, i)
+    tj = tt(t, j)
+
+    if is_tuple(ti) and is_tuple(tj) do
+      {_, sl, sc, _, _, _} = ti
+      {_, _, _, el, ec, _} = tj
+      {sl, sc, el, ec}
+    else
+      # one side is past EOF (a recovered/truncated node) — fall back to the eof-aware spans.
+      merge(tok_span(t, i), tok_span(t, j))
+    end
+  end
+
+  # Span from CST `a`'s start to token `j`'s end, in one tuple. A node's start comes from its stored
+  # span (matched inline — no alloc); a token-leaf start delegates to `merge_tt`; else fall back.
+  defp merge_ct(t, {:node, _k, {sl, sc, _, _}, _ch, _f, _d}, j) do
+    case tt(t, j) do
+      {_, _, _, el, ec, _} -> {sl, sc, el, ec}
+      _ -> {sl, sc, sl, sc}
+    end
+  end
+
+  defp merge_ct(t, {:token, i, _f, _d}, j), do: merge_tt(t, i, j)
+  defp merge_ct(t, a, j), do: merge(cst_span(t, a), tok_span(t, j))
+
+  # Span from token `i`'s start to CST `b`'s end, in one tuple (mirror of `merge_ct`).
+  defp merge_tc(t, i, {:node, _k, {_, _, el, ec}, _ch, _f, _d}) do
+    case tt(t, i) do
+      {_, sl, sc, _, _, _} -> {sl, sc, el, ec}
+      _ -> {el, ec, el, ec}
+    end
+  end
+
+  defp merge_tc(t, i, {:token, j, _f, _d}), do: merge_tt(t, i, j)
+  defp merge_tc(t, i, b), do: merge(tok_span(t, i), cst_span(t, b))
 
   defp tok_span(t, i), do: Tokens.span(t, i) || eof_span(t)
 

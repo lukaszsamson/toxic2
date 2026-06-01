@@ -83,8 +83,14 @@ defmodule Toxic2.CST do
   Options: `:error` (bool — set when wrapping a lexer `:error` token), `:synthetic` (bool),
   `:contains_eol` (bool), `:diag` / `:diags`.
   """
+  # Hot path: the parser builds the vast majority of token leaves with NO options, so skip the
+  # `Keyword.get` flag/diag decoding entirely (it was the dominant `lists:keyfind` source) and build
+  # the plain leaf directly: no flags, no diagnostics.
+  @spec token(non_neg_integer()) :: token_t()
+  def token(index) when is_integer(index) and index >= 0, do: {:token, index, 0, []}
+
   @spec token(non_neg_integer(), keyword()) :: token_t()
-  def token(index, opts \\ []) when is_integer(index) and index >= 0 do
+  def token(index, opts) when is_integer(index) and index >= 0 do
     flags =
       0
       |> set_if(Keyword.get(opts, :error, false), @flag_has_error)

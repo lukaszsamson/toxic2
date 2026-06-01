@@ -101,6 +101,40 @@ defmodule Toxic2.Conformance.Corpus do
     {":\"a\#{x}b\"", [:quoted_atom]},
     {":\"\#{x}\"", [:quoted_atom]},
     {"foo(:\"bar\")", [:quoted_atom]},
+    # unicode identifiers/atoms (vendored Toxic2.String.Tokenizer: NFC + UTS-39 script checks)
+    {"café", [:unicode]},
+    {"café = 1", [:unicode]},
+    {"módulo()", [:unicode]},
+    {"αβγ", [:unicode]},
+    {"привет", [:unicode]},
+    {"naïve_x", [:unicode]},
+    {"_αβ", [:unicode]},
+    {"café?", [:unicode]},
+    {"café_αβ.foo", [:unicode]},
+    {"mod.café", [:unicode]},
+    {"µ", [:unicode]},
+    {":café", [:unicode]},
+    {":αβγ", [:unicode]},
+    {":Σ", [:unicode]},
+    {":café?", [:unicode]},
+    {"[café: 1]", [:unicode]},
+    {"%{αβ: 1}", [:unicode]},
+    {"def café(x), do: x", [:unicode]},
+    # `:::` is the atom `:"::"` (leading `:` taking `::` as its operator-name)
+    {":::", [:atom]},
+    {"[a: :::]", [:atom]},
+    # `\`-newline line continuation inside a heredoc (newline dropped; `\"""` still terminates)
+    {"\"\"\"\nfoo\\\n\"\"\"", [:heredoc]},
+    {"\"\"\"\nfoo\\\nbar\n\"\"\"", [:heredoc]},
+    {"\"\"\"\nfoo \#{x}\\\n\"\"\"", [:heredoc]},
+    # `\#{` in a raw (sigil) heredoc suppresses interpolation even AFTER a real `#{...}` — the
+    # backslash stays literal content (the `~s` macro unescapes later), not a `\` + interpolation.
+    {"~s\"\"\"\nreal \#{a} then \\\#{b} done\n\"\"\"", [:heredoc, :sigil]},
+    {"~S\"\"\"\nlit \\\#{b}\n\"\"\"", [:heredoc, :sigil]},
+    # a sigil name sitting at EOF with no delimiter is dropped wholesale (empty program)
+    {"~x", [:sigil]},
+    {"~X123", [:sigil]},
+    {"1\n~x", [:sigil]},
     # struct with a non-alias base (dynamic struct)
     {"%mod{a: 1}", [:struct]},
     {"%nil{}", [:struct]},
@@ -111,11 +145,113 @@ defmodule Toxic2.Conformance.Corpus do
     {"@foo[x]", [:operator]},
     {"@moduledoc false", [:operator]},
     {"@spec foo() :: t", [:operator]},
+    {"@callback(unquote(spec))", [:operator]},
+    {"@foo(x)", [:operator]},
     # no-parens calls with string / sigil / charlist arguments
     {"@doc \"x\"", [:no_parens]},
     {"IO.puts \"hello\"", [:no_parens]},
     {"raise \"msg\"", [:no_parens]},
     {"foo ~w(a b)", [:no_parens]},
+    # the rightmost operand of an operator may be a multi-arg no-parens call (no_parens_op_expr)
+    {"1 + foo 2, 3", [:no_parens]},
+    {"a |> foo 1, 2", [:no_parens]},
+    {"1 < foo 2, 3", [:no_parens]},
+    {"a = foo 1, 2", [:no_parens]},
+    {"1 + if x do :ok end", [:no_parens]},
+    # `when` uniquely takes a bare keyword list on the right
+    {"x when foo: 1", [:operator]},
+    {"x when foo: 1, bar: 2", [:operator]},
+    {"x when foo: bar 1, 2", [:operator]},
+    {"x when \"foo\": 1", [:operator]},
+    # a unary prefix's operand may be a multi-arg no-parens call
+    {"@foo 1, 2", [:operator]},
+    {"-foo 1, 2", [:operator]},
+    {"not bar :a, :b", [:operator]},
+    # a unary op whose operand ends in a `do … end` block becomes GREEDY (Elixir's `unary_op_eol
+    # expr` for an unmatched operand): it captures the whole trailing operator chain. A MATCHED
+    # operand keeps the tight binding (`not a || b` => `(not a) || b`). See [[toxic2-...]].
+    {"not quote do x end || b", [:operator, :do_block]},
+    {"not a || b", [:operator]},
+    {"@foo try do 1 end..1//2", [:operator, :do_block]},
+    {"@x..1//2", [:operator]},
+    {"+case 1 do 18.0 -> 49.0 end - foo", [:operator, :do_block]},
+    # a single leading `;` in a stab body is an empty (nil) first statement
+    {"fn -> ;t end", [:do_block]},
+    {"fn -> ; end", [:do_block]},
+    {"case z do _ -> ;y end", [:do_block]},
+    # a clause guard may be a multi-arg no-parens call / keyword list
+    {"case x do y when baz a, b -> :ok end", [:do_block]},
+    {"case x do y when baz x: 1, y: 2 -> :ok end", [:do_block]},
+    # a `do` block after a `when` guard attaches to the enclosing call, not the guard operand
+    {"def foo(x) when x > 0 do x end", [:do_block]},
+    {"def foo when bar do 1 end", [:do_block]},
+    # a clause head may span lines (pattern, then `when guard ->` on the next line)
+    {"case x do\n%{a: y}\nwhen y > 0 -> :ok\nend", [:do_block]},
+    {"cond do\n(z = f()) &&\ng in h -> :ok\nend", [:do_block]},
+    # `not in` guard whose RHS is an `@`-attribute, then a do-block (attaches to the def)
+    {"def f(h) when h not in @x do :ok end", [:do_block]},
+    # an atom name may contain `@` (`:nonode@nohost`)
+    {":nonode@nohost", [:atom]},
+    # a parenthesised boolean negation is wrapped in a `__block__`
+    {"(not x)", [:operator]},
+    {"(! x)", [:operator]},
+    {"&(not f(&1))", [:capture]},
+    # reserved words are valid remote-call member names
+    {"flags.true", [:operator]},
+    {"counters.nil", [:operator]},
+    {"a.when", [:operator]},
+    {"a.do", [:operator]},
+    {"a.else", [:operator]},
+    {"conn.when(x)", [:operator]},
+    # operators are valid remote-call member names
+    {"Kernel.+", [:operator]},
+    {"foo.++(1, 2)", [:operator]},
+    {"foo.<>", [:operator]},
+    # operator function references (`op/arity`), bare and captured
+    {"+/2", [:operator]},
+    {">=/2", [:operator]},
+    {"Enum.reduce(l, &+/2)", [:operator]},
+    {"max(e, &>=/2, f)", [:operator]},
+    # quoted keyword key as an access index
+    {"a[\"foo\": 1]", [:keyword]},
+    {"foo['asd': 1, b: 1]", [:keyword]},
+    # stab-clause lists combined with `|` (typespec function unions)
+    {"(-> 1) | (-> 2)", [:stab]},
+    {"(:am | :pm -> 1) | (:am, :pm -> 2)", [:stab]},
+    # a stab-head pattern may itself be a multi-arg no-parens call
+    {"fn x 1, 2, 3 -> foo() end", [:fn]},
+    # access takes one index with an optional trailing comma; `...`/operator struct bases
+    {"foo[1,]", [:access]},
+    {"foo[\n:bar]", [:access]},
+    {"foo.() do\n:ok\nend", [:do_block]},
+    # a `do` on the next line after a multi-line head (only for a call that already has args)
+    {"def f(x) when g\ndo\n:ok\nend", [:do_block]},
+    {"with {:ok, a} <- f()\ndo a end", [:do_block]},
+    # `\`-newline joins a no-parens callee with its arg (one logical line); `+`/`-` stay binary
+    {"@x \\\nFile.foo()", [:no_parens]},
+    {"foo \\\nbar", [:no_parens]},
+    {"foo \\\n+1", [:no_parens]},
+    # a multi-arg no-parens call ending in `do…end` is a valid container element (do disambiguates)
+    {"[for x <- a, y <- b do x end]", [:do_block]},
+    {"[z, for x <- xs, into: [] do x end]", [:do_block]},
+    # a keyword value / container element that is a `do … end` call may be non-last
+    {"f(a: case x do\ny -> z\nend, b: 1)", [:do_block]},
+    # a reserved word as a dot member inside a clause guard (`range.end`)
+    {"case z do\na when r.end -> x\n_ -> y\nend", [:do_block]},
+    # the `->` may sit on the line after the clause head
+    {"case h do\nn when is_number(n)\n-> b\n_ -> c\nend", [:do_block]},
+    {"%...foo{}", [:struct]},
+    {"%...foo{x}", [:struct]},
+    # `..` / `...` as nullary (`{:.., [], []}`) and `...` as a low-precedence unary prefix
+    {"..", [:operator]},
+    {"...", [:operator]},
+    {"...x", [:operator]},
+    {"...a + b", [:operator]},
+    {"..-a", [:operator]},
+    {"1 + ...", [:operator]},
+    {"%{...x}", [:operator]},
+    {"%Foo{...1}", [:operator]},
+    {"def foo() when ... do 1 end", [:operator]},
     # trailing keywords in bitstrings / dot-tuples
     {"<<foo, bar: baz>>", [:bitstring]},
     {"Foo.{A, foo: x}", [:dot_tuple]},
@@ -252,6 +388,21 @@ defmodule Toxic2.Conformance.Corpus do
     {"%{\"k\": 1}", [:keyword]},
     {"f(\"a\": 1)", [:keyword]},
     {"[\"f\#{x}\": 1]", [:keyword]},
+    # operator-named keyword keys (`<<>>:`, `+:`, `&:`, bracket ops, …)
+    {"[<<>>: 1]", [:keyword]},
+    {"[%{}: 1]", [:keyword]},
+    {"[{}: 1]", [:keyword]},
+    {"[%: 1]", [:keyword]},
+    {"[&: 1]", [:keyword]},
+    {"[..//: 1]", [:keyword]},
+    {"[.: 1]", [:keyword]},
+    {"[+: 1, ++: 2]", [:keyword]},
+    {"[&&&: 1]", [:keyword]},
+    {"[..: 1]", [:keyword]},
+    {"f(<<>>: 1, x: 2)", [:keyword]},
+    # `op:name` (no kw separator) is the operator applied to an `:atom`, not a keyword key
+    {"[&:foo]", [:keyword]},
+    {"[+:foo]", [:keyword]},
     {"f(a: 1)", [:keyword]},
     {"f(1, a: 2)", [:keyword]},
     {"f(x, y, a: 1, b: 2)", [:keyword]},
@@ -293,6 +444,9 @@ defmodule Toxic2.Conformance.Corpus do
     {"{1,}", [:trailing_comma]},
     {"<<1,>>", [:trailing_comma]},
     {"[1, 2,]", [:trailing_comma]},
+    # a paren call allows a trailing comma only after a keyword arg
+    {"foo(bar: 1,)", [:trailing_comma]},
+    {"foo(1, a: 2,)", [:trailing_comma]},
     {"%{a => 1, b: 2}", [:keyword]},
     {"[1, 2, a: 1, b: 2]", [:keyword]},
     {"a\n.b", [:dot]},
@@ -344,6 +498,24 @@ defmodule Toxic2.Conformance.Corpus do
     {"change fn cs, _ -> cs end", [:fn]},
     {"Enum.map x, fn i -> i end", [:fn]},
     {"fn x -> y = x\n y end", [:fn]},
+    # keyword args in a stab head (grouped into a trailing keyword list)
+    {"fn x, a: 1 -> y end", [:fn]},
+    {"fn a: 1 -> y end", [:fn]},
+    {"fn x, a: 1, b: 2 -> y end", [:fn]},
+    {"fn (a, b) -> a end", [:fn]},
+    # stab clauses inside parens (`(args -> body)`), incl. paren-wrapped arg lists + `when`
+    {"(x -> y)", [:stab]},
+    {"(a, b -> c)", [:stab]},
+    {"(a -> b; c -> d)", [:stab]},
+    {"(() -> c)", [:stab]},
+    {"((a, b, c) -> d)", [:stab]},
+    {"((x, a: 1) -> foo())", [:stab]},
+    {"((a: 1) -> foo())", [:stab]},
+    {"((x, a: 1) when g() -> y)", [:stab]},
+    {"(('a': 1) -> foo())", [:stab]},
+    {"fn (a) when foo: 1 -> x end", [:fn]},
+    {"fn (a, b, 'c': 1, d: 1) when g -> b end", [:fn]},
+    {"fn () when x when y: z -> 0 end", [:fn]},
     # do/end blocks (phase 9)
     {"if x do y end", [:do_block]},
     {"if x do y else z end", [:do_block]},
@@ -388,6 +560,14 @@ defmodule Toxic2.Conformance.Corpus do
 
   # Oracle rejects these; Toxic2 must not crash and must emit an :error diagnostic.
   @invalid [
+    # unicode-uppercase word is valid only as an atom name, not standalone; mixed scripts banned
+    {"Σ", [:unicode]},
+    {"Σ = 1", [:unicode]},
+    {"aαb", [:unicode]},
+    # `::` / `//` are never keyword keys; `op:name` (no separator) is an `:atom`, not a kw key
+    {"[::: 1]", [:keyword]},
+    {"[+:1]", [:keyword]},
+    {"[<<>>:foo]", [:keyword]},
     # over-chained / ineligible paren-call callees (the double-parens rule allows at most two)
     {"foo()()()", [:chained_call]},
     {"foo(1)(2)(3)", [:chained_call]},
@@ -410,6 +590,7 @@ defmodule Toxic2.Conformance.Corpus do
     {~S("a\n), [:string]},
     # keyword-last / trailing-comma / update / kw-in-tuple violations (oracle rejects)
     {"f(1,)", [:recovery]},
+    {"foo(1, 2,)", [:recovery]},
     {"f(a: 1, 2)", [:keyword]},
     {"f(1, a: 2, 3)", [:keyword]},
     {"[a: 1, 2]", [:keyword]},

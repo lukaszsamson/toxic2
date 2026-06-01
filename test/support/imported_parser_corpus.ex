@@ -15127,6 +15127,1364 @@ defmodule Toxic2.Conformance.ImportedParser do
       line: 22
     },
     %{
+      source: "fn x -> end",
+      tags: [:imported, :warnings, :warnings_ungrouped],
+      group: "warnings: ungrouped",
+      line: 44
+    },
+    %{
+      source: "Keyword.merge([], foo: 1,)",
+      tags: [:imported, :warnings, :warnings_ungrouped],
+      group: "warnings: ungrouped",
+      line: 36
+    },
+    %{
+      source: "quote do\n  IO.inspect arg, label: if true, do: \"foo\", else: \"baz\"\nend\n",
+      tags: [:imported, :warnings, :warnings_ungrouped],
+      group: "warnings: ungrouped",
+      line: 28
+    },
+    %{
+      source: "quote do\n  case do\n  end || raise 1, 2\nend\n",
+      tags: [:imported, :warnings, :warnings_ungrouped],
+      group: "warnings: ungrouped",
+      line: 19
+    },
+    %{
+      source:
+        "[5, 6, 7, 3]\n|> Enum.map_join \"\", &(Integer.to_string(&1))\n|> String.to_integer\n",
+      tags: [:imported, :warnings, :warnings_ungrouped],
+      group: "warnings: ungrouped",
+      line: 11
+    },
+    %{
+      source: "not left in right",
+      tags: [:imported, :warnings, :warnings_ungrouped],
+      group: "warnings: ungrouped",
+      line: 7
+    },
+    %{
+      source:
+        "foo.case true do qux ->\n?f\n:ok ->\n\n\n:foo\n:two -> qux\nelse\n; end\n; .. | nil",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 1704
+    },
+    %{
+      source:
+        "Mod.< bar :ok, 0x80; Foo.delta delta: :three, delta: 934, baz: 305 do\nfoo -> false\ndelta -> State\nelse\n; 55\nend",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 1691
+    },
+    %{
+      source:
+        "State.Bar.baz(bar: beta, alpha: foo, eggs: foo)(:bob, 93.96, delta: bar, baz: ?x) do\nelse\n; end\ndelta.beta ..\n.. // ...\n",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 1678
+    },
+    %{
+      source: "\nfoo.bar() do\n8 -> -734\nafter\n; end\n... .. :ok // nil",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 1665
+    },
+    %{
+      source: "... if baz do\n:ok\nend\nbar(Remote, :ok) do\n; end\n",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 1652
+    },
+    %{
+      source: "try gamma do; :foo\nbar\nend",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 1642
+    },
+    %{
+      source: "-707.(-610, eggs) do\n:baz -> 0b11\nrescue\nend",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 1634
+    },
+    %{
+      source: "Mod.delta(spam: 21.83, gamma: Schema.Config)() do\n; end\nbaz qux nil, 0",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 1624
+    },
+    %{
+      source:
+        "if true do\n:ok\nend ||| beta; try qux do\nbeta -> true\nrescue\n; after\ngamma\nend\n",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 1608
+    },
+    %{
+      source: "&nil\nfn ->\n41.2\n; end\n",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 1596
+    },
+    %{
+      source:
+        "Bar.foo(delta: true, bar: 0o1, qux: 0xA6)(gamma, false, qux: beta, eggs: :bob, delta: -48) do\n; after\ntrue\n34.0\nend\n@nil",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 1583
+    },
+    %{
+      source: "<<a, s: 0.'' >>",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 1575
+    },
+    %{
+      source: "foo[0.'']",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 1567
+    },
+    %{
+      source: "'''\nfoo\#{;nil}edtf|-s}\n'''",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 1559
+    },
+    %{
+      source: "%~a\"\"{}",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 1551
+    },
+    %{
+      source: "%~r//c{}",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 1545
+    },
+    %{
+      source: "def foo ;not+c do 1 end",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 1529
+    },
+    %{
+      source: "~s\"\"\"\nfoo\#{nil|s}\n\"\"\"",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 1521
+    },
+    %{
+      source: "~s\"\"\"\nfoo\#{nil}\n\"\"\"",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 1515
+    },
+    %{
+      source: "'''\nfoo\#{nil}\n'''",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 1509
+    },
+    %{
+      source: "\"\#{nil}\"",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 1497
+    },
+    %{
+      source: "'foo\#{nil}'",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 1491
+    },
+    %{
+      source: "[\"foo\#{nil}\": 1]",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 1485
+    },
+    %{
+      source: "%&0{}",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 1477
+    },
+    %{
+      source: "(b);()",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 1469
+    },
+    %{
+      source: "A.\"\".foo()",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 1461
+    },
+    %{
+      source: "A.''.{}",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 1453
+    },
+    %{
+      source: "A.\"\".{}",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 1447
+    },
+    %{
+      source: "%..{}",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 1439
+    },
+    %{
+      source: "%@0{}",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 1433
+    },
+    %{
+      source: "foo.''d",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 1425
+    },
+    %{
+      source: "%!0{}",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 1417
+    },
+    %{
+      source: "~s\"\"\"\nfoo\#{n;h}\n\"\"\"",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 1409
+    },
+    %{
+      source: "\"\#{0;d}\"",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 1401
+    },
+    %{
+      source: "'foo\#{0;d}'",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 1393
+    },
+    %{
+      source: "A.\"\"e.{}",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 1385
+    },
+    %{
+      source: "'''\nfoo\#{n;h}\n'''",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 1377
+    },
+    %{
+      source: "%!!h{}",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 1361
+    },
+    %{
+      source: "x..not//y",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 1345
+    },
+    %{
+      source: "fn x when @e&f -> 1 end",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 1337
+    },
+    %{
+      source: "fn x when @d^a<n -> 1 end",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 1331
+    },
+    %{
+      source: "fn x when n: d -> 1 end",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 1325
+    },
+    %{
+      source: "fn a, 0<-s -> :ok end",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 1317
+    },
+    %{
+      source: "foo .'' bar",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 1309
+    },
+    %{
+      source: ":\"foo\#{\"\"}\"",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 1301
+    },
+    %{
+      source: "0.'' do :ok end",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 1293
+    },
+    %{
+      source: "fn s: e -> :ok end",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 1285
+    },
+    %{
+      source: "foo.\"\"A",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 1277
+    },
+    %{
+      source: "A.et%?.{}",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 1247
+    },
+    %{
+      source: "%0{}",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 1241
+    },
+    %{
+      source: "fn a, r<-b -> :ok end",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 1233
+    },
+    %{
+      source: "fn \"as\#{1}d\": n -> :ok end",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 1225
+    },
+    %{
+      source: "fn \"asd\": n -> :ok end",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 1219
+    },
+    %{
+      source: "fn asd: n -> :ok end",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 1213
+    },
+    %{
+      source: "fn |: n -> :ok end",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 1207
+    },
+    %{
+      source: "fn 1 -> i.''l end",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 1199
+    },
+    %{
+      source: "(-n;)",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 1191
+    },
+    %{
+      source: "fn r.\"\"s -> :ok end",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 1183
+    },
+    %{
+      source: "fn @b^e -> :ok end",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 1175
+    },
+    %{
+      source: "%Foo{0}",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 1167
+    },
+    %{
+      source: "\"\"\"\nfoo\#{;}\n\"\"\"",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 1159
+    },
+    %{
+      source: "'foo\#{w;r}'",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 1153
+    },
+    %{
+      source: "~s/foo\#{;}/",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 1147
+    },
+    %{
+      source: "\"\#{a;c*t}\"",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 1141
+    },
+    %{
+      source: "\"\#{;}\"",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 1135
+    },
+    %{
+      source: "a 1, (l;)",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 1127
+    },
+    %{
+      source: "a(1, s: (+f) )",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 1121
+    },
+    %{
+      source: "<<a, \"s\#{a <> \"\"}\": d >>",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 1113
+    },
+    %{
+      source: "<<a, \"s\#{a}\": d >>",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 1107
+    },
+    %{
+      source: "<<a, 's': d >>",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 1101
+    },
+    %{
+      source: "<<a, s: d >>",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 1095
+    },
+    %{
+      source: "<< d, >>",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 1087
+    },
+    %{
+      source: "fn a, @d t -> 1 end",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 1079
+    },
+    %{
+      source: "fn a, @d^/d -> 1 end",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 1071
+    },
+    %{
+      source: "fn a, d: e -> 1 end",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 1063
+    },
+    %{
+      source: "fn a, d\\\\d -> 1 end",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 1055
+    },
+    %{
+      source: "-!d a do 1 end -!d",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 1047
+    },
+    %{
+      source: "not a do 1 end |r;",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 1039
+    },
+    %{
+      source: "h&A do 1 end",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 1031
+    },
+    %{
+      source: "dh^:e do 1 end",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 1023
+    },
+    %{
+      source: "d&c do 1 end",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 1015
+    },
+    %{
+      source: "a do; @l^h -> 1; end",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 1007
+    },
+    %{
+      source: "a do x -> ;c end",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 999
+    },
+    %{
+      source: "{(s=s;)}",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 991
+    },
+    %{
+      source: "a do (dir;) end",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 983
+    },
+    %{
+      source: "a do -> end",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 975
+    },
+    %{
+      source: "fn d->; end",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 967
+    },
+    %{
+      source: "fn ->;t end",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 958
+    },
+    %{
+      source: "%-e{}",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 949
+    },
+    %{
+      source: "(s;)",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 941
+    },
+    %{
+      source: "[not/eoe]",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 933
+    },
+    %{
+      source: "not/l",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 927
+    },
+    %{
+      source: "^?\n*a",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 919
+    },
+    %{
+      source: "l[\na]",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 911
+    },
+    %{
+      source: "0.'!'d",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 903
+    },
+    %{
+      source: "0.\"\"R",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 897
+    },
+    %{
+      source:
+        "alpha baz: 0x35 do; Config\n?a\nend ..\n& baz(95.84)(:three) do 2 -> :bar\nspam -> 640\nend\n\n",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 883
+    },
+    %{
+      source:
+        "gamma.if baz do false\nrescue\nspam -> -679\n:ok -> ?q\nafter\nbaz\n0b111\nend\nnot gamma .. baz // (;) <|> qux +foo\n",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 867
+    },
+    %{
+      source:
+        "& baz eggs do Context.Qux.Baz\nbeta\nrescue\n:error -> spam\n1 -> Baz.Foo.Bar\nafter\ngamma\nState\nend\neggs &&\n@ ( beta -> bar) <|> qux spam: Mod.Remote.Bar, eggs: eggs\n\n",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 848
+    },
+    %{
+      source:
+        "; Mod.baz spam: 0o11 do\n:two\n:foo\nrescue\nbeta -> Qux\nend\nnil.~>> eggs: false, qux: spam do Remote\nContext\nrescue\nalpha -> alpha\nafter\nSchema\nend\n\n",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 827
+    },
+    %{
+      source: "& delta()() do\n  baz\nend\n",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 817
+    },
+    %{
+      source: "@ & if delta do\n:ok\nend <- foo\n",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 807
+    },
+    %{
+      source: "+ & if delta do\n:ok\nend <- foo\n",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 799
+    },
+    %{
+      source: "& & if delta do\n:ok\nend <- foo\n",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 791
+    },
+    %{
+      source: "... & if delta do\n:ok\nend <- foo\n",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 783
+    },
+    %{
+      source:
+        "... gamma.if true do\n  baz\nend \\\\ receive true do; gamma\nRemote.Config.Qux\nend\n",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 771
+    },
+    %{
+      source: "@ & if true do\n:ok\nend when if false do\nqux\nend\n",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 759
+    },
+    %{
+      source: "... 481.(true, State) do bar\n:bob\nend\n",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 749
+    },
+    %{
+      source: "foo gamma do Foo.Baz\nbeta\nend\n",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 739
+    },
+    %{
+      source:
+        "@ foo spam: gamma do Foo.Baz\nbeta\nend <~> :one.- gamma ~> bar bar: :bar, gamma: Foo\n",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 729
+    },
+    %{
+      source:
+        "\n... alpha()(delta) do; end\n@ Foo.eggs(false, gamma) do\nbaz\ndelta\nelse\n:alice\n859\nend\n\n",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 712
+    },
+    %{
+      source: "& bar !== Baz.Foo.Context.(0xC7) do\nbar\nend\n",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 702
+    },
+    %{
+      source:
+        "~~~ spam()()\n-spam()()\nnot spam()()\n!spam()()\n&spam()()\n@spam()()\n1..2//spam()()\n",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 688
+    },
+    %{
+      source: "@@bar.(0x0)",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 680
+    },
+    %{
+      source: "@@foo -- 999",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 672
+    },
+    %{
+      source: "@@delta[?a]",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 664
+    },
+    %{
+      source:
+        "nil .. nil\nbar\n(; foo -> 203; 8 -> State.Context); &baz\n; nil !== nil\n@\nConfig.State.gamma\n",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 651
+    },
+    %{
+      source:
+        ".. || @ Bar.Schema + 198\n( alpha -> Default; qux -> qux)\n-16.(fn eggs -> delta - beta end)\n![ ... .. (;) // eggs, beta < [beta, eggs], (; :bar -> 2.78) \\ foo]",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 640
+    },
+    %{
+      source:
+        ".. || @ Bar.Schema + 198\n( alpha -> Default; qux -> qux)\n-16.(fn eggs -> delta - beta end)\n![ ... .. (;) // eggs, beta < [beta, eggs], (; :bar -> 2.78) \\\\ foo]",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 629
+    },
+    %{
+      source:
+        "( delta -> spam; baz -> false)\n- baz <<~ Mod.Remote.State.eggs 195\n@@foo[?l] when qux ^^^ 71.28\n; ...qux(beta, bar, beta) ~>\n( :bob -> Config)\n; gamma(baz) ~> ...spam\n?\\\\.(@\ngamma, true != beta, delta[Mod])\n!\n@Context; @ ... ||| (; foo -> 0x0)",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 612
+    },
+    %{
+      source:
+        "... &4 .. for // ...\ndelta <|> bar -604\nnot spam .. (;) //\n...\n~~~\n( bar -> Context.Config.Schema; 4 -> spam) ~>> ()\nspam 0b101 != @ Bar.Default.Remote; fn eggs, beta, baz -> gamma | .. end\n~~~&8\n{{478}, (;) ..\n(; foo -> nil; 4 -> bar) // baz}\n{} <<~\nspam.foo beta: Mod.Context --- (;)\n... ... Default.Bar.State\n842 .. @fn foo -> :bob end // !\nState\n- (:two)\nqux fn -> true end <~> spam ?a",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 588
+    },
+    %{
+      source:
+        "cond .. bar // spam <-\n... +++ ( delta -> Default.Schema.State; qux -> 254)\nbaz Baz.Config\n...bar.spam; @ bar alpha: delta; [baz[60], (; :error -> :ok; foo -> ?r) <= .., @@:ok[true]]; ^\nspam\n@fn bar, beta, alpha, qux -> :bob end <= &3\n; @ -799 <|> false.when :bar\nfn -> State end == false when State.Context.Default.bar; eggs \\ @ ( alpha -> Baz; delta -> Bar)\n; ... <> fn spam, qux when gamma and true -> Remote.Foo end",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 572
+    },
+    %{
+      source: "@Foo.Bar\n",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 564
+    },
+    %{
+      source:
+        "\n[@\neggs, @\neggs[:error], @\n@bar[89.35]]\n&{alpha, foo, false}; (; :one -> Default)\n@foo[foo] <~ delta beta: 0o50 |> foo.delta gamma\n<~> -[0o36, 729, Foo]\n",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 548
+    },
+    %{
+      source: "...@@spam[Context]\n",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 540
+    },
+    %{
+      source: "&bar >= unless delta do\ntrue\nend\n<>\n1 <- 2\n",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 528
+    },
+    %{
+      source: "&bar >= unless delta do\ntrue\nend\n+\n1 <- ...1\n",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 518
+    },
+    %{
+      source: "&bar >= foo()\n<>\n1 <- ...1\n",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 510
+    },
+    %{
+      source:
+        "Config && ..\n; ..\ncase Schema do\nbar -> spam\ngamma -> eggs\n:foo -> Mod\nend\n-248; 74.0\n...Qux\n&bar >= unless delta do\ntrue\nbaz\nelse\n-763\nend\n..\n-343 - 0b11.(beta, ?n) <- ...&1\n",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 486
+    },
+    %{
+      source:
+        "not foo :baz\n..\nif false do\n?v\n0xD9\nelse\nbeta\nend; & bar true\n(Mod)\n; if true do\n90.32\nRemote\nelse\nFoo\nend\n",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 464
+    },
+    %{
+      source:
+        "not ... - unless true do\nfalse\nend\nState !== 180 === case Config do\neggs -> nil\n:error -> alpha\n:foo -> 46.34\nend\nif true do\ndelta\ndelta\nend\n0\n",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 444
+    },
+    %{
+      source: "1..2//delta 27.51 + if false do\n148\nend; :alice\n",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 434
+    },
+    %{
+      source: "-delta 27.51 + if false do\n148\nend; :alice\n",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 426
+    },
+    %{
+      source: "& delta 27.51 + if false do\n148\nend; :alice\n",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 418
+    },
+    %{
+      source: "^ delta 27.51 + if false do\n148\nend\n:alice\n",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 409
+    },
+    %{
+      source: "@ delta 27.51 + if false do\n148\nend; :alice\n",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 401
+    },
+    %{
+      source: "not delta 27.51 + if false do\n148\nend; :alice\n",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 393
+    },
+    %{
+      source: "-not delta 27.51 + if false do\n148\nend; !:alice\n",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 383
+    },
+    %{
+      source: "&(%{\"three\": beta |> 0} + 1) ++ State.\"foo\"(bar)",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 378
+    },
+    %{
+      source: "&(not \"foo\#{-3}bar\" <> \"foo\#{eggs}bar\" + 1)",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 373
+    },
+    %{
+      source:
+        "not gamma |> :foo > [\"alice\": alpha] |> case &1 do\n  ^delta -> ?v\n  _ -> delta\nend",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 366
+    },
+    %{
+      source: "fn gamma -> Context end &&& &(gamma + 1) |> %Baz{metadata: :'alice'} |> Config",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 361
+    },
+    %{
+      source: "+with ?p <- :three do\n  beta\nelse\n  _ -> foo\nend..Schema//2",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 356
+    },
+    %{
+      source: "Context.foo(%{\"v\" => &(?h + 1) !== \"Tsyh\"})",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 351
+    },
+    %{
+      source:
+        "+case {delta, -4} do\n  foo -> gamma\n  _ -> :error\nend |> :alice ** foo >>> %Default{\"bar\": alpha}",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 344
+    },
+    %{
+      source:
+        "&('foo\#{Context |> 22.0}bar' + 1) in fn -> with ^spam <- bar do\n  Bar\nelse\n  _ -> gamma\nend end |> quote do\n  20.0\nend",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 337
+    },
+    %{
+      source: "'foo\#{&(0 |> Foo + 1) |> %{label: [Config, ?o, Qux]}}bar'",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 332
+    },
+    %{
+      source:
+        "case not \"foo\#{:do}bar\" <> \"foo\#{State}bar\" do\n  {alpha, ^alpha} -> \"\"\"\nfoo \#{baz} bar\n\"\"\"\n  _ -> foo()\nend |> \"\"\"\nfoo \#{foo + Foo |> +delta} bar\n\"\"\"",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 325
+    },
+    %{
+      source: "0 |> not \"\"\"\nfoo \#{foo} bar\n\"\"\" + \"\"\"\nfoo \#{{foo, foo}} bar\n\"\"\"",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 320
+    },
+    %{
+      source: "not foo |> foo |> foo < '''\nfoo \#{0.0 |> foo} bar\n'''",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 315
+    },
+    %{
+      source: "not ~s'\#{?a}' |> %{\"k\" => 5} < @qux 0",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 310
+    },
+    %{
+      source: "~s\"\"\"\nfoo \#{&(&(0 + 1) + 1)} bar\n\"\"\"",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 305
+    },
+    %{
+      source: "foo('M' |> %{\"ok\": :err})",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 300
+    },
+    %{
+      source: "Foo.foo('M' |> %Baz{\"ok\": \"\"\"\nfoo \#{alpha} bar\n\"\"\"})",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 295
+    },
+    %{
+      source: "&(&(%Qux{label: ['alice': foo]} + 1) + 1)",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 290
+    },
+    %{
+      source: "not \"\" <> \"\"",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 285
+    },
+    %{
+      source: "not a <> b",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 282
+    },
+    %{
+      source:
+        "{:ok, <<+quote do\n  spam\nend, with ^eggs <- :bob do\n  ?p\nelse\n  _ -> 0\nend>>}",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 277
+    },
+    %{
+      source: "&(['one': :ok] + 1) |> Foo.foo()",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 272
+    },
+    %{
+      source: "case \"\" <> \"foobar\"..['dos': \"\"\"\nfoo  bar\n\"\"\"] do\n  :ok\nend",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 267
+    },
+    %{
+      source:
+        "case \"\" <> \"foo\#{9.0}bar\"..['do': \"\"\"\nfoo \#{spam} bar\n\"\"\"] do\n  <<:\"bar\">> -> ~S/\#{spam}/i\n  _ -> <<?a..foo>>\nend",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 260
+    },
+    %{
+      source: "\"foo\#{[{:alice, :alice}]}bar\" + not %{'ok': -1} |> quote do: :ok",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 255
+    },
+    %{
+      source: "&('''\nfoo \#{%{'ok': alpha}} bar\n''' + 1)..0.0",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 250
+    },
+    %{
+      source: "<<:'ok' + %{\"A\" => delta}>> |> not 0 |> [\"bar\": Foo] + ['bob': foo] + :ok",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 245
+    },
+    %{
+      source:
+        "fn ['end': baz], ^qux -> &({-5, foo} + 1) in Remote.\"three\"(\"foo\#{foo}bar\", not spam) end",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 238
+    },
+    %{
+      source: "1..(&not/2)//0",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 233
+    },
+    %{
+      source: "^b |> a",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 228
+    },
+    %{
+      source: "-b |> a",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 225
+    },
+    %{
+      source: "+b |> a",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 222
+    },
+    %{
+      source: "!b |> a",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 219
+    },
+    %{
+      source: "not b |> a",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 216
+    },
+    %{
+      source: "not a..2 ++ gamma",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 211
+    },
+    %{
+      source: "not a..2//3 - gamma",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 208
+    },
+    %{
+      source: "not [?r]..29.0 ++ gamma |> [%Foo{label: eggs}, [\"end\": Bar]]",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 203
+    },
+    %{
+      source: "@foo try do\n  1\nend..1//2",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 198
+    },
+    %{
+      source: "@foo try do\n  1\nrescue\n_ -> 0\nend..1",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 193
+    },
+    %{
+      source: "@delta case Config.alpha(qux, beta) do\n  Context -> ?u\n  _ -> 3\nend..Foo",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 188
+    },
+    %{
+      source:
+        "case State.\"two\"(quote do\n  %Mod{'alice': :baz}\nend) do\n  ['three': :\"ok\"] -> %{\"end\": ?z} |> delta\n  _ -> %Foo{'error': %Foo{label: baz}}\nend",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 181
+    },
+    %{
+      source: "not quote do\n baz\nend || a",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 176
+    },
+    %{
+      source: "not quote do\n baz\nend and a",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 173
+    },
+    %{
+      source: "not quote do\n baz\nend &&& a",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 170
+    },
+    %{
+      source: "not quote do\n baz\nend && a",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 167
+    },
+    %{
+      source: "not quote do\n baz\nend = a",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 164
+    },
+    %{
+      source: "not quote do\n baz\nend or a",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 161
+    },
+    %{
+      source: "not quote do\n baz\nend == a",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 158
+    },
+    %{
+      source: "!quote do\n baz\nend != a",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 155
+    },
+    %{
+      source: "+quote do\n baz\nend === a",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 152
+    },
+    %{
+      source: "-quote do\n baz\nend ||| a",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 149
+    },
+    %{
+      source:
+        "case <<[\"two\": case beta do\n  38.0 -> qux\n  _ -> ?d\nend]>> do\n  [\"three\": ?m] -> Bar.eggs()\n  _ -> 0.0\nend",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 142
+    },
+    %{
+      source: "@baz with Foo <- Context, do: ?x + &(@eggs %{label: alpha} + 1)",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 137
+    },
+    %{
+      source: "'foo\#{@beta with Config <- :bar, do: :foo + [Baz]}bar'",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 132
+    },
+    %{
+      source:
+        "quote do: case \"foo\#{gamma}bar\" <> \"foo\#{14.0}bar\"..\"\" <> \"foo\#{eggs}bar\" do\n  ?t -> [opts: gamma]\n  _ -> %Baz{\"ok\": Bar}\nend",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 125
+    },
+    %{
+      source: "Foo.foo(\"foo\#{\"foo\#{[\"alice\": 0]}bar\"}bar\")",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 120
+    },
+    %{
+      source: "{11.0, [eggs, ?g, Qux] |> {:ok, 0}}..\"\" <> \"foo\#{['baz': :one]}bar\"",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 115
+    },
+    %{
+      source:
+        "{{[qux, :error, beta] - ?l..gamma, %Remote{'alice': \"foo\#{qux}bar\" <> \"\"}}, {%{\"N\" => 41.0 >>> ?m}, [Default |> ?k, ?i ** qux]}, \"foo\#{[\"two\": spam]}bar\"}",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 108
+    },
+    %{
+      source:
+        "%{\"z9H\" => not 'foo\#{beta}bar'} |> \"foo\#{spam |> Context}bar\"..%Qux{\"one\": :one}..\"\" <> \"\"//1",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 101
+    },
+    %{
+      source: "with [label: [\"baz\": ^bar]] <- @type baz :: any()..qux..22.0//1, do: \"\"",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 96
+    },
+    %{
+      source: "['foo\#{%Foo{\"end\": 47.0}}bar' or foo |> baz..:error..gamma//2]",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 91
+    },
+    %{
+      source:
+        "[@foobar foo() :: term(), with gamma <- beta do\n  Bar\nelse\n  _ -> 0\nend |> {-7, qux} + ~s\"\"\"\nfoo \#{0.0} bar\n\"\"\"]",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 84
+    },
+    %{
+      source:
+        "[@spec foo() :: term(), with gamma <- beta do\n  Bar\nelse\n  _ -> 0\nend |> {-7, qux} + ~s\"\"\"\nfoo \#{0.0} bar\n\"\"\"]",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 77
+    },
+    %{
+      source: "not try do\n :ok\nend <= 1",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 72
+    },
+    %{
+      source: "+case 1 do\n  18.0 -> 49.0\nend - foo",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 67
+    },
+    %{
+      source: "-case 1 do\n  18.0 -> 49.0\nend * foo",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 64
+    },
+    %{
+      source: "not case 1 do\n  18.0 -> 49.0\nend * foo",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 61
+    },
+    %{
+      source: "!case 1 do\n  18.0 -> 49.0\nend * foo",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 58
+    },
+    %{
+      source: "0 + 'A'..\"foo\#{foo}bar\" <> \"\"..%{label: &3}//0",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 53
+    },
+    %{
+      source: "foo..foo..fn -> :ok end//0",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 48
+    },
+    %{
+      source: "foo() + 'W'..foo..0//0",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 43
+    },
+    %{
+      source: "{foo, Foo.foo()}..\"\" <> \"foo\#{%{\"K\" => Mod}}bar\"",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 38
+    },
+    %{
+      source: "Foo.foo() |> {foo..:ok..['two': :ok]//0, [['baz': spam]]}",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 33
+    },
+    %{
+      source: "@foo Foo.\"a\"(try do\n :ok\nend)",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 28
+    },
+    %{
+      source: "@foo Foo.a(try do\n :ok\nend)",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 25
+    },
+    %{
+      source: "@foo Foo.\"a\"(with ^delta <- beta do\n  ?y\nelse\n  _ -> 0.0\nend)",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 20
+    },
+    %{
+      source: "&foo/1..0..case Foo.eggs() do\n  foo -> qux\n  _ -> ?a\nend//0",
+      tags: [:imported, :shrunk_repros, :shrunk_repros_ungrouped],
+      group: "shrunk_repros: ungrouped",
+      line: 15
+    },
+    %{
       source: "a ++ b +++ c",
       tags: [:imported, :systematic, :systematic_systematic_operators],
       group: "systematic: systematic operators",
@@ -26216,12 +27574,6 @@ defmodule Toxic2.Conformance.ImportedParser do
     },
     %{
       source: "not a .. b",
-      tags: [:imported, :systematic, :systematic_systematic_operators],
-      group: "systematic: systematic operators",
-      line: 0
-    },
-    %{
-      source: "not a <> b",
       tags: [:imported, :systematic, :systematic_systematic_operators],
       group: "systematic: systematic operators",
       line: 0

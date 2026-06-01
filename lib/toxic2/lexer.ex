@@ -15,9 +15,10 @@ defmodule Toxic2.Lexer do
   interpolation, trailing modifiers on `:sigil_end`), and **heredocs** `\"""`/`'''` (`read_heredoc`,
   line-spanning with lexical indentation stripping), including sigil heredocs. Also: quoted atoms
   (`:"..."` via a `:quoted_atom` marker), quoted keyword keys (`"foo":` via a `:kw_quote` marker),
-  operator-named atoms (`:<<>>`, `:%{}`, `:..//`), and `\`-newline line continuation in code.
-  Not yet lexed: **unicode identifiers/atoms** (needs Unicode XID + NFC) and **operator-named
-  keyword keys** (`<<>>: 1`).
+  operator-named atoms (`:<<>>`, `:%{}`, `:..//`), operator-named keyword keys (`<<>>: 1`,
+  `+: 1`, `%{}: 1` — an operator/bracket name before a separator colon), `@`-bearing atom names
+  (`:nonode@nohost`), and `\`-newline line continuation in code. **Unicode identifiers/atoms**
+  (`café`, `:αβγ`) are lexed via the vendored `Toxic2.String.Tokenizer` (NFC + UTS-39 checks).
 
   Architecture invariants this locks in:
 
@@ -41,6 +42,11 @@ defmodule Toxic2.Lexer do
   """
 
   alias Toxic2.LexError
+
+  # Narrow inlining of tiny, hot, LOCAL helpers (cross-module calls are unaffected). Recursive
+  # scanners (`lex/6`, `word_len/2`, `read_name/1`, `consume_eols/4`, `plain_run_len/4`) are
+  # deliberately excluded — inlining them risks code growth / worse i-cache. A/B-measured.
+  @compile {:inline, rest_at: 2, kw_suffix: 1, kw_colon?: 1, reserved_token: 4}
 
   @type token :: Toxic2.Token.t()
   @type warning :: term()
@@ -272,8 +278,13 @@ defmodule Toxic2.Lexer do
   end
 
   # --- type operator :: (before the atom `:` clause) ---------------------
-  defp lex(<<"::", rest::binary>>, line, col, acc, w, st),
-    do: cont(rest, {:type_op, line, col, line, col + 2, :"::"}, acc, w, st)
+  # `:::` is NOT `::` + `:`; it's the atom `:"::"` (a leading `:` taking `::` as its operator
+  # name), so the `::` operator must yield when a third `:` follows — the atom clause handles it.
+  defp lex(<<?:, ?:, next, _::binary>> = bin, line, col, acc, w, st) when next != ?:,
+    do: cont(rest_at(bin, 2), {:type_op, line, col, line, col + 2, :"::"}, acc, w, st)
+
+  defp lex(<<?:, ?:>>, line, col, acc, w, st),
+    do: cont(<<>>, {:type_op, line, col, line, col + 2, :"::"}, acc, w, st)
 
   # --- quoted atoms `:"..."` / `:'...'` (a `:quoted_atom` marker + the quoted literal's tokens) --
   defp lex(<<?:, ?", rest::binary>>, line, col, acc, w, st) do
@@ -289,19 +300,31 @@ defmodule Toxic2.Lexer do
   end
 
   # --- atoms: :name and :<operator> -------------------------------------
+  # Unlike identifiers, an atom name may contain `@` (`:nonode@nohost`, `:foo@`).
   defp lex(<<?:, c, _::binary>> = bin, line, col, acc, w, st)
        when is_lower_start(c) or is_upper_start(c) do
-    {wlen, _name, _rest} = read_name(rest_at(bin, 1))
-    total = 1 + wlen
+    {wlen, after_name} = read_atom_name(rest_at(bin, 1))
 
-    cont(
-      rest_at(bin, total),
-      {:atom, line, col, line, col + total, binary_part(bin, 1, wlen)},
-      acc,
-      w,
-      st
-    )
+    case after_name do
+      <<cp::utf8, _::binary>> when cp > 127 ->
+        lex_unicode_atom(rest_at(bin, 1), line, col, acc, w, st)
+
+      _ ->
+        total = 1 + wlen
+
+        cont(
+          rest_at(bin, total),
+          {:atom, line, col, line, col + total, binary_part(bin, 1, wlen)},
+          acc,
+          w,
+          st
+        )
+    end
   end
+
+  # unicode-started atom name (`:café`, `:αβγ`, `:Σ` — incl. unicode-uppercase, valid as an atom)
+  defp lex(<<?:, cp::utf8, _::binary>> = bin, line, col, acc, w, st) when cp > 127,
+    do: lex_unicode_atom(rest_at(bin, 1), line, col, acc, w, st)
 
   defp lex(<<?:, rest::binary>> = bin, line, col, acc, w, st) do
     case op_atom_len(rest) do
@@ -331,12 +354,22 @@ defmodule Toxic2.Lexer do
   end
 
   # --- percent (parser combines with `{`/alias for maps/structs) ---------
-  defp lex(<<?%, rest::binary>>, line, col, acc, w, st),
-    do: cont(rest, {:percent, line, col, line, col + 1, nil}, acc, w, st)
+  # `%{}:`/`%:` followed by a kw separator are operator keyword keys (handled via op_kw_len).
+  defp lex(<<?%, _::binary>> = bin, line, col, acc, w, st) do
+    case op_kw_len(bin) do
+      nil -> cont(rest_at(bin, 1), {:percent, line, col, line, col + 1, nil}, acc, w, st)
+      len -> emit_op_kw(bin, len, line, col, acc, w, st)
+    end
+  end
 
   # --- `{` opens a brace frame (so the matching `}` isn't mistaken for an interp close) ---
-  defp lex(<<?{, rest::binary>>, line, col, acc, w, st),
-    do: cont(rest, {:"{", line, col, line, col + 1, nil}, acc, w, [:brace | st])
+  # `{}:` followed by a kw separator is an operator keyword key.
+  defp lex(<<?{, _::binary>> = bin, line, col, acc, w, st) do
+    case op_kw_len(bin) do
+      nil -> cont(rest_at(bin, 1), {:"{", line, col, line, col + 1, nil}, acc, w, [:brace | st])
+      len -> emit_op_kw(bin, len, line, col, acc, w, st)
+    end
+  end
 
   # --- `}` ends an interpolation (resume the string) OR closes a brace ---
   defp lex(<<?}, rest::binary>>, line, col, acc, w, [{:interp, resume} | st]) do
@@ -355,49 +388,208 @@ defmodule Toxic2.Lexer do
     do: cont(rest, {delim_kind(c), line, col, line, col + 1, nil}, acc, w, st)
 
   # --- identifiers (lowercase/_) : kw key, reserved op, literal, or name --
+  # If the ascii run flows into a `>127` byte the word is unicode — hand the WHOLE word to the
+  # vendored tokenizer (NFC + UTS-39 script checks), so e.g. `café`/`módulo` stay single tokens.
   defp lex(<<c, _::binary>> = bin, line, col, acc, w, st) when is_lower_start(c) do
     {len, name, after_name} = read_name(bin)
 
-    case kw_suffix(after_name) do
-      {:kw, rest} ->
-        cont(rest, {:kw_identifier, line, col, line, col + len + 1, name}, acc, w, st)
+    case after_name do
+      <<cp::utf8, _::binary>> when cp > 127 ->
+        lex_unicode(bin, line, col, acc, w, st)
 
-      :no ->
-        cont(rest_at(bin, len), lower_token(name, line, col, len), acc, w, st)
+      _ ->
+        case kw_suffix(after_name) do
+          {:kw, rest} ->
+            cont(rest, {:kw_identifier, line, col, line, col + len + 1, name}, acc, w, st)
+
+          :no ->
+            cont(after_name, lower_token(name, line, col, len), acc, w, st)
+        end
     end
   end
 
   # --- aliases (Uppercase): kw key or alias ------------------------------
   defp lex(<<c, _::binary>> = bin, line, col, acc, w, st) when is_upper_start(c) do
-    {len, _} = word_len(bin, 0)
+    {len, after_name} = word_len(bin, 0)
     name = binary_part(bin, 0, len)
 
-    case kw_suffix(rest_at(bin, len)) do
-      {:kw, rest} ->
-        cont(rest, {:kw_identifier, line, col, line, col + len + 1, name}, acc, w, st)
+    case after_name do
+      <<cp::utf8, _::binary>> when cp > 127 ->
+        lex_unicode(bin, line, col, acc, w, st)
 
-      :no ->
-        cont(rest_at(bin, len), {:alias, line, col, line, col + len, name}, acc, w, st)
+      _ ->
+        case kw_suffix(after_name) do
+          {:kw, rest} ->
+            cont(rest, {:kw_identifier, line, col, line, col + len + 1, name}, acc, w, st)
+
+          :no ->
+            cont(after_name, {:alias, line, col, line, col + len, name}, acc, w, st)
+        end
     end
   end
 
+  # --- unicode-started identifiers (`αβγ`, `привет`) --------------------
+  defp lex(<<cp::utf8, _::binary>> = bin, line, col, acc, w, st) when cp > 127,
+    do: lex_unicode(bin, line, col, acc, w, st)
+
   # --- operators (longest match) + tolerant UTF-8/byte error fallback ----
+  # Match the operator ONCE, then decide operator-token vs operator keyword-key from that single
+  # result (the old path matched the table twice: once via `op_kw_len`/`op_atom_len`, again here).
   defp lex(bin, line, col, acc, w, st) do
+    case match_op(bin) do
+      {kind, value, len} -> emit_operator_or_kw(bin, kind, value, len, line, col, acc, w, st)
+      nil -> lex_op_error(bin, line, col, acc, w, st)
+    end
+  end
+
+  defp emit_operator_or_kw(bin, kind, value, len, line, col, acc, w, st) do
+    cond do
+      # `<<>>:` / `..//:` — atom-shaped operator keys whose full length the table's longest match
+      # (`<<` / `..`) would shadow; `%{}`/`{}`/`%`/`::` are handled by earlier `lex/6` clauses.
+      sp = atom_op_kw_len(bin) ->
+        emit_op_kw(bin, sp, line, col, acc, w, st)
+
+      # a table operator directly followed by a keyword colon is an operator keyword key (`+: 1`),
+      # EXCEPT `//` (the ternary step op) which is never an atom/keyword (`a // b: c` is `a // (b: c)`).
+      kind != :ternary_op and kw_colon?(rest_at(bin, len)) ->
+        emit_op_kw(bin, len, line, col, acc, w, st)
+
+      true ->
+        cont(rest_at(bin, len), {kind, line, col, line, col + len, value}, acc, w, st)
+    end
+  end
+
+  defp atom_op_kw_len(<<"<<>>", rest::binary>>), do: if(kw_colon?(rest), do: 4)
+  defp atom_op_kw_len(<<"..//", rest::binary>>), do: if(kw_colon?(rest), do: 4)
+  defp atom_op_kw_len(_), do: nil
+
+  # --- unicode identifier/atom tokenization (vendored Toxic2.String.Tokenizer) -----------------
+  # The tokenizer returns {kind, nfc_name, rest, codepoint_len, ascii?, special}. `kind` is
+  # `:identifier` (usable as a name), `:alias` (Module-like), or `:atom` (unicode-uppercase —
+  # valid ONLY as an atom name, not a standalone identifier). Columns advance by codepoint count.
+
+  # Identifier position (start of a word). `:atom`-kind words and tokenizer errors are rejected.
+  defp lex_unicode(bin, line, col, acc, w, st) do
+    case Toxic2.String.Tokenizer.tokenize(bin) do
+      {:identifier, name, rest, len, _ascii?, _special} ->
+        emit_unicode_name(:identifier, name, rest, len, line, col, acc, w, st)
+
+      {:alias, name, rest, len, _ascii?, _special} ->
+        emit_unicode_name(:alias, name, rest, len, line, col, acc, w, st)
+
+      {:atom, name, rest, len, _ascii?, _special} ->
+        # A unicode-uppercase word is valid only as an atom name — `Σ` alone is rejected, but as a
+        # keyword KEY it's fine (`[Ólá: 0]` => `[{:Ólá, 0}]`).
+        case kw_suffix(rest) do
+          {:kw, r} ->
+            cont(r, {:kw_identifier, line, col, line, col + len + 1, name}, acc, w, st)
+
+          :no ->
+            unicode_error(bin, line, col, acc, w, st)
+        end
+
+      # The leading codepoint is not an identifier start at all (a stray symbol like `√`): defer
+      # to the operator/byte fallback, which emits a precise one-codepoint `:unexpected_char`.
+      {:error, :empty} ->
+        lex_operator(bin, line, col, acc, w, st)
+
+      {:error, _reason} ->
+        unicode_error(bin, line, col, acc, w, st)
+    end
+  end
+
+  defp emit_unicode_name(kind, name, rest, len, line, col, acc, w, st) do
+    case kw_suffix(rest) do
+      {:kw, r} ->
+        cont(r, {:kw_identifier, line, col, line, col + len + 1, name}, acc, w, st)
+
+      :no ->
+        cont(rest, {kind, line, col, line, col + len, name}, acc, w, st)
+    end
+  end
+
+  # Atom-literal position (`:` already at `col`; `wordbin` is one past the colon). Every word
+  # kind — including `:atom` (`:Σ`) — is a valid atom name here.
+  defp lex_unicode_atom(wordbin, line, col, acc, w, st) do
+    case Toxic2.String.Tokenizer.tokenize(wordbin) do
+      {kind, name, rest, len, _ascii?, _special} when kind in [:identifier, :alias, :atom] ->
+        cont(rest, {:atom, line, col, line, col + 1 + len, name}, acc, w, st)
+
+      {:error, _reason} ->
+        {clen, rest} = ident_run(wordbin)
+        err = LexError.new(:unexpected_token, %{})
+        cont(rest, {:error, line, col, line, col + 1 + clen, err}, acc, w, st)
+    end
+  end
+
+  # Tolerant resync for a rejected unicode word (mixed-script, disallowed codepoint, …): emit one
+  # `:error` token and consume the whole identifier-ish run so the lexer makes progress.
+  defp unicode_error(bin, line, col, acc, w, st) do
+    {clen, rest} = ident_run(bin)
+    err = LexError.new(:unexpected_token, %{})
+    cont(rest, {:error, line, col, line, col + clen, err}, acc, w, st)
+  end
+
+  # Codepoint length + remaining binary of the maximal identifier-ish run (ascii word chars and
+  # non-ascii codepoints). Used only for error resync, so it errs toward consuming the whole run.
+  defp ident_run(<<c, rest::binary>>) when is_word(c) do
+    {n, r} = ident_run(rest)
+    {n + 1, r}
+  end
+
+  defp ident_run(<<cp::utf8, rest::binary>>) when cp > 127 do
+    {n, r} = ident_run(rest)
+    {n + 1, r}
+  end
+
+  defp ident_run(rest), do: {0, rest}
+
+  # An operator name immediately followed by a keyword-separator colon is a keyword KEY —
+  # `<<>>:`, `+:`, `.:`, `&:`, `..//:`, `&&&:`, `%{}:`, `{}:` => `[{:"<<>>", _}, ...]`.
+  # `::` (`:::`) and `//` are never valid keys.
+  defp op_kw_len(bin) do
+    case op_atom_len(bin) do
+      nil ->
+        nil
+
+      len ->
+        if binary_part(bin, 0, len) != "::" and kw_colon?(rest_at(bin, len)), do: len, else: nil
+    end
+  end
+
+  defp emit_op_kw(bin, len, line, col, acc, w, st) do
+    tok = {:kw_identifier, line, col, line, col + len + 1, binary_part(bin, 0, len)}
+    cont(rest_at(bin, len + 1), tok, acc, w, st)
+  end
+
+  # A keyword-key colon is `:` followed by a clear separator (whitespace / closer / EOF).
+  # `:` followed by a name char starts an `:atom` operand instead — `&:foo`, `+:erlang` (a capture).
+  defp kw_colon?(<<?:, c, _::binary>>),
+    do: c in [?\s, ?\t, ?\n, ?\r, ?\f, ?\v, ?], ?}, ?), ?,, ?;]
+
+  defp kw_colon?(<<?:>>), do: true
+  defp kw_colon?(_), do: false
+
+  defp lex_operator(bin, line, col, acc, w, st) do
     case match_op(bin) do
       {kind, value, len} ->
         cont(rest_at(bin, len), {kind, line, col, line, col + len, value}, acc, w, st)
 
       nil ->
-        case bin do
-          <<cp::utf8, rest::binary>> ->
-            err = LexError.new(:unexpected_char, %{codepoint: cp})
-            cont(rest, {:error, line, col, line, col + 1, err}, acc, w, st)
-
-          <<byte, rest::binary>> ->
-            err = LexError.new(:invalid_byte, %{byte: byte})
-            cont(rest, {:error, line, col, line, col + 1, err}, acc, w, st)
-        end
+        lex_op_error(bin, line, col, acc, w, st)
     end
+  end
+
+  # Not an operator: a stray valid codepoint is one `:unexpected_char`, an invalid byte one
+  # `:invalid_byte` — each advances a single column (tolerant; never raises).
+  defp lex_op_error(<<cp::utf8, rest::binary>>, line, col, acc, w, st) do
+    err = LexError.new(:unexpected_char, %{codepoint: cp})
+    cont(rest, {:error, line, col, line, col + 1, err}, acc, w, st)
+  end
+
+  defp lex_op_error(<<byte, rest::binary>>, line, col, acc, w, st) do
+    err = LexError.new(:invalid_byte, %{byte: byte})
+    cont(rest, {:error, line, col, line, col + 1, err}, acc, w, st)
   end
 
   # --- classification of a lowercase word --------------------------------
@@ -431,6 +623,7 @@ defmodule Toxic2.Lexer do
   defp op_atom_len(<<"%{}", _::binary>>), do: 3
   defp op_atom_len(<<"{}", _::binary>>), do: 2
   defp op_atom_len(<<"%", _::binary>>), do: 1
+  defp op_atom_len(<<"::", _::binary>>), do: 2
   defp op_atom_len(<<?/, ?/, _::binary>>), do: nil
 
   defp op_atom_len(rest) do
@@ -440,16 +633,17 @@ defmodule Toxic2.Lexer do
     end
   end
 
-  defp match_op(bin), do: lookup_op(bin, 3) || lookup_op(bin, 2) || lookup_op(bin, 1)
-
-  defp lookup_op(bin, n) when byte_size(bin) >= n do
-    case @op_table[binary_part(bin, 0, n)] do
-      nil -> nil
-      {kind, value} -> {kind, value, n}
-    end
+  # Longest-match operator dispatch as direct binary-prefix clauses generated from `@op_table`,
+  # ordered longest-first so the BEAM's binary matcher prefers the longer operator. This replaces a
+  # `binary_part` + map lookup per length (which allocated a throwaway sub-binary each try); the
+  # generated clauses match bytes directly with zero allocation. `@op_table` stays the single source
+  # of truth (it also drives `op_atom_len`/the precedence pin).
+  for {str, {kind, value}} <- Enum.sort_by(@op_table, fn {s, _} -> -byte_size(s) end) do
+    defp match_op(<<unquote(str), _::binary>>),
+      do: {unquote(kind), unquote(value), unquote(byte_size(str))}
   end
 
-  defp lookup_op(_bin, _n), do: nil
+  defp match_op(_), do: nil
 
   # --- shared continuation -----------------------------------------------
 
@@ -486,13 +680,36 @@ defmodule Toxic2.Lexer do
     {[{end_kind(qk), line, col, line, col, nil}, err | acc], w}
   end
 
+  # Fast path: slice a maximal run of ordinary printable-ASCII content bytes in ONE `binary_part`
+  # instead of one `<<c>>`+cons per char (the dominant string/heredoc allocation — see tprof). The
+  # guard also matches the close quote (a printable ASCII byte); the run scanner stops at it, so a
+  # 0-length run means "the close is here" and we hand off to `close_quoted`.
+  defp read_quoted(<<c, _::binary>> = bin, line, col, buf, fs, acc, w, st, qk)
+       when c >= 32 and c < 128 and c != ?\\ and c != ?# do
+    close = close_char(qk)
+
+    if c == close do
+      close_quoted(rest_at(bin, 1), line, col, buf, fs, acc, w, st, qk)
+    else
+      n = plain_run_len(bin, close, close, 0)
+
+      read_quoted(
+        rest_at(bin, n),
+        line,
+        col + n,
+        [binary_part(bin, 0, n) | buf],
+        fs,
+        acc,
+        w,
+        st,
+        qk
+      )
+    end
+  end
+
   defp read_quoted(<<c::utf8, rest::binary>>, line, col, buf, fs, acc, w, st, qk) do
     if c == close_char(qk) do
-      acc = flush_fragment(buf, fs, line, col, acc, frag_kind(qk))
-      acc = [{end_kind(qk), line, col, line, col + 1, nil} | acc]
-      # A `:` immediately after the close quote (not `::`) makes this a quoted keyword KEY
-      # (`"foo": 1`): emit a `:kw_quote` marker the parser pairs with the preceding literal.
-      maybe_kw_colon(rest, line, col + 1, acc, w, st)
+      close_quoted(rest, line, col, buf, fs, acc, w, st, qk)
     else
       read_quoted(rest, line, col + 1, [<<c::utf8>> | buf], fs, acc, w, st, qk)
     end
@@ -501,6 +718,16 @@ defmodule Toxic2.Lexer do
   # A stray non-UTF-8 byte inside a quoted literal: keep it verbatim and keep scanning (tolerant).
   defp read_quoted(<<byte, rest::binary>>, line, col, buf, fs, acc, w, st, qk) do
     read_quoted(rest, line, col + 1, [<<byte>> | buf], fs, acc, w, st, qk)
+  end
+
+  # Close a quoted literal: flush the pending fragment, emit the end token, then check for a quoted
+  # keyword colon. `rest` is the input AFTER the close quote.
+  defp close_quoted(rest, line, col, buf, fs, acc, w, st, qk) do
+    acc = flush_fragment(buf, fs, line, col, acc, frag_kind(qk))
+    acc = [{end_kind(qk), line, col, line, col + 1, nil} | acc]
+    # A `:` immediately after the close quote (not `::`) makes this a quoted keyword KEY
+    # (`"foo": 1`): emit a `:kw_quote` marker the parser pairs with the preceding literal.
+    maybe_kw_colon(rest, line, col + 1, acc, w, st)
   end
 
   defp maybe_kw_colon(<<?:, c, _::binary>> = rest, line, col, acc, w, st) when c != ?: do
@@ -560,6 +787,9 @@ defmodule Toxic2.Lexer do
 
   defp esc(<<e::utf8, rest::binary>>),
     do: {<<Map.get(@char_escapes, e, e)::utf8>>, rest, :sameline}
+
+  # Tolerant (totality): `\` before an invalid UTF-8 byte keeps that byte literally (never raise).
+  defp esc(<<byte, rest::binary>>), do: {<<byte>>, rest, :sameline}
 
   defp esc(<<>>), do: {<<?\\>>, <<>>, :sameline}
 
@@ -683,6 +913,12 @@ defmodule Toxic2.Lexer do
     )
   end
 
+  # A sigil name sitting immediately at EOF (no delimiter at all) is dropped wholesale: the
+  # reference tokenizer yields nothing for a trailing `~x` (the program is empty), so we pop the
+  # already-emitted `:sigil_start` and stop. A non-EOF invalid delimiter (e.g. `~x `) still errors.
+  defp begin_sigil(<<>>, _line, _col, [{:sigil_start, _, _, _, _, _} | acc], w, _st, _name),
+    do: {acc, w}
+
   defp begin_sigil(other, line, col, acc, w, st, _name) do
     err = {:error, line, col, line, col, LexError.new(:invalid_sigil_delimiter, %{})}
     lex(other, line, col, [err | acc], w, st)
@@ -694,6 +930,37 @@ defmodule Toxic2.Lexer do
   # `:full` (unescape via @char_escapes, like a string) or `:raw` (keep verbatim, for uppercase
   # sigil heredocs); `strip` is the closing delimiter's indentation, removed from each line's
   # start. The opener and `strip` are computed in `open_heredoc`. A line `\s*<delim>x3` terminates.
+  # `\`-newline inside a `:full` heredoc is a line continuation: the newline is dropped from the
+  # content, but the NEXT physical line still gets terminator + indentation handling — so route to
+  # `heredoc_line_start`. The empty `<<>>` mirrors the string path's `decode_escape`: it vanishes
+  # when fragments are concatenated, but keeps the trailing `""` segment an interpolated heredoc
+  # ending in `#{…}\<newline>` needs (matching the reference). `:raw` heredocs keep `\` verbatim.
+  defp read_heredoc(
+         <<?\\, ?\r, ?\n, rest::binary>>,
+         line,
+         _col,
+         buf,
+         fs,
+         acc,
+         w,
+         st,
+         {_d, :full, _i, _s, _ek} = hc
+       ),
+       do: heredoc_line_start(rest, line + 1, [<<>> | buf], fs, acc, w, st, hc)
+
+  defp read_heredoc(
+         <<?\\, ?\n, rest::binary>>,
+         line,
+         _col,
+         buf,
+         fs,
+         acc,
+         w,
+         st,
+         {_d, :full, _i, _s, _ek} = hc
+       ),
+       do: heredoc_line_start(rest, line + 1, [<<>> | buf], fs, acc, w, st, hc)
+
   defp read_heredoc(
          <<?\\, rest::binary>>,
          line,
@@ -708,6 +975,29 @@ defmodule Toxic2.Lexer do
     {app, rest2, line2, col2} = decode_escape(rest, line, col)
     read_heredoc(rest2, line2, col2, [app | buf], fs, acc, w, st, hc)
   end
+
+  # In a raw (`~S"""`) heredoc, a `\` before the full delimiter escapes it: `\"""` keeps `"""` as
+  # content (the only escape raw heredocs honour). `:full` heredocs reach `decode_escape` above.
+  defp read_heredoc(<<?\\, a, b, c, rest::binary>>, line, col, buf, fs, acc, w, st, hc)
+       when a == elem(hc, 0) and b == a and c == a and elem(hc, 1) == :raw do
+    read_heredoc(rest, line, col + 4, [<<a, b, c>> | buf], fs, acc, w, st, hc)
+  end
+
+  # In a raw (sigil, `~s"""`) heredoc, `\#{` keeps the backslash literal AND suppresses the
+  # interpolation: the content is `\#{...}` verbatim (the `~s` macro unescapes later), matching
+  # `read_sigil`'s `\<char>` behaviour. `:full` heredocs reach `decode_escape` above instead.
+  defp read_heredoc(
+         <<?\\, ?#, ?{, rest::binary>>,
+         line,
+         col,
+         buf,
+         fs,
+         acc,
+         w,
+         st,
+         {_d, :raw, _i, _s, _ek} = hc
+       ),
+       do: read_heredoc(rest, line, col + 3, [<<?\\, ?#, ?{>> | buf], fs, acc, w, st, hc)
 
   defp read_heredoc(
          <<?#, ?{, rest::binary>>,
@@ -732,6 +1022,27 @@ defmodule Toxic2.Lexer do
     acc = flush_fragment(buf, fs, line, col, acc, frag_of(ek))
     err = {:error, line, col, line, col, LexError.new(:heredoc_missing_terminator, %{})}
     {[{ek, line, col, line, col, nil}, err | acc], w}
+  end
+
+  # Fast path: slice a maximal run of ordinary printable-ASCII content in ONE `binary_part` (the
+  # heredoc terminator and quote chars are only special at line start, so `"`/`'` ARE content here —
+  # no `stop` bytes). `\`/`#`/newline still end the run (handled by the clauses above). tprof showed
+  # per-char heredoc content reading was ~20% of all lexer allocation.
+  defp read_heredoc(<<c, _::binary>> = bin, line, col, buf, fs, acc, w, st, hc)
+       when c >= 32 and c < 128 and c != ?\\ and c != ?# do
+    n = plain_run_len(bin, 0, 0, 0)
+
+    read_heredoc(
+      rest_at(bin, n),
+      line,
+      col + n,
+      [binary_part(bin, 0, n) | buf],
+      fs,
+      acc,
+      w,
+      st,
+      hc
+    )
   end
 
   defp read_heredoc(<<c::utf8, rest::binary>>, line, col, buf, fs, acc, w, st, hc),
@@ -824,7 +1135,11 @@ defmodule Toxic2.Lexer do
   defp heredoc_start_body(body, line, acc, w, st, {delim, mode, interp?, end_kind}) do
     strip = heredoc_indent(body, delim, 0)
     hc = {delim, mode, interp?, strip, end_kind}
-    heredoc_line_start(body, line + 1, [], {line + 1, 1}, acc, w, st, hc)
+
+    # Seed an empty fragment: a heredoc always opens with a fragment, so an immediate `#{…}` keeps
+    # the leading `""` the reference emits (`\"\"\"\n#{x}…` => `["", interp, …]`); for ordinary
+    # leading text the empty chunk simply merges into the first fragment.
+    heredoc_line_start(body, line + 1, [<<>>], {line + 1, 1}, acc, w, st, hc)
   end
 
   # Pre-scan the body for the closing delimiter's indentation. `depth` tracks `#{...}` nesting so a
@@ -848,6 +1163,10 @@ defmodule Toxic2.Lexer do
   # Scan to the next newline (consumed), tracking `#{`/brace depth and skipping escaped chars.
   defp skip_to_eol(<<>>, _depth), do: :eof
   defp skip_to_eol(<<?\n, rest::binary>>, depth), do: {rest, depth}
+  # A `\`-newline is a content line continuation, but the closing `"""` still lives on its own
+  # physical line — so for the indentation pre-scan it counts as a line boundary, not an escape.
+  defp skip_to_eol(<<?\\, ?\r, ?\n, rest::binary>>, depth), do: {rest, depth}
+  defp skip_to_eol(<<?\\, ?\n, rest::binary>>, depth), do: {rest, depth}
   defp skip_to_eol(<<?\\, _c, rest::binary>>, depth), do: skip_to_eol(rest, depth)
   defp skip_to_eol(<<?#, ?{, rest::binary>>, depth), do: skip_to_eol(rest, depth + 1)
   defp skip_to_eol(<<?{, rest::binary>>, depth) when depth > 0, do: skip_to_eol(rest, depth + 1)
@@ -866,18 +1185,44 @@ defmodule Toxic2.Lexer do
     [{kind, fl, fc, el, ec, value} | acc]
   end
 
+  # Length of a maximal run of ordinary printable-ASCII content bytes (32..127, none of `\`/`#`/the
+  # up-to-two `stop` bytes). Newlines and other control bytes (<32) and UTF-8 lead bytes (>=128) end
+  # the run too, so a slice of this length is exactly one column per byte. Lets the string/heredoc
+  # readers take one `binary_part` per run instead of `<<c>>`+cons per char (toxic-style fast path).
+  defp plain_run_len(<<c, rest::binary>>, s1, s2, n)
+       when c >= 32 and c < 128 and c != ?\\ and c != ?# and c != s1 and c != s2,
+       do: plain_run_len(rest, s1, s2, n + 1)
+
+  defp plain_run_len(_bin, _s1, _s2, n), do: n
+
   # Read an identifier/atom name: word chars + optional single trailing ? or !.
+  # `word_len/2` already returns the rest after the word run, so reuse it rather than re-slicing
+  # with `rest_at` (a per-identifier sub-binary that tprof flagged); only the name itself needs a
+  # slice. The optional trailing `?`/`!` consumes one more byte, whose tail we likewise reuse.
   defp read_name(bin) do
-    {wlen, _} = word_len(bin, 0)
+    case word_len(bin, 0) do
+      {wlen, <<p, after_p::binary>>} when p in [??, ?!] ->
+        {wlen + 1, binary_part(bin, 0, wlen + 1), after_p}
 
-    len =
-      case rest_at(bin, wlen) do
-        <<p, _::binary>> when p in [??, ?!] -> wlen + 1
-        _ -> wlen
-      end
-
-    {len, binary_part(bin, 0, len), rest_at(bin, len)}
+      {wlen, rest} ->
+        {wlen, binary_part(bin, 0, wlen), rest}
+    end
   end
+
+  # An atom name: word chars and `@` (`:nonode@nohost`, `:foo@`), then an optional trailing `?`/`!`.
+  # Reuse the rest `atom_word_len/2` already returns instead of re-slicing with `rest_at` (mirrors
+  # `read_name/1`); the optional trailing `?`/`!` consumes one more byte, whose tail we also reuse.
+  defp read_atom_name(bin) do
+    case atom_word_len(bin, 0) do
+      {wlen, <<p, after_p::binary>>} when p in [??, ?!] -> {wlen + 1, after_p}
+      {wlen, rest} -> {wlen, rest}
+    end
+  end
+
+  defp atom_word_len(<<c, rest::binary>>, n) when is_word(c) or c == ?@,
+    do: atom_word_len(rest, n + 1)
+
+  defp atom_word_len(rest, n), do: {n, rest}
 
   defp rest_at(bin, len), do: binary_part(bin, len, byte_size(bin) - len)
 

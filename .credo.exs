@@ -4,7 +4,10 @@
       name: "default",
       files: %{
         included: ["lib/", "test/"],
-        excluded: [~r"/_build/", ~r"/deps/"]
+        # `lib/toxic2/unicode/` is the vendored `String.Tokenizer` port — machine-generated and
+        # kept byte-faithful to upstream Elixir, so it's exempt from our complexity checks (same
+        # rationale as the `toxic2.guard` exemption).
+        excluded: [~r"/_build/", ~r"/deps/", ~r"lib/toxic2/unicode/"]
       },
       strict: true,
       checks: %{

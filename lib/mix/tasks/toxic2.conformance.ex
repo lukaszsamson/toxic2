@@ -60,10 +60,24 @@ defmodule Mix.Tasks.Toxic2.Conformance do
 
   @doc "Classify one source: `:pass | {:fail, oracle, toxic} | :ok_invalid | :unexpected_valid | {:crash, msg}`."
   def evaluate(source) do
-    case Code.string_to_quoted(source, columns: true) do
+    case safe_oracle(source) do
       {:ok, oracle_ast} -> compare_valid(source, oracle_ast)
-      {:error, _} -> compare_invalid(source)
+      :invalid -> compare_invalid(source)
     end
+  end
+
+  # The oracle (`Code.string_to_quoted/2`) is NOT total — it RAISES on invalid UTF-8 (e.g.
+  # `:"<bad byte>"`), where toxic2 stays tolerant. Classify any oracle error OR raise as invalid
+  # input so the evaluator never crashes; it then falls through to `compare_invalid/1`.
+  defp safe_oracle(source) do
+    case Code.string_to_quoted(source, columns: true) do
+      {:ok, ast} -> {:ok, ast}
+      {:error, _} -> :invalid
+    end
+  rescue
+    _ -> :invalid
+  catch
+    _, _ -> :invalid
   end
 
   defp compare_valid(source, oracle_ast) do

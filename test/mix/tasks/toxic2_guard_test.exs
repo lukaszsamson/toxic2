@@ -109,8 +109,9 @@ defmodule Mix.Tasks.Toxic2.GuardTest do
 
   test "the real project tree is clean under the guard" do
     File.cd!(Path.expand("../../..", __DIR__), fn ->
-      paths = Path.wildcard("lib/toxic2/**/*.ex") ++ Path.wildcard("test/**/*.exs")
-      assert Guard.violations(paths) == []
+      # Scan precisely what `run/0` scans (shared helper applies the lib/mix + vendored-unicode
+      # exemptions), so the self-test can't drift from the real gate.
+      assert Guard.violations(Guard.scanned_paths()) == []
     end)
   end
 end

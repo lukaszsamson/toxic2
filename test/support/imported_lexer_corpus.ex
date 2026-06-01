@@ -6,10 +6,136 @@ defmodule Toxic2.Conformance.ImportedLexer do
 
   @entries [
     %{
+      source: "?\\a",
+      tags: [:imported, :warnings, :warnings_ungrouped],
+      group: "warnings: ungrouped",
+      line: 48
+    },
+    %{
+      source: "?\\q",
+      tags: [:imported, :warnings, :warnings_ungrouped],
+      group: "warnings: ungrouped",
+      line: 52
+    },
+    %{
+      source: "?\\t",
+      tags: [:imported, :warnings, :warnings_ungrouped],
+      group: "warnings: ungrouped",
+      line: 56
+    },
+    %{
+      source: "'''\nhello\n'''",
+      tags: [:imported, :warnings, :warnings_ungrouped],
+      group: "warnings: ungrouped",
+      line: 60
+    },
+    %{
+      source: "'hello'",
+      tags: [:imported, :warnings, :warnings_ungrouped],
+      group: "warnings: ungrouped",
+      line: 64
+    },
+    %{
+      source: ":::",
+      tags: [:imported, :warnings, :warnings_ungrouped],
+      group: "warnings: ungrouped",
+      line: 68
+    },
+    %{
+      source: ":'1hello'",
+      tags: [:imported, :warnings, :warnings_ungrouped],
+      group: "warnings: ungrouped",
+      line: 72
+    },
+    %{
+      source: ":'hello'",
+      tags: [:imported, :warnings, :warnings_ungrouped],
+      group: "warnings: ungrouped",
+      line: 76
+    },
+    %{
+      source: ":\"hello\"",
+      tags: [:imported, :warnings, :warnings_ungrouped],
+      group: "warnings: ungrouped",
+      line: 77
+    },
+    %{
+      source: "'1hello': 1",
+      tags: [:imported, :warnings, :warnings_ungrouped],
+      group: "warnings: ungrouped",
+      line: 81
+    },
+    %{
+      source: "'hello': 1",
+      tags: [:imported, :warnings, :warnings_ungrouped],
+      group: "warnings: ungrouped",
+      line: 85
+    },
+    %{
+      source: "\"hello\": 1",
+      tags: [:imported, :warnings, :warnings_ungrouped],
+      group: "warnings: ungrouped",
+      line: 86
+    },
+    %{
+      source: "&&&& true",
+      tags: [:imported, :warnings, :warnings_ungrouped],
+      group: "warnings: ungrouped",
+      line: 90
+    },
+    %{
+      source: "|||| true",
+      tags: [:imported, :warnings, :warnings_ungrouped],
+      group: "warnings: ungrouped",
+      line: 94
+    },
+    %{
+      source: "++++",
+      tags: [:imported, :warnings, :warnings_ungrouped],
+      group: "warnings: ungrouped",
+      line: 98
+    },
+    %{
+      source: "----",
+      tags: [:imported, :warnings, :warnings_ungrouped],
+      group: "warnings: ungrouped",
+      line: 102
+    },
+    %{
+      source: "^^^^",
+      tags: [:imported, :warnings, :warnings_ungrouped],
+      group: "warnings: ungrouped",
+      line: 106
+    },
+    %{
+      source: ":foo!= 1",
+      tags: [:imported, :warnings, :warnings_ungrouped],
+      group: "warnings: ungrouped",
+      line: 110
+    },
+    %{
+      source: "foo!= 1",
+      tags: [:imported, :warnings, :warnings_ungrouped],
+      group: "warnings: ungrouped",
+      line: 114
+    },
+    %{
+      source: ":foo?= 1",
+      tags: [:imported, :warnings, :warnings_ungrouped],
+      group: "warnings: ungrouped",
+      line: 118
+    },
+    %{
       source: "",
       tags: [:imported, :valid_code, :valid_code_ungrouped],
       group: "valid_code: ungrouped",
       line: 120
+    },
+    %{
+      source: "foo?= 1",
+      tags: [:imported, :warnings, :warnings_ungrouped],
+      group: "warnings: ungrouped",
+      line: 122
     },
     %{
       source: "0x123",
@@ -18,10 +144,22 @@ defmodule Toxic2.Conformance.ImportedLexer do
       line: 125
     },
     %{
+      source: "1 ^^^ 2",
+      tags: [:imported, :warnings, :warnings_ungrouped],
+      group: "warnings: ungrouped",
+      line: 126
+    },
+    %{
       source: "0xAB_CD",
       tags: [:imported, :valid_code, :valid_code_hex_numbers],
       group: "valid_code: hex numbers",
       line: 129
+    },
+    %{
+      source: "~~~1",
+      tags: [:imported, :warnings, :warnings_ungrouped],
+      group: "warnings: ungrouped",
+      line: 130
     },
     %{
       source: "0xAbCd",
@@ -30,10 +168,22 @@ defmodule Toxic2.Conformance.ImportedLexer do
       line: 133
     },
     %{
+      source: "1 <|> 2",
+      tags: [:imported, :warnings, :warnings_ungrouped],
+      group: "warnings: ungrouped",
+      line: 134
+    },
+    %{
       source: "0x123;",
       tags: [:imported, :valid_code, :valid_code_hex_numbers],
       group: "valid_code: hex numbers",
       line: 137
+    },
+    %{
+      source: "Foo.'1bar'",
+      tags: [:imported, :warnings, :warnings_ungrouped],
+      group: "warnings: ungrouped",
+      line: 138
     },
     %{
       source: "0x123 ;",
@@ -42,10 +192,52 @@ defmodule Toxic2.Conformance.ImportedLexer do
       line: 141
     },
     %{
+      source: "Foo.'bar'",
+      tags: [:imported, :warnings, :warnings_ungrouped],
+      group: "warnings: ungrouped",
+      line: 142
+    },
+    %{
+      source: "Foo.\"bar\"",
+      tags: [:imported, :warnings, :warnings_ungrouped],
+      group: "warnings: ungrouped",
+      line: 143
+    },
+    %{
+      source: "Foo.\"bar\"()",
+      tags: [:imported, :warnings, :warnings_ungrouped],
+      group: "warnings: ungrouped",
+      line: 144
+    },
+    %{
       source: "0x123  ;",
       tags: [:imported, :valid_code, :valid_code_hex_numbers],
       group: "valid_code: hex numbers",
       line: 145
+    },
+    %{
+      source: "Foo.\"bar\"[]",
+      tags: [:imported, :warnings, :warnings_ungrouped],
+      group: "warnings: ungrouped",
+      line: 145
+    },
+    %{
+      source: "Foo.\"bar\" +1",
+      tags: [:imported, :warnings, :warnings_ungrouped],
+      group: "warnings: ungrouped",
+      line: 146
+    },
+    %{
+      source: "Foo.\"bar\" do\n:ok\nend",
+      tags: [:imported, :warnings, :warnings_ungrouped],
+      group: "warnings: ungrouped",
+      line: 147
+    },
+    %{
+      source: "~S|foo\\|",
+      tags: [:imported, :warnings, :warnings_ungrouped],
+      group: "warnings: ungrouped",
+      line: 151
     },
     %{
       source: "0b101",
@@ -142,6 +334,12 @@ defmodule Toxic2.Conformance.ImportedLexer do
       tags: [:imported, :valid_code, :valid_code_integers],
       group: "valid_code: integers",
       line: 225
+    },
+    %{
+      source: "~S|foo|",
+      tags: [:imported, :warnings, :warnings_ungrouped],
+      group: "warnings: ungrouped",
+      line: 226
     },
     %{
       source: "0123",
@@ -334,12 +532,6 @@ defmodule Toxic2.Conformance.ImportedLexer do
       tags: [:imported, :valid_code, :valid_code_operators_as_atoms],
       group: "valid_code: operators as atoms",
       line: 294
-    },
-    %{
-      source: ":::",
-      tags: [:imported, :valid_code, :valid_code_operators_as_atoms],
-      group: "valid_code: operators as atoms",
-      line: 298
     },
     %{
       source: ":==",
@@ -2056,12 +2248,6 @@ defmodule Toxic2.Conformance.ImportedLexer do
       tags: [:imported, :valid_code, :valid_code_char],
       group: "valid_code: char",
       line: 2126
-    },
-    %{
-      source: "?\\a",
-      tags: [:imported, :valid_code, :valid_code_char],
-      group: "valid_code: char",
-      line: 2127
     },
     %{
       source: "?\\\\",

@@ -19,6 +19,9 @@ defmodule Toxic2.Lower do
 
   alias Toxic2.{CST, Diagnostics, Tokens}
 
+  # Narrow inlining of tiny LOCAL meta builders on the hot per-node path (A/B-measured).
+  @compile {:inline, tmeta: 2, op_atom: 2, op_meta: 2, span_meta: 1}
+
   @type ast :: Macro.t()
 
   @doc """
@@ -27,8 +30,19 @@ defmodule Toxic2.Lower do
   """
   @spec to_ast(CST.t(), Tokens.t(), keyword(), pos_integer()) :: {ast(), [Toxic2.Diagnostic.t()]}
   def to_ast(cst, view, opts \\ [], start_id \\ 1) do
-    {ast, acc, _nid} = lower(cst, view, opts, [], start_id)
+    {ast, acc, _nid} = lower(cst, view, resolve_opts(opts), [], start_id)
     {ast, Diagnostics.to_list(acc)}
+  end
+
+  # Resolve the (keyword) options ONCE into a compact map threaded through lowering, so per-node
+  # checks are a map field read (`opts.range`) instead of a `Keyword.get` keyfind over the option
+  # list on every node (tprof: that keyfind was ~4 % of all calls).
+  defp resolve_opts(opts) do
+    %{
+      existing_atoms_only: Keyword.get(opts, :existing_atoms_only, false),
+      range: Keyword.get(opts, :range, false),
+      literal_encoder: Keyword.get(opts, :literal_encoder)
+    }
   end
 
   defp lower(cst, view, opts, acc, nid) do
@@ -42,48 +56,163 @@ defmodule Toxic2.Lower do
   defp lower_token(cst, view, opts, acc, nid) do
     idx = CST.token_index(cst)
     val = Tokens.value(view, idx)
-    meta = tmeta(view, idx)
+    # Leaf nodes are fresh (no passthrough), so the token's own span IS the range.
+    meta = tmeta(view, idx) |> maybe_token_range(view, idx, opts)
 
     case Tokens.kind(view, idx) do
-      :int -> {val, acc, nid}
-      :flt -> {val, acc, nid}
-      :char -> {val, acc, nid}
-      :literal -> {val, acc, nid}
+      :int -> lit(val, view, idx, opts, acc, nid)
+      :flt -> lit(val, view, idx, opts, acc, nid)
+      :char -> lit(val, view, idx, opts, acc, nid)
+      :literal -> lit(val, view, idx, opts, acc, nid)
       # `&N` (capture argument): the whole token is the capture `{:&, _, [N]}` (see Precedence).
       :capture_int -> {{:&, meta, [val]}, acc, nid}
-      :atom -> atomize(cst, view, opts, acc, nid, val, & &1)
+      :atom -> lower_atom_literal(cst, view, idx, opts, val, acc, nid)
       :identifier -> atomize(cst, view, opts, acc, nid, val, &{&1, meta, nil})
       :alias -> atomize(cst, view, opts, acc, nid, val, &{:__aliases__, meta, [&1]})
       _ -> {error_ast(cst, view), acc, nid}
     end
   end
 
+  defp lower_atom_literal(cst, view, idx, opts, val, acc, nid) do
+    case to_atom(val, opts) do
+      {:ok, atom} -> lit(atom, view, idx, opts, acc, nid)
+      :error -> nonexistent_atom(cst, view, val, acc, nid)
+    end
+  end
+
+  # --- literal encoder (opt-in via `literal_encoder: fn val, meta -> {:ok, ast} | {:error, _} end`)
+  # Elixir-compatible: called for each literal (int/float/atom/string/charlist/true/false/nil and
+  # list / 2-tuple containers) with positional meta — `line:`/`column:` plus `range:` when ranges
+  # are on. Lets bare literals (which otherwise have no metadata slot in the AST) carry source info.
+
+  # A scalar leaf literal: `lit/6` only touches the token span when an encoder is installed, so the
+  # default (no-encoder) path stays a bare value with zero extra work.
+  defp lit(value, view, idx, opts, acc, nid) do
+    case opts.literal_encoder do
+      nil -> {value, acc, nid}
+      enc -> run_encoder(enc, value, Tokens.span(view, idx), opts, acc, nid)
+    end
+  end
+
+  defp run_encoder(enc, value, span, opts, acc, nid),
+    do: run_encoder_meta(enc, value, literal_meta(span, opts), span, acc, nid)
+
+  defp run_encoder_meta(enc, value, meta, span, acc, nid) do
+    case enc.(value, meta) do
+      {:ok, encoded} ->
+        {encoded, acc, nid}
+
+      {:error, reason} ->
+        sp = if is_tuple(span), do: span, else: {1, 1, 1, 1}
+
+        {id, acc, nid} =
+          Diagnostics.emit(acc, nid, :lowerer, :error, :literal_encoder, sp, %{reason: reason})
+
+        {{:__error__, [], %{diag_ids: [id]}}, acc, nid}
+    end
+  end
+
+  defp literal_meta({sl, sc, _el, _ec} = span, opts),
+    do: with_range([line: sl, column: sc], span, opts)
+
+  defp literal_meta(_other, _opts), do: []
+
+  # --- source ranges (opt-in via `range: true`) --------------------------------------------------
+  # Each AST node that corresponds to source carries `range: {{start_line, start_col}, {end_line,
+  # end_col}}` (end exclusive — one past the last char), separate from the `line:`/`column:` anchor
+  # (which Elixir places on the operator for infix ops, not the expression start). The extent comes
+  # straight from the green CST node's span, so a parent's range provably contains every child's.
+
+  defp range_enabled?(opts), do: opts.range
+
+  defp with_range(meta, span, opts) do
+    case range_enabled?(opts) and span do
+      {sl, sc, el, ec} -> [{:range, {{sl, sc}, {el, ec}}} | meta]
+      _ -> meta
+    end
+  end
+
+  # Token spans are only materialized when ranges are on (keeps the default lowering allocation-lean).
+  defp maybe_token_range(meta, view, idx, opts) do
+    if range_enabled?(opts), do: with_range(meta, Tokens.span(view, idx), opts), else: meta
+  end
+
+  # Node kinds that lower to a bare LITERAL value (not a `{form, meta, args}` node) when they hold
+  # no interpolation / are 2-element: these feed the literal encoder. Interpolated strings/charlists
+  # and 3+ tuples lower to real nodes (3-tuples) instead and take the range path.
+  @literal_node_kinds [:list, :tuple, :string, :charlist, :quoted_atom]
+
+  # One trivial clause per node kind (keeps each clause's cyclomatic complexity at 1).
+  defp lower_node(cst, view, opts, acc, nid) do
+    kind = CST.node_kind(cst)
+    {ast, acc, nid} = lower_kind(kind, CST.children(cst), cst, view, opts, acc, nid)
+    finalize_node(kind, ast, cst, opts, acc, nid)
+  end
+
+  # A real node result → attach its source range. A bare literal result from a literal-bearing kind
+  # → run the literal encoder. Anything else (e.g. a synthetic `nil`) passes through untouched.
+  defp finalize_node(_kind, {form, meta, args}, cst, opts, acc, nid) when is_list(meta),
+    do: {put_node_range({form, meta, args}, cst, opts), acc, nid}
+
+  defp finalize_node(kind, ast, cst, opts, acc, nid) when kind in @literal_node_kinds do
+    encode_node_literal(ast, cst, opts, acc, nid)
+  end
+
+  # A parenthesised stab `(a -> b)` (e.g. a function type in a spec) lowers to a clause LIST, which
+  # Elixir treats as a list literal — so the encoder wraps it. Single-expr / multi-stmt parens lower
+  # to a node or an already-encoded child instead, so only the bare-list (stab) case lands here.
+  defp finalize_node(:paren, ast, cst, opts, acc, nid) when is_list(ast),
+    do: encode_node_literal(ast, cst, opts, acc, nid)
+
+  defp finalize_node(_kind, ast, _cst, _opts, acc, nid), do: {ast, acc, nid}
+
+  defp encode_node_literal(ast, cst, opts, acc, nid) do
+    case opts.literal_encoder do
+      nil -> {ast, acc, nid}
+      enc -> run_encoder(enc, ast, CST.span(cst), opts, acc, nid)
+    end
+  end
+
+  # Attach this CST node's span as the range — UNLESS the lowered result already carries one, which
+  # means `lower_kind` passed a child through transparently (single-statement block/paren); the
+  # child's own (tighter) range must win.
+  defp put_node_range({form, meta, args}, cst, opts) when is_list(meta) do
+    if range_enabled?(opts) and not Keyword.has_key?(meta, :range) do
+      {form, with_range(meta, CST.span(cst), opts), args}
+    else
+      {form, meta, args}
+    end
+  end
+
+  defp put_node_range(ast, _cst, _opts), do: ast
+
   # Atomize a source-derived name via `build`, or — under `existing_atoms_only` for a missing
   # atom — emit a lowerer diagnostic and an error node (never raise).
   defp atomize(cst, view, opts, acc, nid, val, build) do
     case to_atom(val, opts) do
-      {:ok, atom} ->
-        {build.(atom), acc, nid}
-
-      :error ->
-        {id, acc, nid} =
-          Diagnostics.emit(acc, nid, :lowerer, :error, :nonexistent_atom, name_span(cst, view), %{
-            name: val
-          })
-
-        {{:__error__, error_meta(cst, view), %{diag_ids: [id]}}, acc, nid}
+      {:ok, atom} -> {build.(atom), acc, nid}
+      :error -> nonexistent_atom(cst, view, val, acc, nid)
     end
   end
 
-  # One trivial clause per node kind (keeps each clause's cyclomatic complexity at 1).
-  defp lower_node(cst, view, opts, acc, nid),
-    do: lower_kind(CST.node_kind(cst), CST.children(cst), cst, view, opts, acc, nid)
+  defp nonexistent_atom(cst, view, val, acc, nid) do
+    {id, acc, nid} =
+      Diagnostics.emit(acc, nid, :lowerer, :error, :nonexistent_atom, name_span(cst, view), %{
+        name: val
+      })
 
+    {{:__error__, error_meta(cst, view), %{diag_ids: [id]}}, acc, nid}
+  end
+
+  # One trivial clause per node kind (keeps each clause's cyclomatic complexity at 1).
   defp lower_kind(:expr_list, ch, _cst, view, opts, acc, nid),
     do: lower_block(ch, view, opts, acc, nid)
 
   defp lower_kind(:paren, ch, _cst, view, opts, acc, nid),
     do: lower_paren(ch, view, opts, acc, nid)
+
+  # A leading `;` empty statement in a stab body (`-> ;t` => `__block__([nil, t])`) lowers to `nil`.
+  defp lower_kind(:empty_stmt, _ch, _cst, _view, _opts, acc, nid), do: {nil, acc, nid}
 
   defp lower_kind(:binary_op, ch, _cst, view, opts, acc, nid),
     do: lower_binary(ch, view, opts, acc, nid)
@@ -91,7 +220,17 @@ defmodule Toxic2.Lower do
   defp lower_kind(:unary_op, ch, _cst, view, opts, acc, nid),
     do: lower_unary(ch, view, opts, acc, nid)
 
+  # An operator function reference (`+/2` => `{:/, [], [{:+, [], nil}, 2]}`): the bare operator
+  # lowers to `{:op_atom, meta, nil}`, the variable-like form the reference's `/arity` divides.
+  defp lower_kind(:op_ref, [op_leaf], _cst, view, _opts, acc, nid),
+    do: {{op_atom(op_leaf, view), op_meta(op_leaf, view), nil}, acc, nid}
+
   defp lower_kind(:list, ch, _cst, view, opts, acc, nid), do: lower_list(ch, view, opts, acc, nid)
+
+  # A synthesized keyword list (bare `when a: t` guard) — lowers like a list but is NOT a list
+  # literal, so `finalize_node` leaves it un-encoded (matches the oracle).
+  defp lower_kind(:kw_list, ch, _cst, view, opts, acc, nid),
+    do: lower_each(ch, view, opts, acc, nid)
 
   defp lower_kind(:tuple, ch, _cst, view, opts, acc, nid),
     do: lower_tuple(ch, view, opts, acc, nid)
@@ -237,7 +376,7 @@ defmodule Toxic2.Lower do
       {{{:., [], [List, :to_charlist]}, [], [Enum.map(parts, &charlist_segment/1)]}, acc, nid}
     else
       bin = parts |> Enum.map(fn {:frag, b} -> b end) |> IO.iodata_to_binary()
-      {String.to_charlist(bin), acc, nid}
+      {safe_to_charlist(bin), acc, nid}
     end
   end
 
@@ -314,7 +453,7 @@ defmodule Toxic2.Lower do
   defp build_sigil(name, parts, mods, start_leaf, view, opts, acc, nid) do
     case to_atom("sigil_" <> name, opts) do
       {:ok, atom} ->
-        {{atom, [], [{:<<>>, [], sigil_segments(parts)}, String.to_charlist(mods)]}, acc, nid}
+        {{atom, [], [{:<<>>, [], sigil_segments(parts)}, safe_to_charlist(mods)]}, acc, nid}
 
       :error ->
         {id, acc, nid} =
@@ -339,7 +478,11 @@ defmodule Toxic2.Lower do
   defp sigil_segments(parts), do: Enum.map(parts, &string_segment/1)
 
   defp lower_block([], _view, _opts, acc, nid), do: {{:__block__, [], []}, acc, nid}
-  defp lower_block([only], view, opts, acc, nid), do: lower(only, view, opts, acc, nid)
+
+  defp lower_block([only], view, opts, acc, nid) do
+    {ast, acc, nid} = lower(only, view, opts, acc, nid)
+    {wrap_splice(ast), acc, nid}
+  end
 
   defp lower_block(children, view, opts, acc, nid) do
     {asts, acc, nid} = lower_each(children, view, opts, acc, nid)
@@ -350,10 +493,29 @@ defmodule Toxic2.Lower do
   # A paren is a statement block: empty => empty block, one => the expr (transparent), many =>
   # `__block__`. A trailing recovered `:missing` (no `)`) is skipped — its diagnostic is emitted.
   defp lower_paren(children, view, opts, acc, nid) do
-    children
-    |> Enum.reject(&(CST.tag(&1) == :missing))
-    |> lower_block(view, opts, acc, nid)
+    children = Enum.reject(children, &(CST.tag(&1) == :missing))
+
+    # A paren of stab clauses (`(a -> b; c -> d)`) lowers to the bare clause LIST `[{:->, …}, …]`,
+    # not a statement block.
+    if Enum.any?(children, &stab_node?/1) do
+      lower_each(children, view, opts, acc, nid)
+    else
+      {ast, acc, nid} = lower_block(children, view, opts, acc, nid)
+      {wrap_paren_negation(ast), acc, nid}
+    end
   end
+
+  defp stab_node?(cst), do: CST.tag(cst) == :node and CST.node_kind(cst) == :stab
+
+  # A parenthesised boolean negation is wrapped in a `__block__` — `(not x)` => `{:__block__, [],
+  # [{:not, [], [x]}]}`, likewise `(! x)` — preserving the parenthesisation the `not in`
+  # deprecation relies on. (`-`/`+` and binary ops are NOT wrapped.)
+  defp wrap_paren_negation({op, _, [_]} = ast) when op in [:not, :!], do: {:__block__, [], [ast]}
+  defp wrap_paren_negation(ast), do: ast
+
+  # A sole empty `()` head means zero patterns (`fn () when g`/`fn () ->`); anything else is kept.
+  defp strip_empty_paren_head([{:node, :paren, _sp, [], _f, _d}]), do: []
+  defp strip_empty_paren_head(pats), do: pats
 
   defp lower_binary([lhs, op_leaf, rhs], view, opts, acc, nid) do
     cond do
@@ -435,6 +597,10 @@ defmodule Toxic2.Lower do
     {{op_atom(op_leaf, view), op_meta(op_leaf, view), [o]}, acc, nid}
   end
 
+  # Nullary `..` / `...` (no operand): `{:.., [], []}` / `{:..., [], []}`.
+  defp lower_unary([op_leaf], view, _opts, acc, nid),
+    do: {{op_atom(op_leaf, view), op_meta(op_leaf, view), []}, acc, nid}
+
   # A list literal lowers to the Elixir list of its lowered elements.
   defp lower_list(children, view, opts, acc, nid), do: lower_each(children, view, opts, acc, nid)
 
@@ -491,22 +657,47 @@ defmodule Toxic2.Lower do
 
   # Alias chain: `{:__aliases__, meta, segments}`. A leading alias segment contributes its atom;
   # a leading non-alias base (e.g. `foo.Bar`) contributes its lowered AST as the first segment.
-  # (Alias segment atoms are not gated by `existing_atoms_only` — module names are a controlled
-  # namespace, not arbitrary user atoms.)
+  # Alias segment atoms ARE gated by `existing_atoms_only` — the oracle rejects a fresh module name
+  # too — so a segment that would mint a new atom yields an error node + `:nonexistent_atom`.
   defp lower_alias([first | rest], view, opts, acc, nid) do
-    rest_atoms =
-      Enum.map(rest, fn leaf -> String.to_atom(Tokens.value(view, CST.token_index(leaf))) end)
-
     meta = error_meta(first, view)
 
     if CST.tag(first) == :token and Tokens.kind(view, CST.token_index(first)) == :alias do
-      seg0 = String.to_atom(Tokens.value(view, CST.token_index(first)))
-      {{:__aliases__, meta, [seg0 | rest_atoms]}, acc, nid}
+      build_alias([first | rest], meta, view, opts, acc, nid)
     else
       {base_ast, acc, nid} = lower(first, view, opts, acc, nid)
-      {{:__aliases__, meta, [base_ast | rest_atoms]}, acc, nid}
+
+      case seg_atoms(rest, view, opts) do
+        {:ok, atoms} -> {{:__aliases__, meta, [base_ast | atoms]}, acc, nid}
+        {:error, leaf} -> alias_seg_error(leaf, view, acc, nid)
+      end
     end
   end
+
+  defp build_alias(leaves, meta, view, opts, acc, nid) do
+    case seg_atoms(leaves, view, opts) do
+      {:ok, atoms} -> {{:__aliases__, meta, atoms}, acc, nid}
+      {:error, leaf} -> alias_seg_error(leaf, view, acc, nid)
+    end
+  end
+
+  # Atomize every alias segment through the gated policy; the first that fails (a fresh atom under
+  # `existing_atoms_only`, or invalid UTF-8) short-circuits to `{:error, that_leaf}`.
+  defp seg_atoms(leaves, view, opts) do
+    Enum.reduce_while(leaves, {:ok, []}, fn leaf, {:ok, atoms} ->
+      case to_atom(Tokens.value(view, CST.token_index(leaf)), opts) do
+        {:ok, atom} -> {:cont, {:ok, [atom | atoms]}}
+        :error -> {:halt, {:error, leaf}}
+      end
+    end)
+    |> case do
+      {:ok, rev} -> {:ok, :lists.reverse(rev)}
+      err -> err
+    end
+  end
+
+  defp alias_seg_error(leaf, view, acc, nid),
+    do: nonexistent_atom(leaf, view, Tokens.value(view, CST.token_index(leaf)), acc, nid)
 
   # `a.b` / `a.b(args)` => `{{:., m, [base, name]}, m, args}` (zero-arg form is just `args = []`).
   defp lower_remote_call([base, name_leaf | arg_children], view, opts, acc, nid) do
@@ -519,7 +710,7 @@ defmodule Toxic2.Lower do
     idx = CST.token_index(name_leaf)
     meta = tmeta(view, idx)
 
-    case to_atom(Tokens.value(view, idx), opts) do
+    case member_atom(Tokens.kind(view, idx), Tokens.value(view, idx), opts) do
       {:ok, name} -> {{{:., meta, [base_ast, name]}, meta, args}, acc, nid}
       :error -> name_error(name_leaf, view, acc, nid)
     end
@@ -550,14 +741,28 @@ defmodule Toxic2.Lower do
       {{:__error__, [], %{diag_ids: [id]}}, acc, nid}
     else
       bin = parts |> Enum.map(fn {:frag, b} -> b end) |> IO.iodata_to_binary()
-      {{{:., [], [base_ast, String.to_atom(bin)]}, [], args}, acc, nid}
+
+      case to_atom(bin, opts) do
+        {:ok, name} -> {{{:., [], [base_ast, name]}, [], args}, acc, nid}
+        :error -> name_error(name_node, view, acc, nid)
+      end
     end
   end
+
+  # The atom for a remote-call member. Identifiers carry a binary name (atom policy applies);
+  # reserved-word members (`a.true`, `a.when`, `a.do`) carry the atom in the token itself — the
+  # value for word operators / `:literal` / block labels, or the kind for `do`/`end`/`fn`.
+  defp member_atom(:identifier, value, opts), do: to_atom(value, opts)
+  defp member_atom(:literal, value, _opts), do: {:ok, value}
+  defp member_atom(kind, nil, _opts) when kind in [:do, :end, :fn], do: {:ok, kind}
+  defp member_atom(_kind, value, _opts) when is_atom(value), do: {:ok, value}
 
   # `a.(args)` => `{{:., m, [base]}, m, args}`.
   defp lower_anon_call([base | arg_children], view, opts, acc, nid) do
     {base_ast, acc, nid} = lower(base, view, opts, acc, nid)
-    {args, acc, nid} = lower_args(arg_children, view, opts, acc, nid)
+
+    # `lower_call_args` (not `lower_args`) so a trailing do-block becomes `[do: …]` — `f.() do … end`.
+    {args, acc, nid} = lower_call_args(arg_children, view, opts, acc, nid)
     meta = error_meta(base, view)
     {{{:., meta, [base_ast]}, meta, args}, acc, nid}
   end
@@ -587,16 +792,61 @@ defmodule Toxic2.Lower do
     kw_key(CST.tag(key), key, v, view, opts, acc, nid)
   end
 
-  defp kw_key(:token, key_leaf, v, view, _opts, acc, nid),
-    do: {{String.to_atom(Tokens.value(view, CST.token_index(key_leaf))), v}, acc, nid}
+  defp kw_key(:token, key_leaf, v, view, opts, acc, nid) do
+    idx = CST.token_index(key_leaf)
+
+    case to_atom(Tokens.value(view, idx), opts) do
+      :error ->
+        {err, acc, nid} = nonexistent_atom(key_leaf, view, Tokens.value(view, idx), acc, nid)
+        {{err, v}, acc, nid}
+
+      {:ok, atom} ->
+        case opts.literal_encoder do
+          nil ->
+            {{atom, v}, acc, nid}
+
+          enc ->
+            # A keyword key is a literal atom; Elixir tags its meta `format: :keyword` and the
+            # encoded key turns the `k: v` shorthand into an explicit `{encoded_key, v}` pair.
+            span = Tokens.span(view, idx)
+            meta = [{:format, :keyword} | literal_meta(span, opts)]
+            {key_ast, acc, nid} = run_encoder_meta(enc, atom, meta, span, acc, nid)
+            {{key_ast, v}, acc, nid}
+        end
+    end
+  end
 
   # A quoted kw key (`"foo": v`) atomizes like a quoted atom: no interpolation => the atom; with
   # interpolation => the `binary_to_atom` construction (so the pair is `{key_expr, v}`).
   defp kw_key(:node, key_node, v, view, opts, acc, nid) do
     {parts, acc, nid} = quoted_parts_ast(CST.children(key_node), view, opts, acc, nid)
     {key_ast, acc, nid} = build_quoted_atom(parts, key_node, view, opts, acc, nid)
+    {key_ast, acc, nid} = encode_quoted_kw_key(key_ast, key_node, opts, acc, nid)
     {{key_ast, v}, acc, nid}
   end
+
+  # A static quoted kw key (`"foo": v`) lowers to a bare atom — encode it like a plain kw key. An
+  # interpolated key (`"#{x}": v`) is a `binary_to_atom` construction (not an atom), left as-is.
+  defp encode_quoted_kw_key(atom, key_node, opts, acc, nid) when is_atom(atom) do
+    case opts.literal_encoder do
+      nil ->
+        {atom, acc, nid}
+
+      enc ->
+        span = CST.span(key_node)
+
+        run_encoder_meta(
+          enc,
+          atom,
+          [{:format, :keyword} | literal_meta(span, opts)],
+          span,
+          acc,
+          nid
+        )
+    end
+  end
+
+  defp encode_quoted_kw_key(other, _key_node, _opts, acc, nid), do: {other, acc, nid}
 
   # Call arguments: a trailing run of keyword pairs is collected into one keyword-list arg
   # (`f(1, a: 2)` => `[1, [a: 2]]`); regular args lower normally.
@@ -656,12 +906,24 @@ defmodule Toxic2.Lower do
 
   defp lower_section({:node, :do_section, _sp, [label_leaf, body], _f, _d}, view, opts, acc, nid) do
     {b, acc, nid} = lower_section_body(body, view, opts, acc, nid)
-    {{section_label(label_leaf, view), b}, acc, nid}
+    {key, acc, nid} = section_label(label_leaf, view, opts, acc, nid)
+    {{key, b}, acc, nid}
   end
 
-  defp section_label(label_leaf, view) do
+  # The `do:`/`else:`/`rescue:`/… key of a do-block. It is a literal atom too, so under a literal
+  # encoder it gets encoded (plain `line:`/`column:` meta — Elixir does NOT tag these `:keyword`).
+  defp section_label(label_leaf, view, opts, acc, nid) do
     idx = CST.token_index(label_leaf)
-    if Tokens.kind(view, idx) == :do, do: :do, else: Tokens.value(view, idx)
+    atom = if Tokens.kind(view, idx) == :do, do: :do, else: Tokens.value(view, idx)
+
+    case opts.literal_encoder do
+      nil ->
+        {atom, acc, nid}
+
+      enc ->
+        span = Tokens.span(view, idx)
+        run_encoder_meta(enc, atom, literal_meta(span, opts), span, acc, nid)
+    end
   end
 
   # A `:do_body` lowers like a block (nil / expr / __block__); `:do_clauses` lowers to a list of
@@ -673,9 +935,15 @@ defmodule Toxic2.Lower do
     case stmts do
       # An empty section body is `{:__block__, [], []}` (`foo do end` => `[do: {:__block__,[],[]}]`),
       # NOT nil — Elixir distinguishes an empty block from a missing one.
-      [] -> {{:__block__, [], []}, acc, nid}
-      [one] -> lower(one, view, opts, acc, nid)
-      many -> wrap_block(lower_each(many, view, opts, acc, nid))
+      [] ->
+        {{:__block__, [], []}, acc, nid}
+
+      [one] ->
+        {ast, acc, nid} = lower(one, view, opts, acc, nid)
+        {wrap_splice(ast), acc, nid}
+
+      many ->
+        wrap_block(lower_each(many, view, opts, acc, nid))
     end
   end
 
@@ -714,31 +982,50 @@ defmodule Toxic2.Lower do
   end
 
   # Stab clause head -> the arg list. A `when` guard wraps the patterns: `[{:when, [], [pats, g]}]`.
+  # A trailing keyword run in the patterns is grouped into one keyword-list arg (`fn x, a: 1 -> …`
+  # => `[x, [a: 1]]`), matching call/list args; the guard (always last) stays a separate element.
   defp lower_stab_args(args_node, view, opts, acc, nid) do
     case CST.children(args_node) do
       [{:node, :stab_when, _sp, when_ch, _f, _d}] ->
-        {parts, acc, nid} = lower_each(when_ch, view, opts, acc, nid)
-        {[{:when, [], parts}], acc, nid}
+        {pats, [guard]} = Enum.split(when_ch, length(when_ch) - 1)
+
+        # `fn () when g -> …`: an empty parenthesised head is ZERO patterns, so `when` wraps just
+        # the guard (`{:when, [], [g]}`), mirroring the bare `fn () -> …` => `[]` case below.
+        {pat_asts, acc, nid} = lower_args(strip_empty_paren_head(pats), view, opts, acc, nid)
+        {guard_ast, acc, nid} = lower(guard, view, opts, acc, nid)
+        {[{:when, [], Enum.concat(pat_asts, [guard_ast])}], acc, nid}
 
       # `fn () -> ... end`: an empty parenthesised head is ZERO args (`[]`), not one block arg.
       [{:node, :paren, _sp, [], _f, _d}] ->
         {[], acc, nid}
 
       children ->
-        lower_each(children, view, opts, acc, nid)
+        lower_args(children, view, opts, acc, nid)
     end
   end
 
   # Stab clause body -> nil (empty), the expression (one), or a `__block__` (many).
   defp lower_stab_body(body_node, view, opts, acc, nid) do
     case CST.children(body_node) do
-      [] -> {nil, acc, nid}
-      [one] -> lower(one, view, opts, acc, nid)
-      many -> wrap_block(lower_each(many, view, opts, acc, nid))
+      [] ->
+        {nil, acc, nid}
+
+      [one] ->
+        {ast, acc, nid} = lower(one, view, opts, acc, nid)
+        {wrap_splice(ast), acc, nid}
+
+      many ->
+        wrap_block(lower_each(many, view, opts, acc, nid))
     end
   end
 
   defp wrap_block({asts, acc, nid}), do: {{:__block__, [], asts}, acc, nid}
+
+  # `unquote_splicing(x)` as the SOLE statement of a block / paren / clause body is wrapped in a
+  # `__block__` (it is only valid in a list/block context) — `(unquote_splicing(x))` => `{:__block__,
+  # [], [it]}`. As a list element (`[unquote_splicing(x)]`) it is NOT wrapped (a different path).
+  defp wrap_splice({:unquote_splicing, _, _} = ast), do: {:__block__, [], [ast]}
+  defp wrap_splice(ast), do: ast
 
   # `a not in b` => `{:not, [], [{:in, [], [a, b]}]}` (the canonical Elixir shape; the rewrite
   # lives here, not in the parser — P5).
@@ -786,10 +1073,13 @@ defmodule Toxic2.Lower do
 
   defp name_span(cst, view), do: Tokens.span(view, CST.token_index(cst)) || {1, 1, 1, 1}
 
+  # Read the start line/col straight off the token tuple. Going through `Tokens.span/2` allocated a
+  # throwaway `{sl,sc,el,ec}` per node just to drop `el,ec` — tprof flagged it as ~quarter of all
+  # `Token.span` calls in lowering.
   defp tmeta(view, idx) do
-    case Tokens.span(view, idx) do
-      {sl, sc, _el, _ec} -> [line: sl, column: sc]
-      nil -> []
+    case Tokens.token(view, idx) do
+      {_kind, sl, sc, _el, _ec, _v} -> [line: sl, column: sc]
+      :eof -> []
     end
   end
 
@@ -797,12 +1087,20 @@ defmodule Toxic2.Lower do
   defp span_meta(_), do: []
 
   defp to_atom(bin, opts) do
-    if Keyword.get(opts, :existing_atoms_only, false) do
+    if opts.existing_atoms_only do
       {:ok, String.to_existing_atom(bin)}
     else
       {:ok, String.to_atom(bin)}
     end
   rescue
     ArgumentError -> :error
+  end
+
+  # Totality helper (P5): `String.to_charlist` RAISES on invalid UTF-8, but a tolerant lexer/parser
+  # may carry truncated bytes (`'<bad utf8>'`). Charlists don't touch the atom table, so a
+  # non-raising best-effort (raw byte list) is fine; atom names instead route through the gated
+  # `to_atom/2` (which returns `:error` rather than minting on bad input).
+  defp safe_to_charlist(bin) when is_binary(bin) do
+    if String.valid?(bin), do: String.to_charlist(bin), else: :erlang.binary_to_list(bin)
   end
 end

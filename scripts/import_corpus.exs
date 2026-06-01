@@ -116,7 +116,16 @@ parser_files = [
   {tp.("conformance_test.exs"), "conformance", [:assert_conforms], false},
   {tp.("conformance_large_test.exs"), "large", [], true},
   {tp.("operators_test.exs"), "operators", [], true},
-  {tp.("elixir_source_repros_test.exs"), "repros", [:assert_conforms], true}
+  {tp.("elixir_source_repros_test.exs"), "repros", [:assert_conforms], true},
+  # Warning suites: we don't emit warnings, but every snippet is still a valid parser exercise
+  # (the oracle is the arbiter). Only the parser-level `assert_warning_conforms` snippets here;
+  # the lexer-level helpers are harvested into the lexer corpus below.
+  {tp.("warnings_test.exs"), "warnings", [:assert_warning_conforms], false},
+  # Phase 12: the SHRUNK property-test counterexamples recorded by the old toxic_parser — the
+  # `code = "…"` repros that its generative tests found and pinned. These are the highest-signal
+  # adversarial inputs (operator/precedence/do-block corner cases) and the core phase-12 fixtures.
+  {tp.("repro_test.exs"), "shrunk_repros", [:assert_conforms], true},
+  {tp.("tuple_keyword_merge_regression_test.exs"), "shrunk_repros", [], true}
 ]
 
 parser_raw =
@@ -126,11 +135,21 @@ parser_raw =
 
 parser = Enum.uniq_by(parser_raw, fn {s, _l, _g} -> s end)
 
+# Lexer corpus: the valid_code suite plus the lexer-level warning snippets from both repos
+# (`assert_lexer_warning_conforms` in toxic_parser, `tokenize_and_compare_warning` in toxic) —
+# again input-only, the oracle decides conformance.
+lexer_files = [
+  {tp.("../../toxic/test/toxic/valid_code_test.exs"), "valid_code", [:tokenize]},
+  {tp.("warnings_test.exs"), "warnings", [:assert_lexer_warning_conforms]},
+  {tp.("../../toxic/test/toxic/warnings_test.exs"), "warnings", [:tokenize_and_compare_warning]}
+]
+
 lexer =
-  collect.(tp.("../../toxic/test/toxic/valid_code_test.exs"), [:tokenize], false)
+  Enum.flat_map(lexer_files, fn {path, ftag, calls} ->
+    collect.(path, calls, false) |> Enum.map(fn {s, l, g} -> {s, l, "#{ftag}: #{g}"} end)
+  end)
   |> Enum.sort_by(fn {_s, l, _g} -> l end)
   |> Enum.uniq_by(fn {s, _l, _g} -> s end)
-  |> Enum.map(fn {s, l, g} -> {s, l, "valid_code: #{g}"} end)
 
 # `group` is "file: describe"; tags = [:imported, file_slug, group_slug] for flexible bucketing.
 render = fn module, source_desc, entries ->

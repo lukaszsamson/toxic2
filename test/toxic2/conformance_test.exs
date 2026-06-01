@@ -23,4 +23,18 @@ defmodule Toxic2.ConformanceTest do
       end
     end
   end
+
+  describe "evaluate/1 is total even when the oracle is not" do
+    # `Code.string_to_quoted/2` RAISES on invalid UTF-8; the evaluator must classify that as
+    # invalid input (via `compare_invalid/1`) rather than propagate the crash.
+    @invalid_utf8 [<<":\"", 255, "\"">>, <<206, 177, 206>>, <<?', 255, ?'>>]
+
+    for src <- @invalid_utf8 do
+      test "does not raise on #{inspect(src)}" do
+        status = Harness.evaluate(unquote(src))
+        assert status in [:ok_invalid, :unexpected_valid]
+        refute match?({:crash, _}, status)
+      end
+    end
+  end
 end

@@ -24,11 +24,14 @@ defmodule Mix.Tasks.Toxic2.Guard do
   - `Macro.to_string` — lossy AST→string comparison must not live in the library
     (it normalizes away real structural differences; see R_OPUS §10.5).
 
-  Forbidden in **all library core** (`lib/**` except the harness Mix tasks):
+  Forbidden in **all library core** (`lib/**` except the harness Mix tasks and the vendored
+  Unicode tables in `lib/toxic2/unicode/`):
 
   - `++` — no list append on the hot path; build reversed and reverse once (Performance rules).
     All of library core is treated as hot so a new parser/cursor module can't silently escape
-    the ban; a legitimate boundary append uses a trailing `# guard:allow`.
+    the ban; a legitimate boundary append uses a trailing `# guard:allow`. The vendored
+    `String.Tokenizer` port under `lib/toxic2/unicode/` is exempt wholesale: it is
+    machine-generated compile-time table construction kept byte-faithful to upstream Elixir.
 
   Forbidden in **test files**:
 
@@ -69,9 +72,7 @@ defmodule Mix.Tasks.Toxic2.Guard do
 
   @impl true
   def run(_args) do
-    # Library core = everything under lib/ except the harness Mix tasks (tooling).
-    lib = Path.wildcard("lib/**/*.ex") |> Enum.reject(&String.contains?(&1, "lib/mix/"))
-    paths = lib ++ Path.wildcard("test/**/*.exs")
+    paths = scanned_paths()
 
     case violations(paths) do
       [] ->
@@ -96,6 +97,24 @@ defmodule Mix.Tasks.Toxic2.Guard do
             "\n\nSee `mix help toxic2.guard`. Legitimate exceptions: trailing `#{@allow_marker}`."
         )
     end
+  end
+
+  @doc """
+  The exact set of files the guard scans: all library core (`lib/**`) except the harness Mix
+  tasks (tooling) and the vendored, machine-generated Unicode tables (`lib/toxic2/unicode/` —
+  ported wholesale from Elixir's `String.Tokenizer`; its compile-time `++` table-building is data
+  generation, not hot-path hand-written code, and we keep it byte-faithful rather than annotate
+  every line), plus all test files. Exposed so the self-test scans precisely what `run/0` does.
+  """
+  @spec scanned_paths() :: [Path.t()]
+  def scanned_paths do
+    lib =
+      Path.wildcard("lib/**/*.ex")
+      |> Enum.reject(
+        &(String.contains?(&1, "lib/mix/") or String.contains?(&1, "lib/toxic2/unicode/"))
+      )
+
+    Enum.concat(lib, Path.wildcard("test/**/*.exs"))
   end
 
   @doc """

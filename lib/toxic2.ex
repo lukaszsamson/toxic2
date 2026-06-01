@@ -30,6 +30,19 @@ defmodule Toxic2 do
   Full pipeline: tokenize → parse → lower. Returns `{ast, diagnostics}` where `ast` is the
   Elixir AST (exact for valid code in the supported grammar subset, best-effort with
   `{:__error__, ...}` nodes otherwise) and `diagnostics` is the combined source-ordered stream.
+
+  Options:
+
+    * `:existing_atoms_only` — atomize source names with `String.to_existing_atom/1` (tolerant of
+      untrusted input; missing atoms become `{:__error__, ...}` with a lowerer diagnostic).
+    * `:range` (default `false`) — attach `range: {{start_line, start_col}, {end_line, end_col}}`
+      (end exclusive) to every AST node that corresponds to source, alongside the usual
+      `line:`/`column:` anchor. Macro-generated nodes (interpolation's `Kernel.to_string`/`::`,
+      a sigil's inner `<<>>`, …) carry no range. A parent's range always contains every child's.
+    * `:literal_encoder` — `fn value, meta -> {:ok, ast} | {:error, reason} end`, called for each
+      literal (integers, floats, atoms, strings, charlists, `true`/`false`/`nil`, list and 2-tuple
+      containers, keyword keys) so bare literals — which have no metadata slot in the AST — can be
+      wrapped to carry position info. Elixir-compatible; combine with `:range` for literal ranges.
   """
   @spec parse_to_ast(binary(), keyword()) :: {Macro.t(), [Toxic2.Diagnostic.t()]}
   def parse_to_ast(source, opts \\ []) when is_binary(source) do

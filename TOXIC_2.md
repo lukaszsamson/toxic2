@@ -587,9 +587,157 @@ phase 6 onward each phase also ends green under `toxic2.conformance --gate` and 
     indentation stripped lexically against the closing delimiter's column (pre-scanned, skipping
     `#{…}`), sharing string/charlist lowering; sigil heredocs (`~s"""…"""`) reuse it in raw mode
     with `:sigil_end` modifiers. All verified against the live oracle.)**
-11. Parser-only recovery + invalid-code property harness.
-12. Port old property failures as permanent fixtures.
-13. Benchmark; remove hot-path allocations before broadening features.
+11. Parser-only recovery + invalid-code property harness. **(DONE —
+    `test/toxic2/recovery_property_test.exs`: the tolerant contract (P5) asserted over every
+    byte-prefix (truncation) and single-byte deletion of the whole curated corpus, structural-token
+    insertions at every position, and ~40k seeded random byte/ASCII strings — `tokenize` /
+    `parse_to_ast` never raise and always return tokens / `{ast, diagnostics}` (with
+    `existing_atoms_only` so the volume can't grow the atom table); plus a recovery assertion that
+    common truncations yield a best-effort AST + an `:error` diagnostic. The fuzz found and fixed
+    three real totality holes on invalid UTF-8: the vendored `String.Tokenizer.continue` (truncated
+    multibyte mid-identifier), charlist/atom lowering (`String.to_charlist`/`to_atom` raise on
+    invalid encoding → `safe_to_charlist`/`safe_to_atom`), and `Lexer.esc` (`\` before an invalid
+    byte). Totality re-verified across every prefix/deletion of the 294-package OSS corpus too.)**
+12. Port old property failures as permanent fixtures. **(DONE — the shrunk property-test
+    counterexamples recorded in toxic_parser's `repro_test.exs` (166 tests) +
+    `tuple_keyword_merge_regression_test.exs` are harvested by `scripts/import_corpus.exs` (ftag
+    `shrunk_repros`) into the imported parser corpus (4617 → 4830 sources), so every recorded
+    failure is a permanent, oracle-arbitrated fixture pinned by the forward-only freeze ratchet
+    (parser freeze 4500 → 4689). Porting them immediately surfaced TWO real precedence bugs, both
+    root-caused and fixed: (a) **unary/`@`-greedy with a do-block operand** — Elixir's `unary_op_eol
+    expr` for an UNMATCHED operand: a unary op (`not`/`!`/`+`/`-`/`@`/`&`/`~~~`/`...`) whose operand
+    ends in a `do…end` block captures the whole trailing operator chain (`not quote do x end || b`
+    => `not(quote(…) || b)`, `@foo try do 1 end..1//2` => `@(foo(try) do 1 end .. 1 // 2)`), while a
+    matched operand keeps the tight binding (`not a || b` => `(not a) || b`); fixed in `parse_unary`
+    by re-driving `led/8` at min-bp 0 when `has_do_block?(operand)`. (b) **a single leading `;` in a
+    stab body** is an empty (`nil`) first statement (`fn -> ;t end` => `__block__([nil, t])`); fixed
+    with a synthetic `:empty_stmt` CST node lowering to `nil`. Both pinned in the curated corpus.
+    The remaining ~140 backlog repros are deeply obscure fuzzer combinations (operators in fn-head
+    patterns like `fn r<-b ->` where `in_match_op` (40) sits below `when` (50); nested `@@x[access]`;
+    empty-string dot members `0.""R`; `%&0{}`) — tracked as forward-only imported backlog, the
+    architecture's sanctioned disposition for the long tail.)**
+13. Benchmark; remove hot-path allocations before broadening features. **(DONE — `mix toxic2.bench`
+    (`lib/mix/tasks/toxic2.bench.ex`): a dependency-free benchmark (`:timer.tc` + `:erlang`
+    GC stats, min-of-N passes) over a real oracle-valid corpus (default: the Elixir stdlib
+    `lib/elixir/lib`, 104 files / 3.2 MB), timing each stage (`tokenize`, `lex+parse→CST`,
+    `lex+parse+lower`, `oracle`) plus an allocation proxy and a `--top` slowest-files list. NOT in
+    `toxic2.check` (opt-in, slow). **Stable result: `t2_full` ≈ 1.85× the oracle wall-time, ≈ 1.41×
+    allocations** (steady across runs; the per-run oracle/full ratio is what's compared, the
+    absolute baseline drifts with machine load). **The early hypothesis (§ Performance Rules — "the
+    second [lower] pass is the main risk to 1.5×") is REFUTED:** lowering is only ~12–15 % of
+    `t2_full`, and the Pratt parser is *cheaper than yecc* (≈ 0.5× oracle over prebuilt views). The
+    real cost is the **lexer** — its single stage (~57 % of `t2_full`) alone slightly exceeds the
+    oracle's entire tokenize+parse+build-AST, because `:elixir_tokenizer` is exceptionally tuned.
+    No gross hot-path allocation was found to remove: the lexer/parser already obey every BEAM perf
+    rule (flat token 6-tuples, integer-index cursor, O(1) `List.to_tuple` view + prefix-sum eol
+    index, `binary_part` sub-binaries, reversed-list build, no `Enum`/`++` in hot loops), and
+    per-stage allocations are already at/below the oracle (lex 0.81×). The ≤1.5× target is thus a
+    **lexer-throughput** project (≈2× the tokenizer), not an allocation-bug fix — the explicit next
+    optimization focus "before broadening features", now measurable via the committed benchmark.
+
+    **Lexer profiled + optimized** (via `tprof` `call_memory` — `:tools` lives under the asdf
+    Erlang install but is off `mix run`'s code path; add it with `:code.add_path(.../tools-*/ebin)`,
+    no eprof/fprof needed since `call_memory` is exact under tracing). Hotspots, in order:
+    `read_heredoc`/`read_quoted` processed content ONE char at a time (`<<c>>`+cons per byte) —
+    19.6 % of all lexer allocation. Fixed with toxic's **ASCII-run fast path**: `plain_run_len/4`
+    scans a maximal run of ordinary printable-ASCII content (32..127, excluding `\`/`#`/newline and,
+    for strings, the close quote) and slices it in ONE `binary_part` per run instead of per char.
+    Second: `read_name` re-sliced the rest with `rest_at` three times when `word_len/2` already
+    returns it — reused it (and in the identifier/alias clauses). Whitespace was investigated and
+    found ALREADY coalesced (indentation is consumed in `consume_eols` after a newline, so `lex/6`
+    is per-token not per-char) — the profile said leave it. **Net: lexer allocation 36.2M → 25.0M
+    words (−31 %), `read_heredoc` calls 1.30M → 75k, `rest_at` 651k → 180k; lexer wall-time 176 →
+    132 ms (1.06× → 0.84× the oracle — now FASTER than yecc's whole tokenize+parse), and `t2_full`
+    1.85× → 1.65×, allocations 1.41× → 1.17×.** Verified byte-exact vs the oracle on 105
+    heredoc/string-heavy files. The remaining lexer top (`lex/6`, 29 % — the token 6-tuples) is
+    irreducible; closing 1.65×→1.5× is now parser/lower work, not lexer.
+
+    **Parser/lower profiled + optimized** (`tprof` `call_memory` over prebuilt views, so the
+    lexer's already-done work is excluded). Top wastes: (1) `Lower.tmeta/2` built a full
+    `{sl,sc,el,ec}` span via `Tokens.span` only to keep `line`/`column` — read the token tuple
+    directly instead (≈¼ of all `Token.span` calls gone). (2) The three post-prefix combinators in
+    the hot `parse_expr` (`postfix`, `maybe_no_parens`, `maybe_do_block`) each returned a fresh
+    `{lhs, i, diags, nid, fuel}` state tuple EVEN ON NO-OP. Gated `maybe_no_parens` and
+    `maybe_do_block` by their exact entry predicate (`np_callee? and np_arg_start?`; a `do` ahead and
+    not `:no_parens_arg`) and tail-call onward unchanged when they won't fire — no tuple allocated in
+    the common case. `postfix` was left unguarded: it loops internally and fires on every paren call,
+    so guarding only double-evaluates its predicate (measured regression — reverted). **Net:
+    parser+lower allocation 22.1M → 19.4M words (−12 %); combined with the lexer pass, `t2_full`
+    allocations 1.41× → 1.10× oracle and wall-time ≈1.85× → ≈1.55–1.7× depending on machine load
+    (t2_full itself is stable ~253–260 ms vs the lexer-pass 306 ms; the ratio wobbles because the
+    oracle baseline drifts).** **The ≤1.5× wall-time target is NOT yet met — this phase is the
+    allocation/structure pass (1.41× → 1.10× allocations is the durable win); closing the last
+    ~0.1–0.2× of wall-time remains open** (the residue is structural — CST node 6-tuples, the
+    necessary `[line:, column:]` AST meta, node spans, and the state tuples for combinators that DO
+    fire — so further gains need a representation change, e.g. a leaner threaded-state record, not
+    incremental tweaks). 768 tests green, 105/105 byte-exact vs the oracle.)**
+
+    **Perf pass 3 (review-driven correction + incremental wins).** A reviewer showed the "≈1.52–1.55×
+    / at target" claim was too optimistic — the committed tree measures ~1.55–1.7× (median, load-
+    dependent), still ABOVE 1.5×. (1) **Benchmark rebuilt for credibility**: `reps` interleaved rounds,
+    a fresh process per stage (warm-up discarded), shuffled stage order, and median + p95 + min (not
+    just min); `--json`; the headline now states the target is NOT met and the allocation column is
+    called out as the stable comparison. (2) **Lexer**: fused operator/keyword-key detection so the
+    operator table is matched ONCE per token (was twice — `op_kw_len`→`op_atom_len`→`match_op`, then
+    `lex_operator`→`match_op`), with a `//`-exclusion + `<<>>:`/`..//:` special-case; `read_atom_name`
+    now reuses the rest `atom_word_len` already returns (was 2 extra `rest_at` slices). (3) **Parser
+    span plumbing**: `Token.span/1` was ~5 % of full-pipeline allocation — added `merge_tt`/`merge_ct`/
+    `merge_tc` that read token/node coords inline and build ONE span tuple, replacing the 37
+    `merge(tok_span/cst_span, …)` sites that built throwaway intermediates. **Net: `Token.span` calls
+    477k → 292k, `merge/2` words 783k → 255k, full-pipeline allocation ~49.8M → ~48.6M words, t2_full
+    allocations 1.10× → 1.08× oracle; wall-time ~1.55× (still above 1.5×).** Deliberately deferred (the
+    reviewer's optional/larger items): a `metadata: false | :line | :line_column` fast-mode (removes
+    the `[line:, column:]` allocation floor for meta-less consumers, but needs broad `opts` threading
+    through every meta builder and does NOT help the default oracle comparison, which also carries
+    meta), and flattening CST node span tuples into node fields / token indices (attacks `CST.node/5`
+    + span allocation but is broad churn needing strong tests). 791 tests green.
+
+    **Perf pass 4 (A/B-measured inlining).** With the tree honest at ~1.56× / 1.08× alloc, further
+    gains are incremental → A/B only. Normalizer: the `t2_full / oracle` ratio (oracle measured in the
+    same interleaved run cancels load drift). Baseline over 3×`--reps 20`: median 1.569 (band
+    1.557–1.580). Added NARROW `@compile {:inline, …}` for tiny LOCAL hot helpers only — lexer
+    (`rest_at`, `kw_suffix`, `kw_colon?`, `match_op`, `lookup_op`, `reserved_token`), parser span
+    builders (`merge`/`merge_tt`/`merge_ct`/`merge_tc`), lower meta builders (`tmeta`, `op_atom`,
+    `op_meta`, `span_meta`). Recursive scanners (`lex/6`, `word_len`, `read_name`, `consume_eols`,
+    `plain_run_len`) and big multi-branch routines deliberately NOT inlined (code growth / i-cache).
+    Caveat honored: cross-module calls (e.g. `Tokens.*` from the parser) are unaffected by a callee-
+    module `@compile :inline`. **Measured: median 1.569 → 1.544 (band 1.537–1.565, now BELOW the
+    baseline band) — a real ~1.6 % win, no regression, 791 tests green.** Still ABOVE 1.5×; the
+    reviewer's read holds — crossing it needs inlining PLUS a representation/path cleanup (metadata
+    fast-mode or CST span/state flattening), not more micro-tweaks.
+
+    **Perf pass 5 (the two path cleanups, A/B-measured).** (#4) `match_op` rewritten from
+    `binary_part`+`@op_table` map lookups (a throwaway sub-binary per length tried) into direct
+    binary-prefix clauses GENERATED from `@op_table` (longest-first), zero-allocation byte matching;
+    `lookup_op` deleted, `@op_table` kept as the codegen source. (#3) `Tokens.from_list/1` builds the
+    cumulative-eol prefix FORWARD in one body-recursive pass (no `Enum.reduce`-reversed list +
+    `:lists.reverse` intermediate). **Measured (median `t2_full/oracle` over reps-20 runs, ratio
+    normalizes load): 1.541 → 1.517; t2_lex 0.748 → 0.689 (−8 %, #4 the bulk); full-pipeline
+    allocation 1.08× → 1.04× oracle (lexer alloc −5 %, from_list reverse-list gone).** So across this
+    session (inlining + #3 + #4): ~1.56× → **~1.517×** (occasional runs dip <1.5×; not RELIABLY under
+    target) and alloc 1.082× → **1.04×**; the lexer is now ~45 % of `t2_full` (was ~50 %). Note:
+    `eol_prefix`/`eol_between?` turned out to be UNUSED dead infrastructure (defensive O(1) guardrail
+    the parser never calls) — kept per the spec's intent but flagged as a lazy/removal candidate.
+    791 tests green. Remaining toward 1.5× is the metadata fast-mode (semantic) / CST flatten (churn).
+
+    **Perf pass 6 — UNDER the target (cross-module call elimination, A/B-measured).** The call-count
+    profile showed the real hot path was repeated CROSS-MODULE calls (which `@compile :inline` can't
+    touch), not per-call work: `Tokens.kind/2` was **12 % of ALL calls** (4.03M), `lists:keyfind/3`
+    4 %, plus `Tokens.prefix/2` building a dead index. Four changes: (1) **parser-LOCAL inlined token
+    reads** `tk`/`tv`/`tt`/`t_eof?` over the view tuple, replacing the 104 `Tokens.kind/value/token/
+    at_eof?` sites → `Tokens.kind` 4.03M → 125k calls; (2) **removed the eol-prefix index** —
+    `eol_between?/3` (its only consumer, parser-unused) now scans on demand, the view drops to
+    `{toks, size}`, killing the per-parse `prefix`/`eol_inc` build; (3) **resolved `opts` once** into
+    a compact map threaded through lowering (`opts.range`/`.literal_encoder`/`.existing_atoms_only`
+    instead of `Keyword.get` keyfind per node); (4) **`CST.token/1` no-opts fast path** — the parser
+    builds token leaves with no options, so skip the `Keyword.get` flag decoding that turned out to be
+    the DOMINANT keyfind source (~800k). **Measured (median `t2_full/oracle`, reps-20): 1.503 → 1.381
+    (1.341–1.410 band, RELIABLY <1.5× across 5 runs); t2_parse 1.182 → 1.097; full-pipeline
+    allocation 1.046× → ≈1.01× oracle (near parity, 346.6 → 336.1 MB).** So the ≤1.5× wall-time target
+    is now MET on this corpus/machine without the semantic (metadata-mode) or high-churn (CST-flatten)
+    levers — pure cross-module-call + dead-code elimination. 791 tests green, all gates clean. The
+    next hotspots are now `lex/6` token tuples (~18 % alloc) and the per-byte scanners — both
+    inherent; further gains would need the representation change, with shrinking returns.)**
 
 ---
 
