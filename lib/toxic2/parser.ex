@@ -42,8 +42,14 @@ defmodule Toxic2.Parser do
   Chained/double-parens calls `f(a)(b)` / `a.b()()` are handled with Elixir's "at most two paren
   groups per base" rule (a third, or a call on an alias/access/container, is an error).
 
-  Not yet handled (later islands): quoted keyword keys, operator-named atoms, unicode
-  identifiers. Encountering those yields error/leaf nodes rather than crashing.
+  Also: multi-statement parens `(a; b)` => block; maps/structs with bare-expression entries
+  (`%{x}`, `%Foo{x}`); struct bases beyond aliases (`%mod{}`, `%nil{}`, spaced `% (){}`);
+  dot-quoted remote calls (`a."foo"`); quoted keyword keys (`"foo": 1`); a no-parens-call keyword
+  value must be last (`f(a: g b, c)` rejected); `&` capture; `..//` step range.
+
+  Not yet handled (later islands): **unicode identifiers/atoms** (needs Unicode XID classification
+  + NFC normalisation) and **operator-named keyword keys** (`<<>>: 1`). Encountering those yields
+  error/leaf nodes rather than crashing.
   """
 
   alias Toxic2.{CST, Diagnostics, LexError, Precedence, Tokens}

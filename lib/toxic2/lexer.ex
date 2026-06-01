@@ -13,7 +13,11 @@ defmodule Toxic2.Lexer do
   (`st`); see the note above `lex/6`. The same linear shape covers **charlists** `'...'`
   (`read_quoted`), **sigils** `~name<delim>...<delim>mods` (`read_sigil`, raw content + optional
   interpolation, trailing modifiers on `:sigil_end`), and **heredocs** `\"""`/`'''` (`read_heredoc`,
-  line-spanning with lexical indentation stripping), including sigil heredocs.
+  line-spanning with lexical indentation stripping), including sigil heredocs. Also: quoted atoms
+  (`:"..."` via a `:quoted_atom` marker), quoted keyword keys (`"foo":` via a `:kw_quote` marker),
+  operator-named atoms (`:<<>>`, `:%{}`, `:..//`), and `\`-newline line continuation in code.
+  Not yet lexed: **unicode identifiers/atoms** (needs Unicode XID + NFC) and **operator-named
+  keyword keys** (`<<>>: 1`).
 
   Architecture invariants this locks in:
 
