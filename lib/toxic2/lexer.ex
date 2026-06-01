@@ -293,8 +293,12 @@ defmodule Toxic2.Lexer do
   end
 
   defp lex(<<?:, rest::binary>> = bin, line, col, acc, w, st) do
-    case match_op(rest) do
-      {_kind, _value, oplen} ->
+    case op_atom_len(rest) do
+      nil ->
+        err = LexError.new(:unexpected_colon, %{})
+        cont(rest_at(bin, 1), {:error, line, col, line, col + 1, err}, acc, w, st)
+
+      oplen ->
         total = 1 + oplen
 
         cont(
@@ -304,10 +308,6 @@ defmodule Toxic2.Lexer do
           w,
           st
         )
-
-      nil ->
-        err = LexError.new(:unexpected_colon, %{})
-        cont(rest_at(bin, 1), {:error, line, col, line, col + 1, err}, acc, w, st)
     end
   end
 
@@ -410,6 +410,24 @@ defmodule Toxic2.Lexer do
   defp kw_suffix(_), do: :no
 
   # --- longest-match operator lookup -------------------------------------
+
+  # The operator-name length an atom may carry after `:`. Bracket/percent operators (`<<>>`,
+  # `%{}`, `{}`, `%`, `..//`) aren't in @op_table, so they're matched first (longest first); `//`
+  # alone is NOT a valid atom (`://` is rejected — `//` is only the range step); everything else
+  # falls back to the longest-match operator table (`:++`, `:when`, `:|>`, `:.`, ...).
+  defp op_atom_len(<<"<<>>", _::binary>>), do: 4
+  defp op_atom_len(<<"..//", _::binary>>), do: 4
+  defp op_atom_len(<<"%{}", _::binary>>), do: 3
+  defp op_atom_len(<<"{}", _::binary>>), do: 2
+  defp op_atom_len(<<"%", _::binary>>), do: 1
+  defp op_atom_len(<<?/, ?/, _::binary>>), do: nil
+
+  defp op_atom_len(rest) do
+    case match_op(rest) do
+      {_kind, _value, oplen} -> oplen
+      nil -> nil
+    end
+  end
 
   defp match_op(bin), do: lookup_op(bin, 3) || lookup_op(bin, 2) || lookup_op(bin, 1)
 

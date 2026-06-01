@@ -369,6 +369,14 @@ defmodule Toxic2.LexerTest do
                shapes(~S("abc))
     end
 
+    test "operator-named atoms (brackets/percent) lex as a single :atom" do
+      assert shapes(":<<>>") == [{:atom, "<<>>"}]
+      assert shapes(":%{}") == [{:atom, "%{}"}]
+      assert shapes(":..//") == [{:atom, "..//"}]
+      # `//` alone is not a valid atom (`://` rejected — // is only the range step)
+      assert [{:error, _} | _] = shapes("://")
+    end
+
     test "quoted atoms emit a :quoted_atom marker then the quoted-literal tokens" do
       assert shapes(":\"ab\"") == [
                {:quoted_atom, nil},

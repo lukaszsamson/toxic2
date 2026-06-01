@@ -156,6 +156,13 @@ defmodule Toxic2.Conformance.Corpus do
     {"~S\"\"\"\n  raw\#{x}\n  \"\"\"", [:heredoc]},
     {"foo(\"\"\"\nbar\n\"\"\")", [:heredoc]},
     {":foo", [:literal]},
+    # operator-named atoms (bracket/percent ops not in the op table)
+    {":<<>>", [:atom]},
+    {":%{}", [:atom]},
+    {":{}", [:atom]},
+    {":%", [:atom]},
+    {":..//", [:atom]},
+    {"[:<<>>, :%{}]", [:atom]},
     {"true", [:literal]},
     {"false", [:literal]},
     {"nil", [:literal]},
@@ -409,6 +416,7 @@ defmodule Toxic2.Conformance.Corpus do
     # commas/semicolons not allowed where they would need a tuple/call
     {"(a, b)", [:paren]},
     {"foo(a; b)", [:paren]},
+    {"://", [:atom]},
     # missing `end` / empty fn / leftover tokens in bodies (must not crash; emit diagnostics)
     {"if x do y", [:do_block]},
     {"foo do", [:do_block]},
