@@ -1238,17 +1238,17 @@ defmodule Toxic2.Parser do
            nil
          ), m, diags, nid, fuel}
 
+      # No `|` and no `=>`: a BARE first entry (`%{x}`, `%{1, 2}`). Continue with the rest.
       true ->
-        {id, diags, nid} =
-          Diagnostics.emit(diags, nid, :parser, :error, :expected_assoc, tok_span(t, jj), %{})
+        {entries, m, diags, nid, fuel} = map_rest(t, j, [key], false, diags, nid, fuel)
 
         {CST.node(
            :map,
-           merge(tok_span(t, span_start), tok_span(t, jj)),
-           [key, CST.missing(:"=>", jj, diag: id)],
+           merge(tok_span(t, span_start), tok_span(t, m - 1)),
+           entries,
            :matched,
            nil
-         ), jj, diags, nid, fuel}
+         ), m, diags, nid, fuel}
     end
   end
 
@@ -1302,16 +1302,9 @@ defmodule Toxic2.Parser do
         {CST.node(:assoc, merge(cst_span(t, key), cst_span(t, val)), [key, val], :matched, nil),
          k, diags, nid, fuel}
       else
-        {id, diags, nid} =
-          Diagnostics.emit(diags, nid, :parser, :error, :expected_assoc, tok_span(t, jj), %{})
-
-        {CST.node(
-           :assoc,
-           merge(cst_span(t, key), tok_span(t, jj)),
-           [key, CST.missing(:"=>", jj, diag: id)],
-           :matched,
-           nil
-         ), jj, diags, nid, fuel}
+        # A map entry without `=>` is a BARE expression (`%{x}`, `%{1, 2}`, `%{&0}`) — Elixir
+        # allows them freely (used in quoted/macro code). The expression IS the entry.
+        {key, j, diags, nid, fuel}
       end
     end
   end

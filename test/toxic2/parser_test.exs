@@ -218,6 +218,23 @@ defmodule Toxic2.ParserTest do
                Toxic2.parse_to_ast("%{m | k => v}")
     end
 
+    test "maps/structs accept bare-expression entries, mixed with => and kw" do
+      assert {{:%{}, _, [{:x, _, nil}]}, []} = Toxic2.parse_to_ast("%{x}")
+      assert {{:%{}, _, [{:x, _, nil}, {:y, _, nil}]}, []} = Toxic2.parse_to_ast("%{x, y}")
+
+      assert {{:%{}, _, [{{:x, _, nil}, 1}, {:y, _, nil}]}, []} =
+               Toxic2.parse_to_ast("%{x => 1, y}")
+
+      assert {{:%{}, _, [{:x, _, nil}, {:a, 1}]}, []} = Toxic2.parse_to_ast("%{x, a: 1}")
+
+      assert {{:%, _, [{:__aliases__, _, [:Foo]}, {:%{}, _, [{:x, _, nil}]}]}, []} =
+               Toxic2.parse_to_ast("%Foo{x}")
+
+      # a keyword that isn't last is still rejected
+      {_a, diags} = Toxic2.parse_to_ast("%{a: 1, x}")
+      assert Enum.any?(diags, &(elem(&1, 2) == :error))
+    end
+
     test "structs (incl. update)" do
       assert {{:%, _, [{:__aliases__, _, [:Foo]}, {:%{}, _, [a: 1]}]}, []} =
                Toxic2.parse_to_ast("%Foo{a: 1}")

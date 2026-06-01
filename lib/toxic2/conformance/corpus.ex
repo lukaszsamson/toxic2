@@ -250,6 +250,15 @@ defmodule Toxic2.Conformance.Corpus do
     {"%Foo{m | a: 1}", [:struct]},
     {"%Foo.Bar{x: 1}", [:struct]},
     {"%__MODULE__{}", [:struct]},
+    # maps/structs with bare expression entries (quoted/macro code), freely mixed with => and kw
+    {"%{x}", [:map]},
+    {"%{x, y}", [:map]},
+    {"%{1, 2}", [:map]},
+    {"%{x => 1, y}", [:map]},
+    {"%{x, a: 1}", [:map]},
+    {"%{&0}", [:map]},
+    {"%{x | y}", [:map]},
+    {"%Foo{x}", [:struct]},
     # bitstrings
     {"<<1, 2>>", [:bitstring]},
     {"<<>>", [:bitstring]},
@@ -385,6 +394,7 @@ defmodule Toxic2.Conformance.Corpus do
     {"%{a: 1, b => 2}", [:keyword]},
     {"%{m |}", [:map]},
     {"%Foo{m |}", [:struct]},
+    {"%{a: 1, x}", [:map]},
     {"{a: 1}", [:keyword]},
     {"{a: 1, b: 2}", [:keyword]},
     # `//` is only the range step: a non-range `//` is rejected (tolerant: an :error diagnostic)
