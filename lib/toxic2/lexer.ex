@@ -479,7 +479,9 @@ defmodule Toxic2.Lexer do
     if c == close_char(qk) do
       acc = flush_fragment(buf, fs, line, col, acc, frag_kind(qk))
       acc = [{end_kind(qk), line, col, line, col + 1, nil} | acc]
-      lex(rest, line, col + 1, acc, w, st)
+      # A `:` immediately after the close quote (not `::`) makes this a quoted keyword KEY
+      # (`"foo": 1`): emit a `:kw_quote` marker the parser pairs with the preceding literal.
+      maybe_kw_colon(rest, line, col + 1, acc, w, st)
     else
       read_quoted(rest, line, col + 1, [<<c::utf8>> | buf], fs, acc, w, st, qk)
     end
@@ -489,6 +491,17 @@ defmodule Toxic2.Lexer do
   defp read_quoted(<<byte, rest::binary>>, line, col, buf, fs, acc, w, st, qk) do
     read_quoted(rest, line, col + 1, [<<byte>> | buf], fs, acc, w, st, qk)
   end
+
+  defp maybe_kw_colon(<<?:, c, _::binary>> = rest, line, col, acc, w, st) when c != ?: do
+    tok = {:kw_quote, line, col, line, col + 1, nil}
+    lex(rest_at(rest, 1), line, col + 1, [tok | acc], w, st)
+  end
+
+  defp maybe_kw_colon(<<?:>>, line, col, acc, w, st) do
+    lex(<<>>, line, col + 1, [{:kw_quote, line, col, line, col + 1, nil} | acc], w, st)
+  end
+
+  defp maybe_kw_colon(rest, line, col, acc, w, st), do: lex(rest, line, col, acc, w, st)
 
   defp close_char(:dquote), do: ?"
   defp close_char(:charlist), do: ?'

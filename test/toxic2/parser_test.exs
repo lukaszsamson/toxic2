@@ -209,6 +209,16 @@ defmodule Toxic2.ParserTest do
                Toxic2.parse_to_ast("a.b.c")
     end
 
+    test "quoted keyword keys: \"foo\": v / 'bar': v / interpolated key" do
+      assert {[foo: 1], []} = Toxic2.parse_to_ast("[\"foo\": 1]")
+      assert {[bar: 2], []} = Toxic2.parse_to_ast("['bar': 2]")
+      assert {["a b": 1], []} = Toxic2.parse_to_ast("[\"a b\": 1]")
+      assert {{:%{}, _, [k: 1]}, []} = Toxic2.parse_to_ast("%{\"k\": 1}")
+
+      {ast, []} = Toxic2.parse_to_ast("[\"f\#{x}\": 1]")
+      assert [{{{:., _, [:erlang, :binary_to_atom]}, _, _}, 1}] = ast
+    end
+
     test "keyword pairs: inline in lists, collected as a trailing list in calls" do
       assert {[a: 1, b: 2], []} = Toxic2.parse_to_ast("[a: 1, b: 2]")
       assert {[1, {:a, 2}], []} = Toxic2.parse_to_ast("[1, a: 2]")

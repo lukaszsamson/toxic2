@@ -369,6 +369,25 @@ defmodule Toxic2.LexerTest do
                shapes(~S("abc))
     end
 
+    test "a quoted string immediately before `:` emits a :kw_quote marker (quoted kw key)" do
+      assert shapes("\"foo\": 1") == [
+               {:string_start, nil},
+               {:string_fragment, "foo"},
+               {:string_end, nil},
+               {:kw_quote, nil},
+               {:int, 1}
+             ]
+
+      # `::` after a string is the type operator, not a kw key
+      assert [
+               {:string_start, _},
+               {:string_fragment, "x"},
+               {:string_end, _},
+               {:type_op, :"::"} | _
+             ] =
+               shapes("\"x\"::y")
+    end
+
     test "operator-named atoms (brackets/percent) lex as a single :atom" do
       assert shapes(":<<>>") == [{:atom, "<<>>"}]
       assert shapes(":%{}") == [{:atom, "%{}"}]

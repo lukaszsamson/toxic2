@@ -577,9 +577,20 @@ defmodule Toxic2.Lower do
   end
 
   # A keyword pair `k: v` => `{key_atom, lowered_value}`. (Keyword key atoms are not gated.)
-  defp lower_kw_pair([key_leaf, val], view, opts, acc, nid) do
+  defp lower_kw_pair([key, val], view, opts, acc, nid) do
     {v, acc, nid} = lower(val, view, opts, acc, nid)
-    {{String.to_atom(Tokens.value(view, CST.token_index(key_leaf))), v}, acc, nid}
+    kw_key(CST.tag(key), key, v, view, opts, acc, nid)
+  end
+
+  defp kw_key(:token, key_leaf, v, view, _opts, acc, nid),
+    do: {{String.to_atom(Tokens.value(view, CST.token_index(key_leaf))), v}, acc, nid}
+
+  # A quoted kw key (`"foo": v`) atomizes like a quoted atom: no interpolation => the atom; with
+  # interpolation => the `binary_to_atom` construction (so the pair is `{key_expr, v}`).
+  defp kw_key(:node, key_node, v, view, opts, acc, nid) do
+    {parts, acc, nid} = quoted_parts_ast(CST.children(key_node), view, opts, acc, nid)
+    {key_ast, acc, nid} = build_quoted_atom(parts, key_node, view, opts, acc, nid)
+    {{key_ast, v}, acc, nid}
   end
 
   # Call arguments: a trailing run of keyword pairs is collected into one keyword-list arg

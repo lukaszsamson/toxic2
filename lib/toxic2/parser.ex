@@ -243,7 +243,15 @@ defmodule Toxic2.Parser do
       {node, j, true, diags, nid, fuel}
     else
       {expr, j, diags, nid, fuel} = parse_expr(t, i, 0, :no_parens_arg, diags, nid, fuel - 1)
-      {expr, j, false, diags, nid, fuel}
+
+      if quoted_kw?(t, j) do
+        {node, k, diags, nid, fuel} =
+          parse_quoted_kw(t, expr, j, :no_parens_arg, diags, nid, fuel)
+
+        {node, k, true, diags, nid, fuel}
+      else
+        {expr, j, false, diags, nid, fuel}
+      end
     end
   end
 
@@ -1261,6 +1269,19 @@ defmodule Toxic2.Parser do
            nil
          ), m, diags, nid, fuel}
 
+      # `%{"k": v}` — a quoted keyword key as the first entry (kw, so seen_kw is now true).
+      quoted_kw?(t, j) ->
+        {first, k, diags, nid, fuel} = parse_quoted_kw(t, key, j, :matched, diags, nid, fuel)
+        {entries, m, diags, nid, fuel} = map_rest(t, k, [first], true, diags, nid, fuel)
+
+        {CST.node(
+           :map,
+           merge(tok_span(t, span_start), tok_span(t, m - 1)),
+           entries,
+           :matched,
+           nil
+         ), m, diags, nid, fuel}
+
       # No `|` and no `=>`: a BARE first entry (`%{x}`, `%{1, 2}`). Continue with the rest.
       true ->
         {entries, m, diags, nid, fuel} = map_rest(t, j, [key], false, diags, nid, fuel)
@@ -1318,16 +1339,22 @@ defmodule Toxic2.Parser do
       {key, j, diags, nid, fuel} = parse_expr(t, i, @map_key_bp, :matched, diags, nid, fuel - 1)
       jj = skip_eols(t, j)
 
-      if Tokens.kind(t, jj) == :assoc_op do
-        {val, k, diags, nid, fuel} =
-          parse_expr(t, skip_eols(t, jj + 1), 0, :matched, diags, nid, fuel - 1)
+      cond do
+        Tokens.kind(t, jj) == :assoc_op ->
+          {val, k, diags, nid, fuel} =
+            parse_expr(t, skip_eols(t, jj + 1), 0, :matched, diags, nid, fuel - 1)
 
-        {CST.node(:assoc, merge(cst_span(t, key), cst_span(t, val)), [key, val], :matched, nil),
-         k, diags, nid, fuel}
-      else
-        # A map entry without `=>` is a BARE expression (`%{x}`, `%{1, 2}`, `%{&0}`) — Elixir
-        # allows them freely (used in quoted/macro code). The expression IS the entry.
-        {key, j, diags, nid, fuel}
+          {CST.node(:assoc, merge(cst_span(t, key), cst_span(t, val)), [key, val], :matched, nil),
+           k, diags, nid, fuel}
+
+        # `%{"k": v}` — a quoted keyword key (the `:kw_quote` sits right after the close quote).
+        quoted_kw?(t, j) ->
+          parse_quoted_kw(t, key, j, :matched, diags, nid, fuel)
+
+        true ->
+          # A map entry without `=>` is a BARE expression (`%{x}`, `%{1, 2}`, `%{&0}`) — Elixir
+          # allows them freely (used in quoted/macro code). The expression IS the entry.
+          {key, j, diags, nid, fuel}
       end
     end
   end
@@ -1460,8 +1487,30 @@ defmodule Toxic2.Parser do
       {node, j, true, diags, nid, fuel}
     else
       {expr, j, diags, nid, fuel} = parse_expr(t, i, 0, ctx, diags, nid, fuel)
-      {expr, j, false, diags, nid, fuel}
+
+      if quoted_kw?(t, j) do
+        {node, k, diags, nid, fuel} = parse_quoted_kw(t, expr, j, ctx, diags, nid, fuel)
+        {diags, nid} = check_kw_allowed(mode, t, i, diags, nid)
+        {node, k, true, diags, nid, fuel}
+      else
+        {expr, j, false, diags, nid, fuel}
+      end
     end
+  end
+
+  # A quoted keyword key (`"foo": v`): the lexer marks the colon as `:kw_quote` right after the
+  # close quote, so an expression that's a quoted literal followed by `:kw_quote` is a kw pair
+  # whose key is the literal (atomized like a quoted atom in lowering).
+  defp quoted_kw?(t, j), do: Tokens.kind(t, j) == :kw_quote
+
+  defp parse_quoted_kw(t, key, kw_i, ctx, diags, nid, fuel) do
+    {val, k, diags, nid, fuel} =
+      parse_expr(t, skip_eols(t, kw_i + 1), 0, ctx, diags, nid, fuel - 1)
+
+    node =
+      CST.node(:kw_pair, merge(cst_span(t, key), cst_span(t, val)), [key, val], :matched, nil)
+
+    {node, k, diags, nid, fuel}
   end
 
   # A no-parens call as a non-last container element (`[f a, b]`) is ambiguous — Elixir requires

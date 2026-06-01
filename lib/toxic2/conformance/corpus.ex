@@ -245,6 +245,13 @@ defmodule Toxic2.Conformance.Corpus do
     {"[a: 1, b: 2]", [:keyword]},
     {"[1, a: 2]", [:keyword]},
     {"[do: 1]", [:keyword]},
+    # quoted keyword keys ("foo": v / 'bar': v), incl. interpolated key
+    {"[\"foo\": 1]", [:keyword]},
+    {"['bar': 2]", [:keyword]},
+    {"[\"a b\": 1]", [:keyword]},
+    {"%{\"k\": 1}", [:keyword]},
+    {"f(\"a\": 1)", [:keyword]},
+    {"[\"f\#{x}\": 1]", [:keyword]},
     {"f(a: 1)", [:keyword]},
     {"f(1, a: 2)", [:keyword]},
     {"f(x, y, a: 1, b: 2)", [:keyword]},
