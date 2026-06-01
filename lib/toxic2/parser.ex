@@ -42,8 +42,8 @@ defmodule Toxic2.Parser do
   Chained/double-parens calls `f(a)(b)` / `a.b()()` are handled with Elixir's "at most two paren
   groups per base" rule (a third, or a call on an alias/access/container, is an error).
 
-  Not yet handled (later islands): multi-statement parens, the `Foo.{A, B}` dot-tuple.
-  Encountering those yields error/leaf nodes rather than crashing.
+  Not yet handled (later islands): multi-statement parens `(a; b)`. Encountering those yields
+  error/leaf nodes rather than crashing.
   """
 
   alias Toxic2.{CST, Diagnostics, LexError, Precedence, Tokens}
@@ -420,6 +420,22 @@ defmodule Toxic2.Parser do
 
         # Anon call `a.(...)` consumed its first paren group; one more (`a.()()`) is allowed.
         postfix(t, k, node, ctx, diags, nid, fuel, 1)
+
+      # Dot-tuple multi-alias `Foo.{A, B}` (the `alias Foo.{Bar, Baz}` form): the brace contents
+      # are a comma-separated sequence; lowers to `{{:., _, [base, :{}]}, _, [elems]}`.
+      :"{" ->
+        {elems, k, diags, nid, fuel} = parse_seq(t, j + 1, :"}", :tuple, diags, nid, fuel)
+
+        node =
+          CST.node(
+            :dot_tuple,
+            merge(cst_span(t, lhs), tok_span(t, k - 1)),
+            [lhs | elems],
+            :matched,
+            nil
+          )
+
+        postfix(t, k, node, ctx, diags, nid, fuel, 0)
 
       _ ->
         {id, diags, nid} =

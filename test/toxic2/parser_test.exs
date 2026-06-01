@@ -556,6 +556,26 @@ defmodule Toxic2.ParserTest do
     end
   end
 
+  describe "dot-tuple multi-alias (Foo.{A, B})" do
+    test "lowers to {{:., _, [base, :{}]}, _, [elems]}" do
+      assert {{{:., _, [{:__aliases__, _, [:Foo]}, :{}]}, _,
+               [{:__aliases__, _, [:A]}, {:__aliases__, _, [:B]}]}, []} =
+               Toxic2.parse_to_ast("Foo.{A, B}")
+
+      assert {{{:., _, [{:__aliases__, _, [:Foo, :Bar]}, :{}]}, _, [{:__aliases__, _, [:Baz]}]},
+              []} =
+               Toxic2.parse_to_ast("Foo.Bar.{Baz}")
+
+      assert {{{:., _, [{:__aliases__, _, [:Foo]}, :{}]}, _, []}, []} =
+               Toxic2.parse_to_ast("Foo.{}")
+    end
+
+    test "works as the argument of `alias`" do
+      assert {:alias, _, [{{:., _, [{:__aliases__, _, [:Foo]}, :{}]}, _, _}]} =
+               elem(Toxic2.parse_to_ast("alias Foo.{Bar, Baz}"), 0)
+    end
+  end
+
   describe "not in (lowering rewrite + deprecation)" do
     test "`not a in b` rewrites to not(a in b) with a deprecation warning" do
       {ast, diags} = Toxic2.parse_to_ast("not a in b")

@@ -76,6 +76,13 @@ defmodule Toxic2.Conformance.Corpus do
     {"a.()()", [:chained_call]},
     {"foo().bar()()", [:chained_call]},
     {"a.b.c()()", [:chained_call]},
+    # dot-tuple multi-alias (the `alias Foo.{Bar, Baz}` form)
+    {"Foo.{A, B}", [:dot_tuple]},
+    {"Foo.Bar.{Baz, Qux}", [:dot_tuple]},
+    {"Foo.{}", [:dot_tuple]},
+    {"alias Foo.{Bar, Baz}", [:dot_tuple]},
+    {"a.b.{C, D}", [:dot_tuple]},
+    {"__MODULE__.{A, B}", [:dot_tuple]},
     # charlists
     {"'abc'", [:charlist]},
     {"''", [:charlist]},

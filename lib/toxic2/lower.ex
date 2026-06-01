@@ -108,6 +108,13 @@ defmodule Toxic2.Lower do
   defp lower_kind(:remote_call, ch, _cst, view, opts, acc, nid),
     do: lower_remote_call(ch, view, opts, acc, nid)
 
+  # `Foo.{A, B}` => `{{:., _, [base, :{}]}, _, [elems]}` (multi-alias / `alias Foo.{...}`).
+  defp lower_kind(:dot_tuple, [base | elems], _cst, view, opts, acc, nid) do
+    {base_ast, acc, nid} = lower(base, view, opts, acc, nid)
+    {elem_asts, acc, nid} = lower_each(elems, view, opts, acc, nid)
+    {{{:., [], [base_ast, :{}]}, [], elem_asts}, acc, nid}
+  end
+
   defp lower_kind(:anon_call, ch, _cst, view, opts, acc, nid),
     do: lower_anon_call(ch, view, opts, acc, nid)
 
