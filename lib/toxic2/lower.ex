@@ -374,8 +374,25 @@ defmodule Toxic2.Lower do
     {r, acc, nid} = lower(rhs, view, opts, acc, nid)
 
     case l do
-      {:.., _m, [a, b]} -> {{:..//, [], [a, b, r]}, acc, nid}
-      _ -> {{:"//", op_meta(op_leaf, view), [l, r]}, acc, nid}
+      # Valid only as the range step: `a..b//c` (lhs a 2-element range, incl. through parens).
+      {:.., _m, [a, b]} ->
+        {{:..//, [], [a, b, r]}, acc, nid}
+
+      # `//` is NOT a general binary operator — Elixir rejects `a // b`, `a..b//c//d`,
+      # `a..(b // c)`. Toxic2 is tolerant: emit an error and keep a best-effort `//` node (P1/P5).
+      _ ->
+        {_id, acc, nid} =
+          Diagnostics.emit(
+            acc,
+            nid,
+            :lowerer,
+            :error,
+            :misplaced_step_op,
+            name_span(op_leaf, view),
+            %{}
+          )
+
+        {{:"//", op_meta(op_leaf, view), [l, r]}, acc, nid}
     end
   end
 

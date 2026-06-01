@@ -566,6 +566,15 @@ defmodule Toxic2.ParserTest do
       assert {{:..//, _, [1, 10, {:+, _, [2, 3]}]}, []} = Toxic2.parse_to_ast("1..10//2 + 3")
       assert {{:..//, _, [1, 10, 2]}, []} = Toxic2.parse_to_ast("(1..10)//2")
     end
+
+    test "// is ONLY the range step — a non-range // is an error (not a generic operator)" do
+      for src <- ["a // b", "a..b//c//d", "a..(b // c)"] do
+        {_ast, diags} = Toxic2.parse_to_ast(src)
+
+        assert Enum.any?(diags, &(elem(&1, 2) == :error and elem(&1, 3) == :misplaced_step_op)),
+               src
+      end
+    end
   end
 
   describe "chained / double-parens calls" do

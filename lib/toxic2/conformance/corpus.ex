@@ -379,6 +379,10 @@ defmodule Toxic2.Conformance.Corpus do
     {"%Foo{m |}", [:struct]},
     {"{a: 1}", [:keyword]},
     {"{a: 1, b: 2}", [:keyword]},
+    # `//` is only the range step: a non-range `//` is rejected (tolerant: an :error diagnostic)
+    {"a // b", [:operator]},
+    {"a..b//c//d", [:operator]},
+    {"a..(b // c)", [:operator]},
     # missing `end` / empty fn / leftover tokens in bodies (must not crash; emit diagnostics)
     {"if x do y", [:do_block]},
     {"foo do", [:do_block]},

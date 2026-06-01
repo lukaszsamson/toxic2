@@ -61,8 +61,20 @@ defmodule Mix.Tasks.Toxic2.Conformance.Imported do
 
   # --- evaluation --------------------------------------------------------
 
-  defp corpus(:parser), do: Toxic2.Conformance.ImportedParser.all()
-  defp corpus(:lexer), do: Toxic2.Conformance.ImportedLexer.all()
+  # The corpus modules live in `test/support` (compiled only in :test). Reference them through a
+  # variable (no compile-time dependency, so `MIX_ENV=dev mix compile` stays warning-clean) and
+  # require the source file on demand if the module isn't already loaded (so the task also works
+  # under MIX_ENV=dev).
+  @corpus %{
+    parser: {Toxic2.Conformance.ImportedParser, "test/support/imported_parser_corpus.ex"},
+    lexer: {Toxic2.Conformance.ImportedLexer, "test/support/imported_lexer_corpus.ex"}
+  }
+
+  defp corpus(track) do
+    {mod, path} = @corpus[track]
+    _ = unless Code.ensure_loaded?(mod), do: Code.require_file(path)
+    mod.all()
+  end
 
   defp evaluate_all(track) do
     for entry <- corpus(track) do
@@ -108,7 +120,12 @@ defmodule Mix.Tasks.Toxic2.Conformance.Imported do
     starts == Enum.sort(starts)
   end
 
-  @green [:pass, :ok_invalid, :clean, :ok_lex_invalid]
+  # "green" = the freeze-gate target (no regression). It bundles TRUE conformance (`:pass` /
+  # `:clean`) with TOLERANCE on oracle-invalid input (`:ok_invalid` / `:ok_lex_invalid`) — the
+  # reports below break these apart so the headline conformance number isn't inflated by tolerance.
+  @conformant [:pass, :clean]
+  @tolerant [:ok_invalid, :ok_lex_invalid]
+  @green @conformant ++ @tolerant
 
   defp green?(status), do: status in @green
 
@@ -120,11 +137,14 @@ defmodule Mix.Tasks.Toxic2.Conformance.Imported do
     do: Enum.filter(results, fn r -> bucket in Enum.map(r.tags, &Atom.to_string/1) end)
 
   defp report(track, results) do
-    {green, backlog} = Enum.split_with(results, &green?(&1.status))
+    conformant = Enum.count(results, &(&1.status in @conformant))
+    tolerant = Enum.count(results, &(&1.status in @tolerant))
+    backlog = Enum.reject(results, &green?(&1.status))
     frozen = read_freeze(track) || []
 
     Mix.shell().info(
-      "toxic2.conformance.imported (#{track}): #{length(green)}/#{length(results)} green, " <>
+      "toxic2.conformance.imported (#{track}): #{conformant} conformant + #{tolerant} " <>
+        "tolerant-invalid = #{conformant + tolerant} green / #{length(results)}; " <>
         "#{length(backlog)} backlog (#{length(frozen)} frozen)"
     )
 
@@ -138,12 +158,13 @@ defmodule Mix.Tasks.Toxic2.Conformance.Imported do
   end
 
   defp report_json(track, results) do
-    {green, backlog} = Enum.split_with(results, &green?(&1.status))
+    backlog = Enum.reject(results, &green?(&1.status))
 
     payload = %{
       "track" => Atom.to_string(track),
       "total" => length(results),
-      "green" => length(green),
+      "conformant" => Enum.count(results, &(&1.status in @conformant)),
+      "tolerant_invalid" => Enum.count(results, &(&1.status in @tolerant)),
       "backlog" =>
         Enum.map(Enum.take(backlog, 200), fn r ->
           %{"source" => r.source, "group" => r.group, "status" => inspect(r.status)}

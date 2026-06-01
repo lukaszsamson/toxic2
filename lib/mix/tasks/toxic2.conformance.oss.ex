@@ -46,11 +46,16 @@ defmodule Mix.Tasks.Toxic2.Conformance.Oss do
         {path, evaluate_file(path)}
       end
 
-    {green, backlog} = Enum.split_with(results, fn {_p, st} -> st in @green end)
+    conformant = Enum.count(results, fn {_p, st} -> st == :pass end)
+    tolerant = Enum.count(results, fn {_p, st} -> st == :ok_invalid end)
+    backlog = Enum.reject(results, fn {_p, st} -> st in @green end)
 
+    # A real source file is valid code, so `:pass` (exact AST) is the meaningful metric; a handful
+    # of `:ok_invalid` (oracle itself rejects the file) are reported separately, not as conformance.
     Mix.shell().info(
-      "toxic2.conformance.oss: #{length(green)}/#{length(results)} files green " <>
-        "(#{length(backlog)} backlog) under #{dir}"
+      "toxic2.conformance.oss: #{conformant} conformant" <>
+        if(tolerant > 0, do: " (+#{tolerant} oracle-invalid, tolerated)", else: "") <>
+        " / #{length(results)} files; #{length(backlog)} backlog under #{dir}"
     )
 
     backlog
