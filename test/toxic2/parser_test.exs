@@ -195,6 +195,15 @@ defmodule Toxic2.ParserTest do
                Toxic2.parse_to_ast("Foo.bar(1)")
     end
 
+    test "dot-quoted remote calls use the string as the function-name atom" do
+      assert {{{:., _, [{:a, _, nil}, :foo]}, _, []}, []} = Toxic2.parse_to_ast("a.\"foo\"")
+      assert {{{:., _, [{:a, _, nil}, :foo]}, _, [1]}, []} = Toxic2.parse_to_ast("a.\"foo\"(1)")
+      assert {{{:., _, [{:a, _, nil}, :foo]}, _, []}, []} = Toxic2.parse_to_ast("a.'foo'")
+      # an interpolated name is rejected (tolerantly)
+      {_a, diags} = Toxic2.parse_to_ast("a.\"f\#{x}\"")
+      assert Enum.any?(diags, &(elem(&1, 2) == :error))
+    end
+
     test "dot chains nest left-associatively" do
       assert {{{:., _, [{{:., _, [{:a, _, nil}, :b]}, _, []}, :c]}, _, []}, []} =
                Toxic2.parse_to_ast("a.b.c")

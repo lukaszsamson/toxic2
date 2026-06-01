@@ -512,12 +512,40 @@ defmodule Toxic2.Lower do
   defp lower_remote_call([base, name_leaf | arg_children], view, opts, acc, nid) do
     {base_ast, acc, nid} = lower(base, view, opts, acc, nid)
     {args, acc, nid} = lower_call_args(arg_children, view, opts, acc, nid)
+    remote_name(CST.tag(name_leaf), name_leaf, base_ast, args, view, opts, acc, nid)
+  end
+
+  defp remote_name(:token, name_leaf, base_ast, args, view, opts, acc, nid) do
     idx = CST.token_index(name_leaf)
     meta = tmeta(view, idx)
 
     case to_atom(Tokens.value(view, idx), opts) do
       {:ok, name} -> {{{:., meta, [base_ast, name]}, meta, args}, acc, nid}
       :error -> name_error(name_leaf, view, acc, nid)
+    end
+  end
+
+  # `a."foo"` — the function name is a quoted literal. No interpolation allowed (Elixir rejects
+  # `a."f#{x}"`): atomize the concatenated fragments; on interpolation, error + best-effort.
+  defp remote_name(:node, name_node, base_ast, args, view, opts, acc, nid) do
+    {parts, acc, nid} = quoted_parts_ast(CST.children(name_node), view, opts, acc, nid)
+
+    if Enum.any?(parts, &match?({:interp, _}, &1)) do
+      {id, acc, nid} =
+        Diagnostics.emit(
+          acc,
+          nid,
+          :lowerer,
+          :error,
+          :interpolated_remote_name,
+          atom_span(name_node, view),
+          %{}
+        )
+
+      {{:__error__, [], %{diag_ids: [id]}}, acc, nid}
+    else
+      bin = parts |> Enum.map(fn {:frag, b} -> b end) |> IO.iodata_to_binary()
+      {{{:., [], [base_ast, String.to_atom(bin)]}, [], args}, acc, nid}
     end
   end
 

@@ -460,6 +460,13 @@ defmodule Toxic2.Parser do
 
         postfix(t, k, node, ctx, diags, nid, fuel, 0)
 
+      # Dot-quoted remote call `a."foo"` / `a.'foo'`: the quoted string is the function name (an
+      # atom; lowering rejects interpolation). `a."foo"(args)` takes an adjacent arg list.
+      qk when qk in [:string_start, :charlist_start] ->
+        qkind = if qk == :charlist_start, do: :charlist, else: :string
+        {qname, k, diags, nid, fuel} = parse_quoted(t, j, qkind, diags, nid, fuel)
+        remote_quoted_call(t, k, lhs, qname, ctx, diags, nid, fuel)
+
       _ ->
         {id, diags, nid} =
           Diagnostics.emit(
@@ -514,6 +521,22 @@ defmodule Toxic2.Parser do
 
       # `a.b` (no adjacent parens) is a fresh base; a following `(` would have been consumed above.
       postfix(t, name_i + 1, node, ctx, diags, nid, fuel, 0)
+    end
+  end
+
+  # `a."foo"` (quoted function name). An adjacent `(` makes it a call with args, else a 0-arg
+  # remote call — same `:remote_call` node, but the name child is a `:string`/`:charlist` node.
+  defp remote_quoted_call(t, after_q, lhs, qname, ctx, diags, nid, fuel) do
+    if Tokens.kind(t, after_q) == :"(" and
+         adjacent_after?(cst_span(t, qname), Tokens.span(t, after_q)) do
+      {args, k, diags, nid, fuel} = parse_seq(t, after_q + 1, :")", :call, diags, nid, fuel)
+      span = merge(cst_span(t, lhs), tok_span(t, k - 1))
+      node = CST.node(:remote_call, span, [lhs, qname | args], :matched, nil)
+      postfix(t, k, node, ctx, diags, nid, fuel, 1)
+    else
+      span = merge(cst_span(t, lhs), cst_span(t, qname))
+      node = CST.node(:remote_call, span, [lhs, qname], :matched, nil)
+      postfix(t, after_q, node, ctx, diags, nid, fuel, 0)
     end
   end
 

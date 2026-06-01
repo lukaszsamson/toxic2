@@ -229,6 +229,11 @@ defmodule Toxic2.Conformance.Corpus do
     {"a.b(1).c", [:dot]},
     {"foo().bar", [:dot]},
     {"a.(1)", [:dot]},
+    # dot-quoted remote calls (function name is a quoted string atom)
+    {"a.\"foo\"", [:dot]},
+    {"a.\"foo\"(1)", [:dot]},
+    {"a.'foo'", [:dot]},
+    {"a.\"foo\".bar", [:dot]},
     # keyword lists
     {"[a: 1, b: 2]", [:keyword]},
     {"[1, a: 2]", [:keyword]},
