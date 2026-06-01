@@ -556,6 +556,27 @@ defmodule Toxic2.ParserTest do
     end
   end
 
+  describe "keyword positions (newline after key:, tuple/access keywords)" do
+    test "a newline is allowed after `key:` before the value" do
+      assert {[a: 1], []} = Toxic2.parse_to_ast("[a:\n1]")
+      assert {{:f, _, [[a: 1]]}, []} = Toxic2.parse_to_ast("f(a:\n1)")
+      assert {{:%{}, _, [a: 1, b: 2]}, []} = Toxic2.parse_to_ast("%{a:\n1,\nb: 2}")
+    end
+
+    test "tuples carry trailing keywords after a positional element" do
+      assert {{1, [a: 1]}, []} = Toxic2.parse_to_ast("{1, a: 1}")
+      assert {{:{}, _, [1, 2, [a: 1]]}, []} = Toxic2.parse_to_ast("{1, 2, a: 1}")
+      # but an all-keyword tuple is rejected (tolerantly)
+      {_ast, diags} = Toxic2.parse_to_ast("{a: 1}")
+      assert Enum.any?(diags, &(elem(&1, 2) == :error))
+    end
+
+    test "access takes a keyword-list index" do
+      assert {{{:., _, [Access, :get]}, _, [{:foo, _, nil}, [a: 1, b: 2]]}, []} =
+               Toxic2.parse_to_ast("foo[a: 1, b: 2]")
+    end
+  end
+
   describe "dot-tuple multi-alias (Foo.{A, B})" do
     test "lowers to {{:., _, [base, :{}]}, _, [elems]}" do
       assert {{{:., _, [{:__aliases__, _, [:Foo]}, :{}]}, _,

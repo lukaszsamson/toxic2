@@ -355,9 +355,10 @@ defmodule Toxic2.Lower do
   # A list literal lowers to the Elixir list of its lowered elements.
   defp lower_list(children, view, opts, acc, nid), do: lower_each(children, view, opts, acc, nid)
 
-  # 2-tuples are literal `{a, b}`; all other arities use `{:{}, [], elems}`.
+  # 2-tuples are literal `{a, b}`; all other arities use `{:{}, [], elems}`. Trailing keyword
+  # pairs collapse into a single keyword-list element (`{1, a: 1}` => `{1, [a: 1]}`), like calls.
   defp lower_tuple(children, view, opts, acc, nid) do
-    {asts, acc, nid} = lower_each(children, view, opts, acc, nid)
+    {asts, acc, nid} = lower_args(children, view, opts, acc, nid)
 
     case asts do
       [a, b] -> {{a, b}, acc, nid}

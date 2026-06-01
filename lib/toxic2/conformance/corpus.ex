@@ -83,6 +83,15 @@ defmodule Toxic2.Conformance.Corpus do
     {"alias Foo.{Bar, Baz}", [:dot_tuple]},
     {"a.b.{C, D}", [:dot_tuple]},
     {"__MODULE__.{A, B}", [:dot_tuple]},
+    # keyword positions: newline after `key:`, tuple trailing keywords, access keyword index
+    {"[a:\n1]", [:keyword]},
+    {"f(a:\n1)", [:keyword]},
+    {"%{a:\n1,\nb: 2}", [:keyword]},
+    {"{1, a: 1}", [:keyword]},
+    {"{1, a: 1, b: 2}", [:keyword]},
+    {"{1, 2, a: 1}", [:keyword]},
+    {"foo[a: 1]", [:keyword]},
+    {"foo[a: 1, b: 2]", [:keyword]},
     # charlists
     {"'abc'", [:charlist]},
     {"''", [:charlist]},
@@ -320,6 +329,7 @@ defmodule Toxic2.Conformance.Corpus do
     {"%{m |}", [:map]},
     {"%Foo{m |}", [:struct]},
     {"{a: 1}", [:keyword]},
+    {"{a: 1, b: 2}", [:keyword]},
     # missing `end` / empty fn / leftover tokens in bodies (must not crash; emit diagnostics)
     {"if x do y", [:do_block]},
     {"foo do", [:do_block]},

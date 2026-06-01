@@ -233,7 +233,9 @@ defmodule Toxic2.Parser do
   defp parse_np_arg(t, i, diags, nid, fuel) do
     if Tokens.kind(t, i) == :kw_identifier do
       key = CST.token(i)
-      {val, j, diags, nid, fuel} = parse_expr(t, i + 1, 0, :no_parens_arg, diags, nid, fuel - 1)
+      # A newline is allowed after `key:` before the value (`[a:\n1]`, `f(a:\n1)`).
+      {val, j, diags, nid, fuel} =
+        parse_expr(t, skip_eols(t, i + 1), 0, :no_parens_arg, diags, nid, fuel - 1)
 
       node =
         CST.node(:kw_pair, merge(tok_span(t, i), cst_span(t, val)), [key, val], :matched, nil)
@@ -339,7 +341,23 @@ defmodule Toxic2.Parser do
   defp adjacent_after?({_, _, el, ec}, {sl, sc, _, _}), do: el == sl and ec == sc
   defp adjacent_after?(_, _), do: false
 
+  # `a[b]`. A keyword-list index (`a[k: 1, j: 2]`) is the index `[k: 1, j: 2]`: parse the bracket
+  # as a list sequence and use that list node as the single index.
   defp access(t, open, lhs, ctx, diags, nid, fuel) do
+    if Tokens.kind(t, skip_eols(t, open + 1)) == :kw_identifier do
+      {elems, j, diags, nid, fuel} = parse_seq(t, open + 1, :"]", :list, diags, nid, fuel)
+      idx = CST.node(:list, merge(tok_span(t, open), tok_span(t, j - 1)), elems, :matched, nil)
+
+      node =
+        CST.node(:access, merge(cst_span(t, lhs), tok_span(t, j - 1)), [lhs, idx], :matched, nil)
+
+      postfix(t, j, node, ctx, diags, nid, fuel)
+    else
+      access_index(t, open, lhs, ctx, diags, nid, fuel)
+    end
+  end
+
+  defp access_index(t, open, lhs, ctx, diags, nid, fuel) do
     {idx, j, diags, nid, fuel} = parse_expr(t, open + 1, 0, :matched, diags, nid, fuel - 1)
     jj = skip_eols(t, j)
 
@@ -1199,7 +1217,9 @@ defmodule Toxic2.Parser do
   defp parse_map_entry(t, i, diags, nid, fuel) do
     if Tokens.kind(t, i) == :kw_identifier do
       key = CST.token(i)
-      {val, j, diags, nid, fuel} = parse_expr(t, i + 1, 0, :matched, diags, nid, fuel - 1)
+
+      {val, j, diags, nid, fuel} =
+        parse_expr(t, skip_eols(t, i + 1), 0, :matched, diags, nid, fuel - 1)
 
       {CST.node(:kw_pair, merge(tok_span(t, i), cst_span(t, val)), [key, val], :matched, nil), j,
        diags, nid, fuel}
@@ -1240,10 +1260,30 @@ defmodule Toxic2.Parser do
   # `[ ... ]` / `{ ... }` / `<< ... >>`: a comma-separated sequence; `kind` is also the seq `mode`.
   defp parse_container(t, open, close, kind, diags, nid, fuel) do
     {elems, j, diags, nid, fuel} = parse_seq(t, open + 1, close, kind, diags, nid, fuel)
+    {diags, nid} = check_tuple_lead(kind, t, elems, diags, nid)
 
     {CST.node(kind, merge(tok_span(t, open), tok_span(t, j - 1)), elems, :matched, nil), j, diags,
      nid, fuel}
   end
+
+  # A tuple may carry trailing keywords (`{1, a: 1}` => `{1, [a: 1]}`) but its FIRST element must
+  # be positional — an all-keyword tuple (`{a: 1}`, `{a: 1, b: 2}`) is rejected by Elixir.
+  defp check_tuple_lead(:tuple, t, [first | _], diags, nid) do
+    if kw_pair_node?(first) do
+      {_id, diags, nid} =
+        Diagnostics.emit(diags, nid, :parser, :error, :keyword_not_allowed, cst_span(t, first), %{
+          in: :tuple
+        })
+
+      {diags, nid}
+    else
+      {diags, nid}
+    end
+  end
+
+  defp check_tuple_lead(_kind, _t, _elems, diags, nid), do: {diags, nid}
+
+  defp kw_pair_node?(cst), do: CST.tag(cst) == :node and CST.node_kind(cst) == :kw_pair
 
   # Comma-separated elements up to `close`. `mode` (`:list | :tuple | :bitstring | :call`) controls
   # the permissive-grammar edges: a trailing comma is allowed everywhere except calls; keyword
@@ -1325,7 +1365,9 @@ defmodule Toxic2.Parser do
 
     if Tokens.kind(t, i) == :kw_identifier do
       key = CST.token(i)
-      {val, j, diags, nid, fuel} = parse_expr(t, i + 1, 0, ctx, diags, nid, fuel - 1)
+
+      {val, j, diags, nid, fuel} =
+        parse_expr(t, skip_eols(t, i + 1), 0, ctx, diags, nid, fuel - 1)
 
       node =
         CST.node(:kw_pair, merge(tok_span(t, i), cst_span(t, val)), [key, val], :matched, nil)
@@ -1381,7 +1423,10 @@ defmodule Toxic2.Parser do
   defp check_kw_last(_seen, _is_kw, _t, _el, diags, nid), do: {diags, nid}
 
   # Keyword pairs are not allowed inside tuples / bitstrings.
-  defp check_kw_allowed(mode, _t, _i, diags, nid) when mode in [:list, :call], do: {diags, nid}
+  # Keyword pairs are allowed in lists, calls, and tuples (tuples additionally require a leading
+  # positional element — see `check_tuple_lead`). Bitstrings reject them.
+  defp check_kw_allowed(mode, _t, _i, diags, nid) when mode in [:list, :call, :tuple],
+    do: {diags, nid}
 
   defp check_kw_allowed(mode, t, i, diags, nid) do
     {_id, diags, nid} =
