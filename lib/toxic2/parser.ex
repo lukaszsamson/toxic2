@@ -617,6 +617,14 @@ defmodule Toxic2.Parser do
   defp parse_primary(:sigil_start, t, i, _ctx, diags, nid, fuel),
     do: parse_sigil(t, i, diags, nid, fuel)
 
+  # `:"..."` / `:'...'` — a `:quoted_atom` marker at `i`, then the quoted literal's tokens at i+1.
+  defp parse_primary(:quoted_atom, t, i, _ctx, diags, nid, fuel) do
+    kind = if Tokens.kind(t, i + 1) == :charlist_start, do: :charlist, else: :string
+    {inner, j, diags, nid, fuel} = parse_quoted(t, i + 1, kind, diags, nid, fuel)
+    span = merge(tok_span(t, i), cst_span(t, inner))
+    {CST.node(:quoted_atom, span, [inner], :matched, nil), j, diags, nid, fuel}
+  end
+
   defp parse_primary(_kind, t, i, _ctx, diags, nid, fuel),
     do: parse_unexpected(t, i, diags, nid, fuel)
 

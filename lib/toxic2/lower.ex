@@ -161,6 +161,13 @@ defmodule Toxic2.Lower do
   defp lower_kind(:sigil, ch, _cst, view, opts, acc, nid),
     do: lower_sigil(ch, view, opts, acc, nid)
 
+  # `:"..."` / `:'...'` — no interpolation lowers to the atom (atom policy); with interpolation to
+  # `:erlang.binary_to_atom(<<...>>, :utf8)`.
+  defp lower_kind(:quoted_atom, [inner], _cst, view, opts, acc, nid) do
+    {parts, acc, nid} = quoted_parts_ast(CST.children(inner), view, opts, acc, nid)
+    build_quoted_atom(parts, inner, view, opts, acc, nid)
+  end
+
   # An interpolation's inner is a block (`#{a; b}` → `{:__block__, ...}`, `#{a}` → `a`).
   defp lower_kind(:interp, ch, _cst, view, opts, acc, nid),
     do: lower_block(ch, view, opts, acc, nid)
@@ -233,6 +240,41 @@ defmodule Toxic2.Lower do
       {String.to_charlist(bin), acc, nid}
     end
   end
+
+  defp build_quoted_atom(parts, inner, view, opts, acc, nid) do
+    if Enum.any?(parts, &match?({:interp, _}, &1)) do
+      segs = Enum.map(parts, &string_segment/1)
+      {{{:., [], [:erlang, :binary_to_atom]}, [], [{:<<>>, [], segs}, :utf8]}, acc, nid}
+    else
+      bin = parts |> Enum.map(fn {:frag, b} -> b end) |> IO.iodata_to_binary()
+      atomize_quoted(bin, inner, opts, view, acc, nid)
+    end
+  end
+
+  defp atomize_quoted(bin, inner, opts, view, acc, nid) do
+    case to_atom(bin, opts) do
+      {:ok, atom} ->
+        {atom, acc, nid}
+
+      :error ->
+        {id, acc, nid} =
+          Diagnostics.emit(
+            acc,
+            nid,
+            :lowerer,
+            :error,
+            :nonexistent_atom,
+            atom_span(inner, view),
+            %{
+              name: bin
+            }
+          )
+
+        {{:__error__, [], %{diag_ids: [id]}}, acc, nid}
+    end
+  end
+
+  defp atom_span(inner, _view), do: CST.span(inner) || {1, 1, 1, 1}
 
   defp string_segment({:frag, bin}), do: bin
 

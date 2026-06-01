@@ -264,7 +264,20 @@ defmodule Toxic2.Lexer do
   defp lex(<<"::", rest::binary>>, line, col, acc, w, st),
     do: cont(rest, {:type_op, line, col, line, col + 2, :"::"}, acc, w, st)
 
-  # --- atoms: :name and :<operator> (quoted atoms deferred to phase 10) --
+  # --- quoted atoms `:"..."` / `:'...'` (a `:quoted_atom` marker + the quoted literal's tokens) --
+  defp lex(<<?:, ?", rest::binary>>, line, col, acc, w, st) do
+    marker = {:quoted_atom, line, col, line, col + 1, nil}
+    start = {:string_start, line, col + 1, line, col + 2, nil}
+    read_quoted(rest, line, col + 2, [], {line, col + 2}, [start, marker | acc], w, st, :dquote)
+  end
+
+  defp lex(<<?:, ?', rest::binary>>, line, col, acc, w, st) do
+    marker = {:quoted_atom, line, col, line, col + 1, nil}
+    start = {:charlist_start, line, col + 1, line, col + 2, nil}
+    read_quoted(rest, line, col + 2, [], {line, col + 2}, [start, marker | acc], w, st, :charlist)
+  end
+
+  # --- atoms: :name and :<operator> -------------------------------------
   defp lex(<<?:, c, _::binary>> = bin, line, col, acc, w, st)
        when is_lower_start(c) or is_upper_start(c) do
     {wlen, _name, _rest} = read_name(rest_at(bin, 1))

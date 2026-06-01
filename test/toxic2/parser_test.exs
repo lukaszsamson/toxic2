@@ -556,6 +556,22 @@ defmodule Toxic2.ParserTest do
     end
   end
 
+  describe "quoted atoms (:\"...\")" do
+    test "no interpolation lowers to the atom (escapes processed)" do
+      assert {:a, []} = Toxic2.parse_to_ast(":\"a\"")
+      assert {:a, []} = Toxic2.parse_to_ast(":'a'")
+      assert {:"a b", []} = Toxic2.parse_to_ast(":\"a b\"")
+      assert {:"", []} = Toxic2.parse_to_ast(":\"\"")
+    end
+
+    test "interpolation lowers to :erlang.binary_to_atom(<<...>>, :utf8)" do
+      {ast, []} = Toxic2.parse_to_ast(":\"a\#{x}b\"")
+
+      assert {{:., _, [:erlang, :binary_to_atom]}, _,
+              [{:<<>>, _, ["a", {:"::", _, _}, "b"]}, :utf8]} = ast
+    end
+  end
+
   describe "keyword positions (newline after key:, tuple/access keywords)" do
     test "a newline is allowed after `key:` before the value" do
       assert {[a: 1], []} = Toxic2.parse_to_ast("[a:\n1]")

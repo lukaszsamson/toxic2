@@ -369,6 +369,17 @@ defmodule Toxic2.LexerTest do
                shapes(~S("abc))
     end
 
+    test "quoted atoms emit a :quoted_atom marker then the quoted-literal tokens" do
+      assert shapes(":\"ab\"") == [
+               {:quoted_atom, nil},
+               {:string_start, nil},
+               {:string_fragment, "ab"},
+               {:string_end, nil}
+             ]
+
+      assert [{:quoted_atom, nil}, {:string_start, nil} | _] = shapes(":\"a\#{x}\"")
+    end
+
     test "sigils: name on :sigil_start, modifiers on :sigil_end, raw content" do
       assert shapes("~r/foo/i") == [
                {:sigil_start, "r"},

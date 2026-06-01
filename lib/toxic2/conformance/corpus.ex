@@ -92,6 +92,15 @@ defmodule Toxic2.Conformance.Corpus do
     {"{1, 2, a: 1}", [:keyword]},
     {"foo[a: 1]", [:keyword]},
     {"foo[a: 1, b: 2]", [:keyword]},
+    # quoted atoms (with escapes / interpolation)
+    {":\"a\"", [:quoted_atom]},
+    {":'a'", [:quoted_atom]},
+    {":\"\"", [:quoted_atom]},
+    {":\"a b\"", [:quoted_atom]},
+    {":\"a\\n\"", [:quoted_atom]},
+    {":\"a\#{x}b\"", [:quoted_atom]},
+    {":\"\#{x}\"", [:quoted_atom]},
+    {"foo(:\"bar\")", [:quoted_atom]},
     # charlists
     {"'abc'", [:charlist]},
     {"''", [:charlist]},
