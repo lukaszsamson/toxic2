@@ -379,7 +379,11 @@ defmodule Toxic2.Conformance.Corpus do
     {"foo()\n|> bar()\n|> baz()", [:layout]},
     {"x = a\n|> b\n|> c", [:layout]},
     {"a\nwhen b", [:layout]},
-    {"a\n* b", [:layout]}
+    {"a\n* b", [:layout]},
+    # backslash-newline line continuation in code (joins the lines, no statement break)
+    {"foo\\\n+1", [:layout]},
+    {"\\\n0x123", [:layout]},
+    {"x = 1\\\n+ 2", [:layout]}
   ]
 
   # Oracle rejects these; Toxic2 must not crash and must emit an :error diagnostic.
@@ -424,6 +428,9 @@ defmodule Toxic2.Conformance.Corpus do
     {"(a, b)", [:paren]},
     {"foo(a; b)", [:paren]},
     {"://", [:atom]},
+    # a no-parens-call keyword value must be the last element
+    {"f(a: g b, c)", [:keyword]},
+    {"function(arg, one: if expr, do: :this, else: :that)", [:keyword]},
     # missing `end` / empty fn / leftover tokens in bodies (must not crash; emit diagnostics)
     {"if x do y", [:do_block]},
     {"foo do", [:do_block]},

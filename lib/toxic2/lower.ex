@@ -525,6 +525,11 @@ defmodule Toxic2.Lower do
     end
   end
 
+  # A recovered missing name (`foo.` with nothing after) — its diagnostic was already emitted by
+  # the parser; lower to an error node (P5: total, never raises).
+  defp remote_name(:missing, name_leaf, _base_ast, _args, view, _opts, acc, nid),
+    do: name_error(name_leaf, view, acc, nid)
+
   # `a."foo"` — the function name is a quoted literal. No interpolation allowed (Elixir rejects
   # `a."f#{x}"`): atomize the concatenated fragments; on interpolation, error + best-effort.
   defp remote_name(:node, name_node, base_ast, args, view, opts, acc, nid) do

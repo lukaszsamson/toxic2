@@ -1125,6 +1125,11 @@ defmodule Toxic2.Parser do
       struct_base_start?(Tokens.kind(t, j)) ->
         parse_struct(t, i, diags, nid, fuel)
 
+      # A `(`/`[` base is valid only when SPACED from `%`: `% (){}` is a struct on `()`, but the
+      # adjacent `%(...)` / `%[...]` is rejected by Elixir.
+      Tokens.kind(t, j) in [:"(", :"["] and not adjacent_after?(tok_span(t, i), tok_span(t, j)) ->
+        parse_struct(t, i, diags, nid, fuel)
+
       true ->
         {id, diags, nid} =
           Diagnostics.emit(
@@ -1141,8 +1146,9 @@ defmodule Toxic2.Parser do
     end
   end
 
-  # A struct base is any primary expression (`%Alias{}`, `%var{}`, `%nil{}`, `%@attr{}`, `%"s"{}`,
-  # ...), not only an alias/identifier — `parse_struct` parses it at @struct_name_bp.
+  # A struct base is a (non-paren, non-bracket) primary expression — `%Alias{}`, `%var{}`,
+  # `%nil{}`, `%@attr{}`, `%"s"{}`, `%-a{}`, `%<<x>>{}`, `%%{}{}`. Notably `%(...)`/`%[...]`/`%&x`
+  # are NOT valid struct bases (Elixir rejects them), so `(`/`[`/capture are excluded.
   defp struct_base_start?(kind) do
     kind in [
       :alias,
@@ -1158,10 +1164,7 @@ defmodule Toxic2.Parser do
       :sigil_start,
       :at_op,
       :unary_op,
-      :capture_op,
-      :capture_int,
-      :"(",
-      :"[",
+      :dual_op,
       :"<<",
       :percent
     ]
@@ -1477,24 +1480,50 @@ defmodule Toxic2.Parser do
     if Tokens.kind(t, i) == :kw_identifier do
       key = CST.token(i)
 
+      # A keyword VALUE is a single `matched_expr` (`f(a: g b)` => `g(b)`), NOT a `:no_parens`
+      # call that grabs the outer commas — `f(a: g b, c)` is rejected (keyword-not-last).
       {val, j, diags, nid, fuel} =
-        parse_expr(t, skip_eols(t, i + 1), 0, ctx, diags, nid, fuel - 1)
+        parse_expr(t, skip_eols(t, i + 1), 0, :matched, diags, nid, fuel - 1)
 
       node =
         CST.node(:kw_pair, merge(tok_span(t, i), cst_span(t, val)), [key, val], :matched, nil)
 
       {diags, nid} = check_kw_allowed(mode, t, i, diags, nid)
+      {diags, nid} = check_np_kw_last(val, t, j, diags, nid)
       {node, j, true, diags, nid, fuel}
     else
       {expr, j, diags, nid, fuel} = parse_expr(t, i, 0, ctx, diags, nid, fuel)
 
       if quoted_kw?(t, j) do
-        {node, k, diags, nid, fuel} = parse_quoted_kw(t, expr, j, ctx, diags, nid, fuel)
+        {node, k, diags, nid, fuel} = parse_quoted_kw(t, expr, j, :matched, diags, nid, fuel)
         {diags, nid} = check_kw_allowed(mode, t, i, diags, nid)
         {node, k, true, diags, nid, fuel}
       else
         {expr, j, false, diags, nid, fuel}
       end
+    end
+  end
+
+  # A keyword value that is a no-parens call (`a: g b`) must be the LAST element — Elixir rejects
+  # `f(a: g b, c)` / `f(a: if e, do: x)`. (A parenthesised value `a: g(b)` is a `:call`, not
+  # `:np_call`, so it may be followed by more.)
+  defp check_np_kw_last(val, t, j, diags, nid) do
+    if CST.tag(val) == :node and CST.node_kind(val) == :np_call and
+         Tokens.kind(t, skip_eols(t, j)) == :"," do
+      {_id, diags, nid} =
+        Diagnostics.emit(
+          diags,
+          nid,
+          :parser,
+          :error,
+          :no_parens_kw_not_last,
+          cst_span(t, val),
+          %{}
+        )
+
+      {diags, nid}
+    else
+      {diags, nid}
     end
   end
 

@@ -182,6 +182,19 @@ defmodule Toxic2.ParserTest do
       {_v, _es, diags} = exprs("[1, 2")
       assert Enum.any?(diags, fn d -> elem(d, 3) == :expected_comma_or_close end)
     end
+
+    test "a no-parens-call keyword value must be the last element" do
+      assert {{:f, _, [[a: {:g, _, [{:b, _, nil}]}]]}, []} = Toxic2.parse_to_ast("f(a: g b)")
+
+      {_a, diags} = Toxic2.parse_to_ast("f(a: g b, c)")
+      assert Enum.any?(diags, &(elem(&1, 3) == :no_parens_kw_not_last))
+    end
+
+    test "a dangling dot does not crash lowering (totality, P5)" do
+      {ast, diags} = Toxic2.parse_to_ast("foo.")
+      assert is_tuple(ast) or is_atom(ast)
+      assert Enum.any?(diags, &(elem(&1, 2) == :error))
+    end
   end
 
   describe "dot / alias chains / keywords (phase 7 slice 2)" do

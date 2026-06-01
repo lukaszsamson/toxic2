@@ -178,6 +178,13 @@ defmodule Toxic2.Lexer do
     lex(rest2, line, col + 1 + drop_len, acc, w, st)
   end
 
+  # --- line continuation: a `\` right before a newline joins the lines (no :eol emitted) ----
+  defp lex(<<?\\, ?\r, ?\n, rest::binary>>, line, _col, acc, w, st),
+    do: lex(rest, line + 1, 1, acc, w, st)
+
+  defp lex(<<?\\, ?\n, rest::binary>>, line, _col, acc, w, st),
+    do: lex(rest, line + 1, 1, acc, w, st)
+
   # --- heredocs: `"""` / `'''` (before the single-quote clauses) ---------
   defp lex(<<?", ?", ?", rest::binary>>, line, col, acc, w, st),
     do: open_heredoc(rest, line, col, acc, w, st, ?")
