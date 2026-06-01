@@ -320,6 +320,18 @@ defmodule Toxic2.Conformance.Corpus do
     {"try do x after z end", [:do_block]},
     {"if x do\n a\n b\n end", [:do_block]},
     {"1 + if x do y end", [:do_block]},
+    # empty do-bodies => [do: {:__block__, [], []}]
+    {"foo do end", [:do_block]},
+    {"if true do\nend", [:do_block]},
+    {"foo() do end", [:do_block]},
+    # fn with an empty parenthesised head => zero args
+    {"fn () -> :ok end", [:fn]},
+    {"fn (x) -> x end", [:fn]},
+    # ternary step range a..b//c
+    {"1..10//2", [:operator]},
+    {"a..b//c", [:operator]},
+    {"1..10//2 + 3", [:operator]},
+    {"(1..10)//2", [:operator]},
     # layout
     {"a\nb", [:layout]},
     {"a; b; c", [:layout]},

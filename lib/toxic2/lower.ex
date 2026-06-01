@@ -353,12 +353,29 @@ defmodule Toxic2.Lower do
     do: lower(inner, view, opts, acc, nid)
 
   defp lower_binary([lhs, op_leaf, rhs], view, opts, acc, nid) do
-    if op_atom(op_leaf, view) == :in and not_unary?(lhs, view) do
-      lower_deprecated_not_in(lhs, op_leaf, rhs, view, opts, acc, nid)
-    else
-      {l, acc, nid} = lower(lhs, view, opts, acc, nid)
-      {r, acc, nid} = lower(rhs, view, opts, acc, nid)
-      {{op_atom(op_leaf, view), op_meta(op_leaf, view), [l, r]}, acc, nid}
+    cond do
+      op_atom(op_leaf, view) == :in and not_unary?(lhs, view) ->
+        lower_deprecated_not_in(lhs, op_leaf, rhs, view, opts, acc, nid)
+
+      op_atom(op_leaf, view) == :"//" ->
+        lower_slash_slash(lhs, op_leaf, rhs, view, opts, acc, nid)
+
+      true ->
+        {l, acc, nid} = lower(lhs, view, opts, acc, nid)
+        {r, acc, nid} = lower(rhs, view, opts, acc, nid)
+        {{op_atom(op_leaf, view), op_meta(op_leaf, view), [l, r]}, acc, nid}
+    end
+  end
+
+  # `a..b//c` is the ternary step range `{:..//, _, [a, b, c]}` — i.e. a `//` whose left side is a
+  # range. We test the LOWERED lhs (so a parenthesised range works too: `(a..b)//c`).
+  defp lower_slash_slash(lhs, op_leaf, rhs, view, opts, acc, nid) do
+    {l, acc, nid} = lower(lhs, view, opts, acc, nid)
+    {r, acc, nid} = lower(rhs, view, opts, acc, nid)
+
+    case l do
+      {:.., _m, [a, b]} -> {{:..//, [], [a, b, r]}, acc, nid}
+      _ -> {{:"//", op_meta(op_leaf, view), [l, r]}, acc, nid}
     end
   end
 
@@ -586,7 +603,9 @@ defmodule Toxic2.Lower do
 
   defp lower_section_body({:node, :do_body, _sp, stmts, _f, _d}, view, opts, acc, nid) do
     case stmts do
-      [] -> {nil, acc, nid}
+      # An empty section body is `{:__block__, [], []}` (`foo do end` => `[do: {:__block__,[],[]}]`),
+      # NOT nil — Elixir distinguishes an empty block from a missing one.
+      [] -> {{:__block__, [], []}, acc, nid}
       [one] -> lower(one, view, opts, acc, nid)
       many -> wrap_block(lower_each(many, view, opts, acc, nid))
     end
@@ -632,6 +651,10 @@ defmodule Toxic2.Lower do
       [{:node, :stab_when, _sp, when_ch, _f, _d}] ->
         {parts, acc, nid} = lower_each(when_ch, view, opts, acc, nid)
         {[{:when, [], parts}], acc, nid}
+
+      # `fn () -> ... end`: an empty parenthesised head is ZERO args (`[]`), not one block arg.
+      [{:node, :paren, _sp, [], _f, _d}] ->
+        {[], acc, nid}
 
       children ->
         lower_each(children, view, opts, acc, nid)

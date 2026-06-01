@@ -549,6 +549,25 @@ defmodule Toxic2.ParserTest do
     end
   end
 
+  describe "empty bodies / step range" do
+    test "an empty do-body lowers to an empty block, not nil" do
+      assert {{:foo, _, [[do: {:__block__, _, []}]]}, []} = Toxic2.parse_to_ast("foo do end")
+
+      assert {{:if, _, [true, [do: {:__block__, _, []}]]}, []} =
+               Toxic2.parse_to_ast("if true do\nend")
+    end
+
+    test "fn with empty parens head has zero args" do
+      assert {{:fn, _, [{:->, _, [[], :ok]}]}, []} = Toxic2.parse_to_ast("fn () -> :ok end")
+    end
+
+    test "a..b//c is the ternary step range (even parenthesised)" do
+      assert {{:..//, _, [1, 10, 2]}, []} = Toxic2.parse_to_ast("1..10//2")
+      assert {{:..//, _, [1, 10, {:+, _, [2, 3]}]}, []} = Toxic2.parse_to_ast("1..10//2 + 3")
+      assert {{:..//, _, [1, 10, 2]}, []} = Toxic2.parse_to_ast("(1..10)//2")
+    end
+  end
+
   describe "chained / double-parens calls" do
     test "two paren-call groups per base are allowed and nest left" do
       assert {{{:foo, _, []}, _, []}, []} = Toxic2.parse_to_ast("foo()()")
