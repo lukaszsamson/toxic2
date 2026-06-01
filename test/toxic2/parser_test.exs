@@ -118,10 +118,19 @@ defmodule Toxic2.ParserTest do
       assert CST.node_kind(hd(es)) == :binary_op
     end
 
-    test "a newline BEFORE an operator ends the expression (Elixir semantics)" do
+    test "a newline BEFORE +/- ends the expression (they can be unary)" do
       {_view, es, []} = exprs("1\n+ 2")
       assert length(es) == 2
       assert CST.node_kind(Enum.at(es, 1)) == :unary_op
+    end
+
+    test "a newline BEFORE a binary-only operator continues it (multi-line pipes)" do
+      {_v, es, []} = exprs("a\n|> b")
+      assert length(es) == 1
+      assert {{:|>, _, [{:a, _, nil}, {:b, _, nil}]}, []} = Toxic2.parse_to_ast("a\n|> b")
+
+      assert {{:|>, _, [{:|>, _, [{:foo, _, []}, {:bar, _, []}]}, {:baz, _, []}]}, []} =
+               Toxic2.parse_to_ast("foo()\n|> bar()\n|> baz()")
     end
   end
 

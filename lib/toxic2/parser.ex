@@ -522,6 +522,11 @@ defmodule Toxic2.Parser do
     do: {lhs, i, diags, nid, fuel}
 
   defp led(t, i, lhs, min_bp, ctx, diags, nid, fuel) do
+    # A newline before a binding infix continues the expression (`a\n|> b`, the multi-line pipe
+    # idiom) — for EVERY operator except `+`/`-` (dual_op, ambiguous with the unary forms, where a
+    # leading newline starts a new statement). Dot continuation (`a\n.b`) is handled in postfix.
+    i = led_skip_eol(t, i, min_bp)
+
     # `a not in b`: the two-token `not in` operator (in_op precedence 170, left-assoc). Built as a
     # faithful :not_in_op CST; the rewrite to `not(a in b)` happens only in lowering (P: no
     # rewrite-ish work in Pratt).
@@ -529,6 +534,30 @@ defmodule Toxic2.Parser do
       led_not_in(t, i, lhs, min_bp, ctx, diags, nid, fuel)
     else
       led_infix(t, i, lhs, min_bp, ctx, diags, nid, fuel)
+    end
+  end
+
+  defp led_skip_eol(t, i, min_bp) do
+    if Tokens.kind(t, i) == :eol do
+      j = skip_eols(t, i)
+      if continues_after_eol?(t, j, min_bp), do: j, else: i
+    else
+      i
+    end
+  end
+
+  # The post-newline token continues the expression iff it's a binding infix that isn't `+`/`-`
+  # (dual_op), or the two-token `not in`. "Binding" uses led_infix's threshold (`prec >= min_bp`).
+  defp continues_after_eol?(t, j, min_bp) do
+    if not_in?(t, j) do
+      170 >= min_bp
+    else
+      kind = Tokens.kind(t, j)
+
+      case Precedence.infix(kind) do
+        {prec, _assoc} -> kind != :dual_op and prec >= min_bp
+        nil -> false
+      end
     end
   end
 

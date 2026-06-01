@@ -321,7 +321,13 @@ defmodule Toxic2.Conformance.Corpus do
     {"a\nb", [:layout]},
     {"a; b; c", [:layout]},
     {"1 +\n2", [:layout]},
-    {"1\n+ 2", [:layout]}
+    {"1\n+ 2", [:layout]},
+    # newline before a binary-only operator continues the expression (multi-line pipe idiom)
+    {"a\n|> b", [:layout]},
+    {"foo()\n|> bar()\n|> baz()", [:layout]},
+    {"x = a\n|> b\n|> c", [:layout]},
+    {"a\nwhen b", [:layout]},
+    {"a\n* b", [:layout]}
   ]
 
   # Oracle rejects these; Toxic2 must not crash and must emit an :error diagnostic.
