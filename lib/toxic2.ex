@@ -1,15 +1,17 @@
 defmodule Toxic2 do
   @moduledoc """
-  Toxic 2 — tolerant-only Elixir lexer + parser (lowerer lands in phase 6).
+  Toxic 2 — tolerant-only Elixir lexer + parser + lowerer.
 
   See `TOXIC_2.md` (repo root) for the canonical design spec.
 
-  - `tokenize/2` — batch lexer → `{tokens, warnings}`.
-  - `parse/2` — lexer + parser → `{cst, diagnostics}` (a green CST; AST lowering is phase 6).
+  - `tokenize/2` — batch lexer → `{tokens, notices}` (notices are out-of-band lexer warnings).
+  - `parse/2` — lexer + parser → `{cst, diagnostics}` (a green CST + combined diagnostic stream).
+  - `parse_to_ast/2` — full pipeline (lex → parse → lower) → `{ast, diagnostics}`.
   """
 
   @doc """
-  Tokenize Elixir source into `{tokens, warnings}`, both in source order.
+  Tokenize Elixir source into `{tokens, notices}`, both in source order (`notices` are the lexer's
+  out-of-band warnings).
 
   Delegates to `Toxic2.Lexer.tokenize/2`.
   """
@@ -19,9 +21,8 @@ defmodule Toxic2 do
   @doc """
   Parse Elixir source into `{cst, diagnostics}` (green CST + combined diagnostic stream).
 
-  The parser is tolerant-only and currently covers the phase-5 grammar subset (expression lists,
-  literals, identifiers/aliases/atoms, prefix/infix operators, parentheses). Delegates to
-  `Toxic2.Parser.parse/2`.
+  The parser is tolerant-only and covers the full Elixir grammar (the whole distribution
+  round-trips — see the conformance suite). Delegates to `Toxic2.Parser.parse/2`.
   """
   @spec parse(binary(), keyword()) :: Toxic2.Parser.result()
   defdelegate parse(source, opts \\ []), to: Toxic2.Parser

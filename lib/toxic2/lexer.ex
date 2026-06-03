@@ -49,7 +49,10 @@ defmodule Toxic2.Lexer do
   @compile {:inline, rest_at: 2, kw_suffix: 1, kw_colon?: 1, reserved_token: 4}
 
   @type token :: Toxic2.Token.t()
-  @type warning :: term()
+  # An id-less lexer warning notice; numbered into a `Diagnostic` at the parse boundary.
+  @type warning ::
+          {:lexer, :warning, atom(), {pos_integer(), pos_integer(), pos_integer(), pos_integer()},
+           map()}
 
   # Longest-match operator/structural table. Operator `value` is the (closed-set) operator atom.
   # `<<`/`>>` are structural delimiters that live here so `<<<`/`>>>`/`<<~` win by length.
@@ -160,10 +163,14 @@ defmodule Toxic2.Lexer do
   defguardp is_word(c) when c in ?a..?z or c in ?A..?Z or c in ?0..?9 or c == ?_
 
   @doc """
-  Tokenize `source` into `{tokens, warnings}`, both in **source order**.
+  Tokenize `source` into `{tokens, notices}`, both in **source order**.
 
-  `tokens` may contain `:error` tokens (tolerant mode is the only mode — P1). `warnings` is the
-  lexer's only out-of-band channel and is always `[]` in phase 2.
+  `tokens` may contain `:error` tokens (tolerant mode is the only mode — P1): lexical ERRORS travel
+  in-stream as `:error` tokens so the parser can convert each to a diagnostic and recover. `notices`
+  is the out-of-band WARNING channel — a list of id-less `{:lexer, :warning, code, {sl,sc,el,ec},
+  details}` tuples (charlist/quote deprecations, ambiguous-pipe-adjacent lexical warnings, unusual
+  char literals, …). They stay OUT of the token stream and are numbered into diagnostics at the
+  parse boundary (`Diagnostics.number/2`).
   """
   @spec tokenize(binary(), keyword()) :: {[token()], [warning()]}
   def tokenize(source, _opts \\ []) when is_binary(source) do
@@ -243,8 +250,16 @@ defmodule Toxic2.Lexer do
   # `?\<newline>` is a valid char (value `\n`) that CONSUMES the newline — the token spans onto the
   # next line, so line state advances and no trailing `:eol` is emitted (matching Elixir). A `\r`
   # escape (`?\<\r>`, incl. before `\n`) is the ordinary one-char case below — value `\r`, no consume.
+  # Like any named-escape special char, Elixir warns to write `?\n` instead.
   defp lex(<<??, ?\\, ?\n, rest::binary>>, line, col, acc, w, st),
-    do: cont(rest, {:char, line, col, line + 1, 1, ?\n}, acc, w, st)
+    do:
+      cont(
+        rest,
+        {:char, line, col, line + 1, 1, ?\n},
+        acc,
+        char_escape_notice(?\n, line, col, 2, w),
+        st
+      )
 
   defp lex(<<??, ?\\, e, rest::binary>>, line, col, acc, w, st) do
     value = Map.get(@char_escapes, e, e)

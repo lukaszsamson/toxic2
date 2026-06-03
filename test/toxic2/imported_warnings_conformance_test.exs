@@ -134,7 +134,8 @@ defmodule Toxic2.ImportedWarningsConformanceTest do
       {"Foo.\"bar\" do\n:ok\nend", :unnecessary_quoted_call},
       {"~S|foo\\|", :deprecated_sigil_escape},
       {"?\\q", :unknown_char_escape},
-      {"?\\t", :unusual_char_literal}
+      {"?\\t", :unusual_char_literal},
+      {"?\\\n", :unusual_char_literal}
     ]
 
     for {src, code} <- cases do

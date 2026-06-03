@@ -54,9 +54,10 @@ defmodule Toxic2.Diagnostics do
   Number a list of id-less lexer notices (`{phase, severity, code, span, details}`, in source order)
   into full diagnostics, allocating ids from `start_id`. Returns `{diagnostics, next_id}`.
 
-  Lexer WARNINGS travel as `:warning` tokens that `Tokens.from_source` partitions out of the parse
-  stream into notices; their ids are allocated here, AFTER the parser's, so the combined stream stays
-  unique (lexer errors keep their own transport — an `:error` token the parser converts to a diag).
+  Lexer WARNINGS ride the lexer's out-of-band notice channel (the lexer returns `{tokens, notices}`;
+  they are never put in the token stream); `Tokens.from_source` passes the notices through alongside
+  the token view. Their ids are allocated here, AFTER the parser's, so the combined stream stays
+  unique (lexer ERRORS keep their own transport — an in-stream `:error` token the parser converts).
   """
   @spec number([tuple()], pos_integer()) :: {[Diagnostic.t()], pos_integer()}
   def number(notices, start_id) do

@@ -18,9 +18,11 @@ defmodule Toxic2.DiagnosticsConformanceTest do
   end
 
   defp toxic2_diags(src) do
-    {ast, diags} = Toxic2.parse_to_ast(src)
-    # totality: an AST is always produced
-    assert ast != nil or match?({:__block__, _, []}, ast) or true
+    # totality (P5): the call returns `{ast, diagnostics}` and never raises — the match itself proves
+    # the shape (a non-tuple or a raise fails here). `ast` may legitimately be any quoted term,
+    # including `nil` (for the input `"nil"`), so we don't constrain it; `diagnostics` is a list.
+    {_ast, diags} = Toxic2.parse_to_ast(src)
+    assert is_list(diags)
     diags
   end
 

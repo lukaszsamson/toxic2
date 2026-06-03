@@ -16,7 +16,7 @@ warns about — so it classified almost everything as `:warning`. All numbers be
 | crashes | **0** | toxic2 never raises (P5 totality holds) |
 | false errors (oracle ok/warn, toxic2 error) | 83 | toxic2 too strict on operator-soup |
 | missed errors (oracle error, toxic2 ok/warn) | 50 | strict-mode detection gaps |
-| missed warnings (oracle warn, toxic2 ok) | 17 | edge variants of warnings we DO emit |
+| missed warnings (oracle warn, toxic2 ok) | 16 | edge variants of warnings we DO emit |
 | **extra warnings (oracle ok, toxic2 warn)** | **0** | no false-positive warnings |
 
 On the 2632-file **real-world** corpus (elixir/lib, deps, absinthe, bitcoinex, dialyxir): **0 false
@@ -76,7 +76,7 @@ The one structural theme worth noting (still fuzzer-only): a no-parens call with
 because the inner kw args don't get absorbed by the inner call. Real code writes `defstruct` at the
 module level, not as a paren-call kw value, so this never hits the corpus.
 
-## Missed WARNINGS (17) — oracle warns, toxic2 stays clean
+## Missed WARNINGS (16) — oracle warns, toxic2 stays clean
 
 Edge variants of warnings toxic2 already emits in the common case:
 
@@ -87,8 +87,9 @@ Edge variants of warnings toxic2 already emits in the common case:
   `<do-block> <op> <multi-arg no-parens>` shape but not these nested fuzzer forms.
 - **[4] `:empty_stab_clause`** with a `;` in the body (`fn x when e->;e -> 1 end`, `fn 1 -> ;fs
   end`) — toxic2 detects a truly empty `->` body but treats a leading `;` as a (non-empty) statement.
-- **[1] `?\<newline>`** — the char-literal-followed-by-raw-newline case, explicitly skipped (it
-  requires typing a literal newline after `?\`, essentially never seen).
+
+(The `?\<newline>` char-literal warning that previously sat here is now emitted —
+`:unusual_char_literal`, same as any named-escape special char.)
 
 ## Verdict
 
