@@ -84,6 +84,47 @@ defmodule Toxic2.DiagnosticsConformanceTest do
       assert_classified("foo@bar")
     end
 
+    test "keyword colon must be followed by whitespace" do
+      # `foo:bar` / `foo:1` / `Foo:1` / `foo:` at EOF are rejected (keyword needs a trailing space)
+      assert_classified("[foo:bar]")
+      assert_classified("[a:1]")
+      assert_classified("[a: 1, b:2]")
+      assert_classified("[Foo:1]")
+      assert_classified("foo:")
+      # a properly-spaced keyword stays valid (space, tab, or newline all count)
+      assert_classified("[foo: 1]")
+      assert_classified("%{foo: 1}")
+      assert_classified("[foo:\n1]")
+      assert_classified("[Foo: 1]")
+    end
+
+    test "an atom literal cannot be followed by an alias" do
+      # `:foo.Bar` / `nil.Bar` etc. — the base of a `.Alias` must not be a bare atom
+      assert_classified(":foo.Bar")
+      assert_classified("nil.Bar")
+      assert_classified("true.Bar")
+      assert_classified(~S(:"foo".Bar))
+      assert_classified(":foo.Bar.Baz")
+      # non-atom bases stay valid
+      assert_classified("__MODULE__.Bar")
+      assert_classified("x.Bar")
+      assert_classified("@x.Bar")
+      assert_classified(":foo.bar")
+      assert_classified("Foo.Bar")
+    end
+
+    test "consecutive semicolons are rejected (single/leading/trailing are fine)" do
+      assert_classified(";;")
+      assert_classified("a;;b")
+      assert_classified("a ; ; b")
+      assert_classified("a;\n;b")
+      # a single, leading, or trailing semicolon is valid
+      assert_classified(";")
+      assert_classified(";a")
+      assert_classified("a;")
+      assert_classified("a;b;c")
+    end
+
     test "already-covered escape / sigil / bidi rejections still hold" do
       assert_classified("\"\\xG\"")
       assert_classified("\"\\u{110000}\"")

@@ -1462,6 +1462,7 @@ defmodule Toxic2.Lower do
     else
       {base_ast, acc, nid} = lower(first, view, opts, acc, nid)
       meta = alias_base_meta(first, meta, view, opts)
+      {acc, nid} = maybe_atom_dot_alias(base_ast, rest, view, acc, nid)
 
       case seg_atoms(rest, view, opts) do
         {:ok, atoms} ->
@@ -1522,6 +1523,19 @@ defmodule Toxic2.Lower do
 
   defp alias_seg_error(leaf, view, acc, nid),
     do: nonexistent_atom(leaf, view, Tokens.value(view, CST.token_index(leaf)), acc, nid)
+
+  # `:foo.Bar` / `nil.Bar` — a bare ATOM literal cannot be followed by an alias (Elixir rejects it;
+  # to keep the atom in its name, it must be quoted). Non-atom bases (`__MODULE__.X`, `x.X`, `@x.X`)
+  # are fine. Mirrors elixir_parser's `build_dot_alias` `is_atom(Atom)` guard. We keep the
+  # `__aliases__` tree (tolerant) but record the error so strict mode rejects it.
+  defp maybe_atom_dot_alias(base, [seg | _], view, acc, nid) when is_atom(base) do
+    {_id, acc, nid} =
+      Diagnostics.emit(acc, nid, :lowerer, :error, :atom_dot_alias, name_span(seg, view), %{})
+
+    {acc, nid}
+  end
+
+  defp maybe_atom_dot_alias(_base, _rest, _view, acc, nid), do: {acc, nid}
 
   # `a.b` / `a.b(args)` => `{{:., m, [base, name]}, m, args}` (zero-arg form is just `args = []`).
   defp lower_remote_call([base, name_leaf | arg_children], view, opts, acc, nid) do

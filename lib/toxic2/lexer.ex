@@ -421,8 +421,20 @@ defmodule Toxic2.Lexer do
   defp lex(<<?}, rest::binary>>, line, col, acc, w, st),
     do: cont(rest, {:"}", line, col, line, col + 1, nil}, acc, w, st)
 
+  # `;` is an end-of-expression separator, but two CONSECUTIVE semicolons (with only
+  # whitespace/newlines between — newlines fold into the preceding `;` in Elixir) are rejected:
+  # `;;`, `a;\n;b`. A single/leading/trailing `;` is fine. Tolerant: record the error, keep the `;`.
+  defp lex(<<?;, rest::binary>>, line, col, acc, w, st) do
+    acc =
+      if prev_semicolon?(acc),
+        do: [{:error, line, col, line, col + 1, LexError.new(:unexpected_semicolon, %{})} | acc],
+        else: acc
+
+    cont(rest, {:";", line, col, line, col + 1, nil}, acc, w, st)
+  end
+
   # --- other single-char delimiters / separators ------------------------
-  defp lex(<<c, rest::binary>>, line, col, acc, w, st) when c in [?(, ?), ?[, ?], ?,, ?;],
+  defp lex(<<c, rest::binary>>, line, col, acc, w, st) when c in [?(, ?), ?[, ?], ?,],
     do: cont(rest, {delim_kind(c), line, col, line, col + 1, nil}, acc, w, st)
 
   # --- identifiers (lowercase/_) : kw key, reserved op, literal, or name --
@@ -438,6 +450,10 @@ defmodule Toxic2.Lexer do
       _ ->
         case kw_suffix(after_name) do
           {:kw, rest} ->
+            cont(rest, {:kw_identifier, line, col, line, col + len + 1, name}, acc, w, st)
+
+          {:kw_nospace, rest} ->
+            acc = kw_nospace_error(name, line, col, len, acc)
             cont(rest, {:kw_identifier, line, col, line, col + len + 1, name}, acc, w, st)
 
           :no ->
@@ -458,6 +474,10 @@ defmodule Toxic2.Lexer do
       _ ->
         case kw_suffix(after_name) do
           {:kw, rest} ->
+            cont(rest, {:kw_identifier, line, col, line, col + len + 1, name}, acc, w, st)
+
+          {:kw_nospace, rest} ->
+            acc = kw_nospace_error(name, line, col, len, acc)
             cont(rest, {:kw_identifier, line, col, line, col + len + 1, name}, acc, w, st)
 
           :no ->
@@ -530,6 +550,10 @@ defmodule Toxic2.Lexer do
           {:kw, r} ->
             cont(r, {:kw_identifier, line, col, line, col + len + 1, name}, acc, w, st)
 
+          {:kw_nospace, r} ->
+            acc = kw_nospace_error(name, line, col, len, acc)
+            cont(r, {:kw_identifier, line, col, line, col + len + 1, name}, acc, w, st)
+
           :no ->
             unicode_error(bin, line, col, acc, w, st)
         end
@@ -547,6 +571,10 @@ defmodule Toxic2.Lexer do
   defp emit_unicode_name(kind, name, rest, len, line, col, acc, w, st) do
     case kw_suffix(rest) do
       {:kw, r} ->
+        cont(r, {:kw_identifier, line, col, line, col + len + 1, name}, acc, w, st)
+
+      {:kw_nospace, r} ->
+        acc = kw_nospace_error(name, line, col, len, acc)
         cont(r, {:kw_identifier, line, col, line, col + len + 1, name}, acc, w, st)
 
       :no ->
@@ -668,9 +696,29 @@ defmodule Toxic2.Lexer do
 
   # `foo:` keyword key iff a single `:` follows (not `::`). Works for reserved words too
   # (`do:` is a keyword key, not the `do` terminator).
+  # A keyword key colon must be followed by `is_space` (space/tab/CR/LF) — `foo:bar`/`foo:1`/`foo:`
+  # at EOF are rejected by Elixir ("keyword argument must be followed by space"). `foo::` is the
+  # type operator, never a keyword.
+  # Look back past any `:eol` tokens (newlines fold into a preceding `;` in Elixir) for a `;`.
+  defp prev_semicolon?([{:eol, _, _, _, _, _} | rest]), do: prev_semicolon?(rest)
+  defp prev_semicolon?([{:";", _, _, _, _, _} | _]), do: true
+  defp prev_semicolon?(_), do: false
+
   defp kw_suffix(<<?:, ?:, _::binary>>), do: :no
-  defp kw_suffix(<<?:, rest::binary>>), do: {:kw, rest}
+
+  defp kw_suffix(<<?:, c, _::binary>> = bin) when c in [?\s, ?\t, ?\r, ?\n],
+    do: {:kw, rest_at(bin, 1)}
+
+  defp kw_suffix(<<?:, _::binary>> = bin), do: {:kw_nospace, rest_at(bin, 1)}
   defp kw_suffix(_), do: :no
+
+  # `foo:bar` — keep the keyword interpretation (tolerant: the tree stays `[foo: bar]`) but record
+  # the missing-space error so strict mode rejects it, matching the oracle.
+  defp kw_nospace_error(name, line, col, len, acc),
+    do: [
+      {:error, line, col, line, col + len + 1, LexError.new(:kw_missing_space, %{name: name})}
+      | acc
+    ]
 
   # --- longest-match operator lookup -------------------------------------
 

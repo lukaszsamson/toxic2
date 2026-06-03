@@ -303,7 +303,8 @@ defmodule Toxic2.LexerTest do
     end
 
     test "keyword-key span includes the colon" do
-      [kw] = tokens("foo:")
+      # the keyword colon must be followed by whitespace (`foo:` alone is a missing-space error)
+      [kw] = tokens("foo: ")
       assert Token.span(kw) == {1, 1, 1, 5}
     end
 
