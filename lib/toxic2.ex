@@ -43,13 +43,21 @@ defmodule Toxic2 do
       literal (integers, floats, atoms, strings, charlists, `true`/`false`/`nil`, list and 2-tuple
       containers, keyword keys) so bare literals — which have no metadata slot in the AST — can be
       wrapped to carry position info. Elixir-compatible; combine with `:range` for literal ranges.
+    * `:token_metadata` (default `false`) — attach Elixir's `token_metadata: true` meta keys:
+      `closing:`, `do:`/`end:`, `delimiter:`, `token:` (raw numeric/char text), `format: :keyword`,
+      `assoc:`, `last:`, `from_brackets:`, `from_interpolation:`, `indentation:` (heredocs),
+      `no_parens:`, `parens:`, `newlines:`, and `end_of_expression: [newlines:, line:, column:]`.
+      Source-derived; pair with `:literal_encoder` so literals carry meta too (matching how the
+      oracle threads `token_metadata` through the encoder).
   """
   @spec parse_to_ast(binary(), keyword()) :: {Macro.t(), [Toxic2.Diagnostic.t()]}
   def parse_to_ast(source, opts \\ []) when is_binary(source) do
     {view, warnings} = Toxic2.Tokens.from_source(source, opts)
     {cst, parser_diags} = Toxic2.Parser.parse_tokens(view)
     # Lowerer ids continue past lexer/parser ids so the combined stream stays unique.
-    {ast, lowerer_diags} = Toxic2.Lower.to_ast(cst, view, opts, next_id(warnings, parser_diags))
+    {ast, lowerer_diags} =
+      Toxic2.Lower.to_ast(cst, view, source, opts, next_id(warnings, parser_diags))
+
     {ast, Toxic2.Diagnostics.merge_sorted([warnings, parser_diags, lowerer_diags])}
   end
 

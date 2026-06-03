@@ -185,6 +185,7 @@ defmodule Toxic2.Lexer do
   # --- comments (dropped unless preserved; phase 2 drops) ----------------
   defp lex(<<?#, rest::binary>>, line, col, acc, w, st) do
     {drop_len, rest2} = take_while(rest, 0, &(&1 != ?\n))
+    acc = comment_bidi_check(rest, line, col + 1, acc)
     lex(rest2, line, col + 1 + drop_len, acc, w, st)
   end
 
@@ -219,11 +220,18 @@ defmodule Toxic2.Lexer do
     namelen = sigil_name(rest_at(bin, 1), 0)
     name = binary_part(bin, 1, namelen)
     ncol = col + 1 + namelen
+    acc = sigil_name_check(name, line, col, ncol, acc)
     start = {:sigil_start, line, col, line, ncol, name}
     begin_sigil(rest_at(bin, 1 + namelen), line, ncol, [start | acc], w, st, name)
   end
 
   # --- char literals: ?\<esc> and ?<codepoint> ---------------------------
+  # `?\<newline>` is a valid char (value `\n`) that CONSUMES the newline — the token spans onto the
+  # next line, so line state advances and no trailing `:eol` is emitted (matching Elixir). A `\r`
+  # escape (`?\<\r>`, incl. before `\n`) is the ordinary one-char case below — value `\r`, no consume.
+  defp lex(<<??, ?\\, ?\n, rest::binary>>, line, col, acc, w, st),
+    do: cont(rest, {:char, line, col, line + 1, 1, ?\n}, acc, w, st)
+
   defp lex(<<??, ?\\, e, rest::binary>>, line, col, acc, w, st) do
     value = Map.get(@char_escapes, e, e)
     cont(rest, {:char, line, col, line, col + 3, value}, acc, w, st)
@@ -661,8 +669,17 @@ defmodule Toxic2.Lexer do
   # unterminated. Escapes (`\n`, `\xHH`, `\u{..}`, line-continuation `\<newline>`, …) are decoded
   # by `decode_escape`. `fs = {line, col}` is the start of the fragment accumulated in `buf`.
   defp read_quoted(<<?\\, rest::binary>>, line, col, buf, fs, acc, w, st, qk) do
-    {app, rest2, line2, col2} = decode_escape(rest, line, col)
-    read_quoted(rest2, line2, col2, [app | buf], fs, acc, w, st, qk)
+    {app, rest2, line2, col2, err} = decode_escape(rest, line, col)
+
+    case err do
+      nil ->
+        read_quoted(rest2, line2, col2, [app | buf], fs, acc, w, st, qk)
+
+      {code, details} ->
+        acc = flush_fragment(buf, fs, line, col, acc, frag_kind(qk))
+        acc = [{:error, line, col, line2, col2, LexError.new(code, details)} | acc]
+        read_quoted(rest2, line2, col2, [app], {line2, col2}, acc, w, st, qk)
+    end
   end
 
   defp read_quoted(<<?#, ?{, rest::binary>>, line, col, buf, fs, acc, w, st, qk) do
@@ -708,10 +725,21 @@ defmodule Toxic2.Lexer do
   end
 
   defp read_quoted(<<c::utf8, rest::binary>>, line, col, buf, fs, acc, w, st, qk) do
-    if c == close_char(qk) do
-      close_quoted(rest, line, col, buf, fs, acc, w, st, qk)
-    else
-      read_quoted(rest, line, col + 1, [<<c::utf8>> | buf], fs, acc, w, st, qk)
+    cond do
+      c == close_char(qk) ->
+        close_quoted(rest, line, col, buf, fs, acc, w, st, qk)
+
+      bidi?(c) ->
+        acc = flush_fragment(buf, fs, line, col, acc, frag_kind(qk))
+
+        acc = [
+          {:error, line, col, line, col + 1, LexError.new(:invalid_bidi, %{codepoint: c})} | acc
+        ]
+
+        read_quoted(rest, line, col + 1, [<<c::utf8>>], {line, col + 1}, acc, w, st, qk)
+
+      true ->
+        read_quoted(rest, line, col + 1, [<<c::utf8>> | buf], fs, acc, w, st, qk)
     end
   end
 
@@ -755,43 +783,63 @@ defmodule Toxic2.Lexer do
   # `\` at EOF (kept literal). Tolerant: a malformed `\x`/`\u` falls back to the literal letter.
   defp decode_escape(rest, line, col) do
     case esc(rest) do
-      {app, rest2, :newline} ->
-        {app, rest2, line + 1, 1}
+      {app, rest2, :newline, err} ->
+        {app, rest2, line + 1, 1, err}
 
-      {app, rest2, :sameline} ->
-        {app, rest2, line, col + 1 + (byte_size(rest) - byte_size(rest2))}
+      {app, rest2, :sameline, err} ->
+        {app, rest2, line, col + 1 + (byte_size(rest) - byte_size(rest2)), err}
     end
   end
 
+  # `\x{H..}` — a codepoint (deprecated form). Empty braces (`\x{}`) are invalid.
   defp esc(<<?x, ?{, rest::binary>>) do
     {hex, rest2} = take_hex(rest, <<>>)
-    {cp_to_utf8(hex), drop_rbrace(rest2), :sameline}
+    rest3 = drop_rbrace(rest2)
+
+    if hex == <<>>,
+      do: {<<>>, rest3, :sameline, {:invalid_hex_escape, %{}}},
+      else: wrap_cp(cp_to_utf8(hex), rest3)
   end
 
   defp esc(<<?x, a, b, rest::binary>>) when is_hex(a) and is_hex(b),
-    do: {<<hex_val(a) * 16 + hex_val(b)>>, rest, :sameline}
+    do: {<<hex_val(a) * 16 + hex_val(b)>>, rest, :sameline, nil}
 
-  defp esc(<<?x, a, rest::binary>>) when is_hex(a), do: {<<hex_val(a)>>, rest, :sameline}
+  defp esc(<<?x, a, rest::binary>>) when is_hex(a), do: {<<hex_val(a)>>, rest, :sameline, nil}
 
+  # `\x` not followed by a hex digit or `{` (e.g. `\xG`) — invalid (Elixir rejects it).
+  defp esc(<<?x, rest::binary>>), do: {<<?x>>, rest, :sameline, {:invalid_hex_escape, %{}}}
+
+  # `\u{H..}` — a codepoint. Empty braces / out-of-range / surrogate are invalid.
   defp esc(<<?u, ?{, rest::binary>>) do
     {hex, rest2} = take_hex(rest, <<>>)
-    {cp_to_utf8(hex), drop_rbrace(rest2), :sameline}
+    rest3 = drop_rbrace(rest2)
+
+    if hex == <<>>,
+      do: {<<>>, rest3, :sameline, {:invalid_unicode_escape, %{}}},
+      else: wrap_cp(cp_to_utf8(hex), rest3)
   end
 
   defp esc(<<?u, a, b, c, d, rest::binary>>)
        when is_hex(a) and is_hex(b) and is_hex(c) and is_hex(d),
-       do: {cp_to_utf8(<<a, b, c, d>>), rest, :sameline}
+       do: wrap_cp(cp_to_utf8(<<a, b, c, d>>), rest)
 
-  defp esc(<<?\r, ?\n, rest::binary>>), do: {<<>>, rest, :newline}
-  defp esc(<<?\n, rest::binary>>), do: {<<>>, rest, :newline}
+  # `\u` not followed by 4 hex digits or `{` (e.g. `\uZ`, `\u1F`) — invalid.
+  defp esc(<<?u, rest::binary>>), do: {<<?u>>, rest, :sameline, {:invalid_unicode_escape, %{}}}
+
+  defp esc(<<?\r, ?\n, rest::binary>>), do: {<<>>, rest, :newline, nil}
+  defp esc(<<?\n, rest::binary>>), do: {<<>>, rest, :newline, nil}
 
   defp esc(<<e::utf8, rest::binary>>),
-    do: {<<Map.get(@char_escapes, e, e)::utf8>>, rest, :sameline}
+    do: {<<Map.get(@char_escapes, e, e)::utf8>>, rest, :sameline, nil}
 
   # Tolerant (totality): `\` before an invalid UTF-8 byte keeps that byte literally (never raise).
-  defp esc(<<byte, rest::binary>>), do: {<<byte>>, rest, :sameline}
+  defp esc(<<byte, rest::binary>>), do: {<<byte>>, rest, :sameline, nil}
 
-  defp esc(<<>>), do: {<<?\\>>, <<>>, :sameline}
+  defp esc(<<>>), do: {<<?\\>>, <<>>, :sameline, nil}
+
+  # A decoded codepoint: `:error` (out of range / surrogate) becomes an invalid-codepoint diagnostic.
+  defp wrap_cp({:ok, bytes}, rest), do: {bytes, rest, :sameline, nil}
+  defp wrap_cp(:error, rest), do: {<<>>, rest, :sameline, {:invalid_unicode_codepoint, %{}}}
 
   defp take_hex(<<c, rest::binary>>, acc) when is_hex(c), do: take_hex(rest, <<acc::binary, c>>)
   defp take_hex(bin, acc), do: {acc, bin}
@@ -803,13 +851,12 @@ defmodule Toxic2.Lexer do
   defp hex_val(c) when c in ?a..?f, do: c - ?a + 10
   defp hex_val(c) when c in ?A..?F, do: c - ?A + 10
 
-  # A codepoint from collected hex digits, UTF-8 encoded. Tolerant: empty or out-of-range → "".
-  defp cp_to_utf8(<<>>), do: <<>>
-
+  # A codepoint from collected hex digits, UTF-8 encoded: `{:ok, bytes}`, or `:error` when the value
+  # is out of range (> 0x10FFFF) or a surrogate (which `<<cp::utf8>>` rejects with ArgumentError).
   defp cp_to_utf8(hex) do
-    <<String.to_integer(hex, 16)::utf8>>
+    {:ok, <<String.to_integer(hex, 16)::utf8>>}
   rescue
-    ArgumentError -> <<>>
+    ArgumentError -> :error
   end
 
   # An interpolation's matching `}` resumes whatever literal it opened inside (P3: one scanner).
@@ -878,6 +925,46 @@ defmodule Toxic2.Lexer do
     do: sigil_name(rest, n + 1)
 
   defp sigil_name(_bin, n), do: n
+
+  # Bidirectional formatting controls (Elixir's `?bidi` macro): rejected in comments and strings
+  # because they can visually reorder source against its logical meaning (a security hazard).
+  defp bidi?(c),
+    do: c in [0x202A, 0x202B, 0x202C, 0x202D, 0x202E, 0x2066, 0x2067, 0x2068, 0x2069]
+
+  # Scan a (to-be-dropped) comment's content for a bidi control; emit a lexer error at the first one.
+  defp comment_bidi_check(bin, line, col, acc) do
+    case find_bidi(bin, col) do
+      nil -> acc
+      bcol -> [{:error, line, bcol, line, bcol + 1, LexError.new(:invalid_bidi, %{})} | acc]
+    end
+  end
+
+  defp find_bidi(<<?\n, _::binary>>, _col), do: nil
+  defp find_bidi(<<>>, _col), do: nil
+
+  defp find_bidi(<<c::utf8, rest::binary>>, col),
+    do: if(bidi?(c), do: col, else: find_bidi(rest, col + 1))
+
+  defp find_bidi(<<_byte, rest::binary>>, col), do: find_bidi(rest, col + 1)
+
+  # A sigil name is either a single lowercase letter or an uppercase letter followed by uppercase
+  # letters / digits (`~r`, `~S`, `~A1`); anything else (`~foo`, `~ab`, `~Ab`, `~A1b`) is invalid.
+  # Tolerant: emit a lexer error token before the sigil but keep lexing the sigil itself.
+  defp sigil_name_check(name, line, col, ncol, acc) do
+    if valid_sigil_name?(name),
+      do: acc,
+      else: [
+        {:error, line, col, line, ncol, LexError.new(:invalid_sigil_name, %{name: name})} | acc
+      ]
+  end
+
+  defp valid_sigil_name?(<<c>>) when c in ?a..?z, do: true
+  defp valid_sigil_name?(<<c, rest::binary>>) when c in ?A..?Z, do: upper_digits?(rest)
+  defp valid_sigil_name?(_name), do: false
+
+  defp upper_digits?(<<c, rest::binary>>) when c in ?A..?Z or c in ?0..?9, do: upper_digits?(rest)
+  defp upper_digits?(<<>>), do: true
+  defp upper_digits?(_rest), do: false
 
   # An uppercase-named sigil is "raw" (no interpolation); a lowercase-named one interpolates.
   defp sigil_interp?(<<c, _::binary>>) when c in ?A..?Z, do: false
@@ -970,10 +1057,19 @@ defmodule Toxic2.Lexer do
          acc,
          w,
          st,
-         {_d, :full, _i, _s, _ek} = hc
+         {_d, :full, _i, _s, ek} = hc
        ) do
-    {app, rest2, line2, col2} = decode_escape(rest, line, col)
-    read_heredoc(rest2, line2, col2, [app | buf], fs, acc, w, st, hc)
+    {app, rest2, line2, col2, err} = decode_escape(rest, line, col)
+
+    case err do
+      nil ->
+        read_heredoc(rest2, line2, col2, [app | buf], fs, acc, w, st, hc)
+
+      {code, details} ->
+        acc = flush_fragment(buf, fs, line, col, acc, frag_of(ek))
+        acc = [{:error, line, col, line2, col2, LexError.new(code, details)} | acc]
+        read_heredoc(rest2, line2, col2, [app], {line2, col2}, acc, w, st, hc)
+    end
   end
 
   # In a raw (`~S"""`) heredoc, a `\` before the full delimiter escapes it: `\"""` keeps `"""` as

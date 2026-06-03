@@ -298,11 +298,48 @@ defmodule Toxic2.Parser do
     if tk(t, i) == :"," do
       {arg, j, is_kw, diags, nid, fuel} = parse_np_arg(t, skip_eols(t, i + 1), diags, nid, fuel)
       {diags, nid} = check_kw_last(seen_kw, is_kw, t, arg, diags, nid)
+      {diags, nid} = check_no_parens_strict(t, arg, diags, nid)
       np_more_args(t, j, [arg | args], seen_kw or is_kw, diags, nid, fuel)
     else
       {:lists.reverse(args), i, diags, nid, fuel}
     end
   end
+
+  # A non-first argument of a no-parens call may not itself be a no-parens MANY / ambiguous-one call
+  # (`foo a, bar b, c` is ambiguous between `foo(a, bar(b, c))` and `foo(a, bar(b), c)`). Elixir's
+  # grammar rejects it via `error_no_parens_many_strict`; parentheses are required. We diagnose it
+  # (tolerant: the best-effort AST still nests the inner call).
+  defp check_no_parens_strict(t, arg, diags, nid) do
+    if no_parens_expr?(arg) do
+      {_id, diags, nid} =
+        Diagnostics.emit(diags, nid, :parser, :error, :ambiguous_no_parens, cst_span(t, arg), %{})
+
+      {diags, nid}
+    else
+      {diags, nid}
+    end
+  end
+
+  # A `no_parens_expr` in the grammar: a no-parens call with several args (`a, b` → no_parens_many)
+  # or a single argument that is itself a no-parens expr (`g a, b` → no_parens_one_ambig). A plain
+  # single-arg call (`f a`) is a `matched_expr`, which is fine.
+  defp no_parens_expr?(arg) do
+    kind = CST.tag(arg) == :node and CST.node_kind(arg)
+
+    if kind in [:np_call, :remote_call] and CST.category(arg) == :no_parens do
+      case np_call_args(kind, CST.children(arg)) do
+        [_, _ | _] -> true
+        [single] -> no_parens_expr?(single)
+        _ -> false
+      end
+    else
+      false
+    end
+  end
+
+  defp np_call_args(:np_call, [_callee | args]), do: args
+  defp np_call_args(:remote_call, [_base, _name | args]), do: args
+  defp np_call_args(_kind, _children), do: []
 
   # Build the no-parens call, marking it `:no_parens` (so a container can detect the ambiguous
   # `[f a, b]`). A plain identifier callee becomes `:np_call`; a bare remote (`a.b`) gains args.
@@ -605,6 +642,7 @@ defmodule Toxic2.Parser do
       # are a comma-separated sequence; lowers to `{{:., _, [base, :{}]}, _, [elems]}`.
       :"{" ->
         {elems, k, diags, nid, fuel} = parse_seq(t, j + 1, :"}", :tuple, diags, nid, fuel)
+        {diags, nid} = check_container_lead(:dot_tuple, t, elems, diags, nid)
 
         node =
           CST.node(
@@ -1766,9 +1804,11 @@ defmodule Toxic2.Parser do
     {CST.node(kind, merge_tt(t, open, j - 1), elems, :matched, nil), j, diags, nid, fuel}
   end
 
-  # A tuple/bitstring may carry trailing keywords (`{1, a: 1}` => `{1, [a: 1]}`) but its FIRST
-  # element must be positional — an all-keyword `{a: 1}` / `<<a: 1>>` is rejected by Elixir.
-  defp check_container_lead(kind, t, [first | _], diags, nid) when kind in [:tuple, :bitstring] do
+  # A tuple/bitstring/dot-tuple may carry trailing keywords (`{1, a: 1}` => `{1, [a: 1]}`) but its
+  # FIRST element must be positional — Elixir's `container_args` requires a positional lead, so an
+  # all-keyword `{a: 1}` / `<<a: 1>>` / `Foo.{a: 1}` is rejected.
+  defp check_container_lead(kind, t, [first | _], diags, nid)
+       when kind in [:tuple, :bitstring, :dot_tuple] do
     if kw_pair_node?(first) do
       {_id, diags, nid} =
         Diagnostics.emit(diags, nid, :parser, :error, :keyword_not_allowed, cst_span(t, first), %{
@@ -1801,6 +1841,7 @@ defmodule Toxic2.Parser do
   defp seq_elems(t, i, acc, seen_kw, close, mode, diags, nid, fuel) do
     {el, i, is_kw, diags, nid, fuel} = parse_element(t, i, mode, diags, nid, fuel)
     {diags, nid} = check_kw_last(seen_kw, is_kw, t, el, diags, nid)
+    {diags, nid} = check_call_arg_strict(mode, el, acc, t, diags, nid)
     acc = [el | acc]
     i2 = skip_eols(t, i)
 
@@ -1965,6 +2006,23 @@ defmodule Toxic2.Parser do
   end
 
   defp check_np_comma(_mode, _el, _t, _comma_i, diags, nid), do: {diags, nid}
+
+  # A NON-FIRST parenthesised call argument may not be a no-parens MANY / ambiguous-one call (`foo(a,
+  # bar b, c)` — `bar b, c` absorbs the comma into a `no_parens_many`). Elixir rejects it via
+  # `error_no_parens_many_strict` on `call_args_parens_expr`. As the sole/first arg it is fine
+  # (`foo(bar b, c)` = `foo(bar(b, c))`, a `call_args_parens_one`), hence the non-empty `acc` guard.
+  defp check_call_arg_strict(:call, el, [_ | _] = _acc, t, diags, nid) do
+    if no_parens_expr?(el) do
+      {_id, diags, nid} =
+        Diagnostics.emit(diags, nid, :parser, :error, :ambiguous_no_parens, cst_span(t, el), %{})
+
+      {diags, nid}
+    else
+      {diags, nid}
+    end
+  end
+
+  defp check_call_arg_strict(_mode, _el, _acc, _t, diags, nid), do: {diags, nid}
 
   # A non-keyword element after a keyword pair: keyword lists must come last.
   defp check_kw_last(true, false, t, el, diags, nid) do

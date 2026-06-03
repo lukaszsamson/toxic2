@@ -28,21 +28,168 @@ defmodule Toxic2.Lower do
   Lower `cst` to AST. Returns `{ast, lowerer_diagnostics}` (source-ordered). `start_id` is the
   next free diagnostic id (so ids don't collide with lexer/parser diagnostics).
   """
-  @spec to_ast(CST.t(), Tokens.t(), keyword(), pos_integer()) :: {ast(), [Toxic2.Diagnostic.t()]}
-  def to_ast(cst, view, opts \\ [], start_id \\ 1) do
-    {ast, acc, _nid} = lower(cst, view, resolve_opts(opts), [], start_id)
+  @spec to_ast(CST.t(), Tokens.t(), String.t(), keyword(), pos_integer()) ::
+          {ast(), [Toxic2.Diagnostic.t()]}
+  def to_ast(cst, view), do: to_ast(cst, view, "", [], 1)
+
+  # Backward-compatible arities: the original public shape was `to_ast(cst, view, opts, start_id)`
+  # (no source). `token_metadata: true` needs the source to scan `delimiter:`/`token:`/`newlines:`,
+  # so the 5-arity form threads it; the keyword-`opts` 3/4-arities keep old callers working.
+  def to_ast(cst, view, opts) when is_list(opts), do: to_ast(cst, view, "", opts, 1)
+
+  def to_ast(cst, view, opts, start_id) when is_list(opts) and is_integer(start_id),
+    do: to_ast(cst, view, "", opts, start_id)
+
+  def to_ast(cst, view, source, opts, start_id)
+      when is_binary(source) and is_list(opts) and is_integer(start_id) do
+    {ast, acc, _nid} = lower(cst, view, resolve_opts(opts, source), [], start_id)
     {ast, Diagnostics.to_list(acc)}
   end
 
   # Resolve the (keyword) options ONCE into a compact map threaded through lowering, so per-node
   # checks are a map field read (`opts.range`) instead of a `Keyword.get` keyfind over the option
-  # list on every node (tprof: that keyfind was ~4 % of all calls).
-  defp resolve_opts(opts) do
+  # list on every node (tprof: that keyfind was ~4 % of all calls). `token_metadata` mode also
+  # carries the source split into lines (codepoint columns) so helpers can slice `delimiter:`/`token:`.
+  defp resolve_opts(opts, source) do
+    tm = Keyword.get(opts, :token_metadata, false)
+
     %{
       existing_atoms_only: Keyword.get(opts, :existing_atoms_only, false),
       range: Keyword.get(opts, :range, false),
-      literal_encoder: Keyword.get(opts, :literal_encoder)
+      literal_encoder: Keyword.get(opts, :literal_encoder),
+      token_metadata: tm,
+      source_lines: if(tm, do: source_lines(source), else: nil)
     }
+  end
+
+  # Split into lines for codepoint-column scanning. A CRLF file leaves a trailing `\r` on each line;
+  # strip it so an end-of-line scan sees the line end where the `\r\n` begins (matching Elixir, which
+  # treats `\r\n` as the newline). The actual column numbers come from the lexer, not from here.
+  defp source_lines(source) do
+    source |> String.split("\n") |> Enum.map(&String.trim_trailing(&1, "\r")) |> List.to_tuple()
+  end
+
+  # Raw source text spanning `{sl,sc}`..`{el,ec}` (codepoint columns, end-exclusive), or `nil`.
+  defp src_slice(%{source_lines: lines}, {sl, sc}, {el, ec}) when is_tuple(lines) and sl == el,
+    do: String.slice(elem(lines, sl - 1), sc - 1, ec - sc)
+
+  defp src_slice(%{source_lines: lines}, {sl, sc}, {el, ec}) when is_tuple(lines) do
+    head = elem(lines, sl - 1) |> String.slice(sc - 1, String.length(elem(lines, sl - 1)))
+    mids = for l <- (sl + 1)..(el - 1)//1, do: elem(lines, l - 1)
+    tail = elem(lines, el - 1) |> String.slice(0, ec - 1)
+    Enum.join(Enum.concat([[head], mids, [tail]]), "\n")
+  end
+
+  defp src_slice(_opts, _from, _to), do: nil
+
+  defp tm?(%{token_metadata: tm}), do: tm
+
+  defp src_line(%{source_lines: lines}, n)
+       when is_tuple(lines) and n >= 1 and n <= tuple_size(lines),
+       do: elem(lines, n - 1)
+
+  defp src_line(_opts, _n), do: nil
+
+  defp src_line_count(%{source_lines: lines}) when is_tuple(lines), do: tuple_size(lines)
+  defp src_line_count(_opts), do: 0
+
+  # --- end_of_expression (token_metadata) --------------------------------------------------------
+  # A statement carries `end_of_expression: [newlines: n, line: l, column: c]` when it is followed by
+  # an end-of-line token (a newline or `;`). `{l, c}` is that terminator's position; `newlines`
+  # counts the `\n`s before the next real token, NOT counting the newline that ends a pure-comment
+  # line (`# …` alone on its line), matching Elixir's tokenizer. Derived entirely from the source.
+  defp attach_eoe(ast, _child, _view, %{token_metadata: false}), do: ast
+
+  defp attach_eoe({f, meta, a} = ast, child, view, opts) do
+    case eoe_meta(child, view, opts) do
+      [] -> ast
+      kw -> {f, Enum.concat(kw, meta), a}
+    end
+  end
+
+  defp attach_eoe(ast, _child, _view, _opts), do: ast
+
+  defp eoe_meta(child, view, opts) do
+    case child_span(child, view) do
+      {_sl, _sc, el, ec} -> scan_eoe(opts, el, ec, 0, false, nil)
+      _ -> []
+    end
+  end
+
+  defp scan_eoe(opts, line, col, nls, semi, pos) do
+    case src_line(opts, line) do
+      nil ->
+        finalize_eoe(nls, semi, pos)
+
+      text ->
+        seg = String.slice(text, col - 1, max(String.length(text) - (col - 1), 0))
+        {ws, rest} = split_leading_ws(seg)
+        tok_col = col + ws
+
+        cond do
+          # End of line, or a comment: cross this line's `\n`. A comment RESETS the run (Elixir
+          # counts only the newlines after the last comment), so we carry 0 across a comment line.
+          rest == "" ->
+            cross_newline(opts, line, nls, semi, pos || {line, tok_col})
+
+          match?("#" <> _, rest) ->
+            cross_newline(opts, line, 0, semi, pos || {line, tok_col})
+
+          match?(";" <> _, rest) ->
+            scan_eoe(opts, line, tok_col + 1, nls, true, pos || {line, tok_col})
+
+          true ->
+            finalize_eoe(nls, semi, pos)
+        end
+    end
+  end
+
+  # Cross the `\n` that ends `line` (+1 newline), continuing on the next line; at EOF there is none.
+  defp cross_newline(opts, line, nls, semi, pos) do
+    if line < src_line_count(opts) do
+      scan_eoe(opts, line + 1, 1, nls + 1, semi, pos)
+    else
+      finalize_eoe(nls, semi, pos)
+    end
+  end
+
+  defp finalize_eoe(nls, semi, {l, c}) when nls > 0 or semi,
+    do: [end_of_expression: [newlines: nls, line: l, column: c]]
+
+  defp finalize_eoe(_nls, _semi, _pos), do: []
+
+  defp split_leading_ws(<<c, rest::binary>>) when c in [?\s, ?\t] do
+    {n, tail} = split_leading_ws(rest)
+    {n + 1, tail}
+  end
+
+  defp split_leading_ws(rest), do: {0, rest}
+
+  # Count the newlines in the source from `{line, col}` up to the next real token, with the same
+  # comment-reset rule as `end_of_expression` (a comment line zeroes the run). Used for the
+  # standalone `newlines:` on operators / `->` / `when` / containers, so comments and blank lines
+  # are counted exactly as Elixir's tokenizer does (not a naive line delta).
+  defp gap_newlines(opts, line, col, nls \\ 0) do
+    case src_line(opts, line) do
+      nil ->
+        nls
+
+      text ->
+        rest =
+          text |> String.slice(col - 1, max(String.length(text) - (col - 1), 0)) |> elem_rest()
+
+        cond do
+          rest == "" -> cross_gap(opts, line, nls + 1, nls)
+          match?("#" <> _, rest) -> cross_gap(opts, line, 1, nls)
+          true -> nls
+        end
+    end
+  end
+
+  defp elem_rest(seg), do: split_leading_ws(seg) |> elem(1)
+
+  defp cross_gap(opts, line, next_nls, eof_nls) do
+    if line < src_line_count(opts), do: gap_newlines(opts, line + 1, 1, next_nls), else: eof_nls
   end
 
   defp lower(cst, view, opts, acc, nid) do
@@ -60,9 +207,9 @@ defmodule Toxic2.Lower do
     meta = tmeta(view, idx) |> maybe_token_range(view, idx, opts)
 
     case Tokens.kind(view, idx) do
-      :int -> lit(val, view, idx, opts, acc, nid)
-      :flt -> lit(val, view, idx, opts, acc, nid)
-      :char -> lit(val, view, idx, opts, acc, nid)
+      :int -> lit(val, view, idx, opts, acc, nid, tm_token(view, idx, opts))
+      :flt -> lit(val, view, idx, opts, acc, nid, tm_token(view, idx, opts))
+      :char -> lit(val, view, idx, opts, acc, nid, tm_token(view, idx, opts))
       :literal -> lit(val, view, idx, opts, acc, nid)
       # `&N` (capture argument): the whole token is the capture `{:&, _, [N]}` (see Precedence).
       :capture_int -> {{:&, meta, [val]}, acc, nid}
@@ -87,15 +234,16 @@ defmodule Toxic2.Lower do
 
   # A scalar leaf literal: `lit/6` only touches the token span when an encoder is installed, so the
   # default (no-encoder) path stays a bare value with zero extra work.
-  defp lit(value, view, idx, opts, acc, nid) do
+  defp lit(value, view, idx, opts, acc, nid, extra \\ []) do
     case opts.literal_encoder do
-      nil -> {value, acc, nid}
-      enc -> run_encoder(enc, value, Tokens.span(view, idx), opts, acc, nid)
+      nil ->
+        {value, acc, nid}
+
+      enc ->
+        span = Tokens.span(view, idx)
+        run_encoder_meta(enc, value, Enum.concat(extra, literal_meta(span, opts)), span, acc, nid)
     end
   end
-
-  defp run_encoder(enc, value, span, opts, acc, nid),
-    do: run_encoder_meta(enc, value, literal_meta(span, opts), span, acc, nid)
 
   defp run_encoder_meta(enc, value, meta, span, acc, nid) do
     case enc.(value, meta) do
@@ -146,31 +294,448 @@ defmodule Toxic2.Lower do
   defp lower_node(cst, view, opts, acc, nid) do
     kind = CST.node_kind(cst)
     {ast, acc, nid} = lower_kind(kind, CST.children(cst), cst, view, opts, acc, nid)
-    finalize_node(kind, ast, cst, opts, acc, nid)
+    finalize_node(kind, ast, cst, view, opts, acc, nid)
   end
 
-  # A real node result → attach its source range. A bare literal result from a literal-bearing kind
-  # → run the literal encoder. Anything else (e.g. a synthetic `nil`) passes through untouched.
-  defp finalize_node(_kind, {form, meta, args}, cst, opts, acc, nid) when is_list(meta),
-    do: {put_node_range({form, meta, args}, cst, opts), acc, nid}
+  # A real node result → attach its source range + token_metadata keys. A bare literal result from a
+  # literal-bearing kind → run the literal encoder (keys flow into the encoder meta). Anything else
+  # (e.g. a synthetic `nil`) passes through untouched.
+  defp finalize_node(kind, {form, meta, args}, cst, view, opts, acc, nid) when is_list(meta) do
+    {form, ranged_meta, args} = put_node_range({form, meta, args}, cst, opts)
 
-  defp finalize_node(kind, ast, cst, opts, acc, nid) when kind in @literal_node_kinds do
-    encode_node_literal(ast, cst, opts, acc, nid)
+    meta =
+      tm_anchor(form, Enum.concat(tm_node_keys(kind, cst, view, opts), ranged_meta), cst, opts)
+
+    {{form, meta, args}, acc, nid}
+  end
+
+  defp finalize_node(kind, ast, cst, view, opts, acc, nid) when kind in @literal_node_kinds do
+    encode_node_literal(kind, ast, cst, view, opts, acc, nid)
   end
 
   # A parenthesised stab `(a -> b)` (e.g. a function type in a spec) lowers to a clause LIST, which
   # Elixir treats as a list literal — so the encoder wraps it. Single-expr / multi-stmt parens lower
   # to a node or an already-encoded child instead, so only the bare-list (stab) case lands here.
-  defp finalize_node(:paren, ast, cst, opts, acc, nid) when is_list(ast),
-    do: encode_node_literal(ast, cst, opts, acc, nid)
+  defp finalize_node(:paren, ast, cst, view, opts, acc, nid) when is_list(ast),
+    do: encode_node_literal(:list, ast, cst, view, opts, acc, nid)
 
-  defp finalize_node(_kind, ast, _cst, _opts, acc, nid), do: {ast, acc, nid}
+  defp finalize_node(_kind, ast, _cst, _view, _opts, acc, nid), do: {ast, acc, nid}
 
-  defp encode_node_literal(ast, cst, opts, acc, nid) do
+  defp encode_node_literal(kind, ast, cst, view, opts, acc, nid) do
     case opts.literal_encoder do
-      nil -> {ast, acc, nid}
-      enc -> run_encoder(enc, ast, CST.span(cst), opts, acc, nid)
+      nil ->
+        {ast, acc, nid}
+
+      enc ->
+        span = CST.span(cst)
+        meta = Enum.concat(tm_node_keys(kind, cst, view, opts), literal_meta(span, opts))
+        run_encoder_meta(enc, ast, meta, span, acc, nid)
     end
+  end
+
+  # --- token_metadata (Elixir-compatible meta, opt-in via `token_metadata: true`) ----------------
+  # Structural keys derivable from the green CST: `closing:` (close-delimiter position = node-span
+  # end minus the close length), and `do:`/`end:` (the do-block span start = the `do` keyword,
+  # span end minus 3 = the `end` keyword). No source / view needed.
+
+  # `ambiguous_op: nil` — a no-parens local call whose SOLE argument is a space-separated unary
+  # `+`/`-` (`foo -1`, `@all_info -1`). The parser only yields an `:np_call` here in the genuinely
+  # ambiguous case (`foo - 1` parses as a binary op instead), so the shape itself is the trigger.
+  defp ambiguous_op_meta({fun, meta, args} = ast, [_callee, arg], view, opts) when is_atom(fun) do
+    if tm?(opts) and leading_unary_pm?(arg, view),
+      do: {fun, [{:ambiguous_op, nil} | meta], args},
+      else: ast
+  end
+
+  defp ambiguous_op_meta(ast, _ch, _view, _opts), do: ast
+
+  # The argument BEGINS with a space-separated unary `+`/`-` — either directly (`foo -1`) or as the
+  # leftmost operand of a wider expression (`@spec -float :: float`, where the arg is `… :: …`).
+  defp leading_unary_pm?({:node, :unary_op, _sp, [op_leaf | _], _f, _d}, view),
+    do: CST.tag(op_leaf) == :token and Tokens.value(view, CST.token_index(op_leaf)) in [:+, :-]
+
+  defp leading_unary_pm?({:node, :binary_op, _sp, [left | _], _f, _d}, view),
+    do: leading_unary_pm?(left, view)
+
+  defp leading_unary_pm?(_arg, _view), do: false
+
+  defp tm_node_keys(kind, cst, view, opts) do
+    if tm?(opts) do
+      Enum.concat([
+        open_newlines(kind, cst, view, opts),
+        doend_keys(cst, opts),
+        closing_keys(kind, cst, view, opts),
+        delimiter_keys(kind, cst, opts)
+      ])
+    else
+      []
+    end
+  end
+
+  # `newlines:` for a container / call / `fn`: the (comment-aware) newline count between the open
+  # delimiter and the first inner element. `foo(\n a)` / `{\n a}` / `%{\n a: 1}` / `fn\n x -> …` → 1;
+  # a newline only *between* later elements does not count. A struct carries it on its inner map.
+  defp open_newlines(kind, cst, view, opts)
+       when kind in [
+              :call,
+              :remote_call,
+              :anon_call,
+              :dot_tuple,
+              :tuple,
+              :map,
+              :map_update,
+              :bitstring,
+              :list,
+              :fn
+            ] do
+    case open_scan_pos(kind, cst, view, opts) do
+      {line, col} ->
+        case gap_newlines(opts, line, col) do
+          n when n > 0 -> [newlines: n]
+          _ -> []
+        end
+
+      _ ->
+        []
+    end
+  end
+
+  defp open_newlines(_kind, _cst, _view, _opts), do: []
+
+  # Where to start scanning for the post-open-delimiter newlines: just past `(`/`{`/`[`/`<<`/`%{`/`fn`.
+  # For a (local) call the `(` follows the callee (child 0); for a remote call it follows the member
+  # name (child 1) — but only when parens are actually present (`a.b`/`a.b c` have none); otherwise
+  # the delimiter sits at the node-span start.
+  defp open_scan_pos(:call, cst, view, opts), do: after_open_paren(cst, 0, view, opts)
+  defp open_scan_pos(:remote_call, cst, view, opts), do: after_open_paren(cst, 1, view, opts)
+
+  # `foo.(…)` / `Foo.{…}` — the open delimiter follows the base AND the `.`, so it sits one column
+  # further than a plain call's `(`.
+  defp open_scan_pos(:anon_call, cst, view, opts), do: after_dot_delim(cst, "(", view, opts)
+  defp open_scan_pos(:dot_tuple, cst, view, opts), do: after_dot_delim(cst, "{", view, opts)
+
+  # A map opens with `%{` (2) when written `%{…}`, but only `{` (1) as a struct's inner map
+  # (`%Foo{…}`, where the `%` sits on the struct node), so measure the leading `%` from the source.
+  defp open_scan_pos(kind, cst, _view, opts) when kind in [:map, :map_update] do
+    case CST.span(cst) do
+      {sl, sc, _el, _ec} ->
+        len = if src_slice(opts, {sl, sc}, {sl, sc + 1}) == "%", do: 2, else: 1
+        {sl, sc + len}
+
+      _ ->
+        nil
+    end
+  end
+
+  defp open_scan_pos(kind, cst, _view, _opts) do
+    case CST.span(cst) do
+      {sl, sc, _el, _ec} -> {sl, sc + open_delim_len(kind)}
+      _ -> nil
+    end
+  end
+
+  defp open_delim_len(kind) when kind in [:list, :tuple], do: 1
+  defp open_delim_len(_two_char), do: 2
+
+  # The position just past the `(` following child `idx` (the callee / member name) — or `nil` when
+  # the next char is not `(` (a paren-less call, which has no open-delimiter newlines).
+  defp after_open_paren(cst, idx, view, opts) do
+    with child when not is_nil(child) <- CST.children(cst) |> Enum.at(idx),
+         {_, _, el, ec} <- child_span(child, view),
+         "(" <- src_slice(opts, {el, ec}, {el, ec + 1}) do
+      {el, ec + 1}
+    else
+      _ -> nil
+    end
+  end
+
+  # `foo.(…)` / `Foo.{…}` — the open delimiter is the char one past the base's `.` (two past the base
+  # end). Returns the position just inside it, or `nil` if the expected delimiter isn't there.
+  defp after_dot_delim(cst, delim, view, opts) do
+    with child when not is_nil(child) <- CST.children(cst) |> Enum.at(0),
+         {_, _, el, ec} <- child_span(child, view),
+         ^delim <- src_slice(opts, {el, ec + 1}, {el, ec + 2}) do
+      {el, ec + 2}
+    else
+      _ -> nil
+    end
+  end
+
+  # Container / operator nodes that lowering built with empty meta still need a `line:`/`column:`
+  # anchor (the node-span start) under `token_metadata: true`, matching Elixir. The implicit
+  # `:__block__` grouping is the one node Elixir leaves anchorless, so it is excluded.
+  defp tm_anchor(:__block__, meta, _cst, _opts), do: meta
+
+  defp tm_anchor(_form, meta, cst, opts) do
+    if tm?(opts) and not Keyword.has_key?(meta, :line) do
+      case CST.span(cst) do
+        {sl, sc, _el, _ec} -> Enum.concat(meta, line: sl, column: sc)
+        _ -> meta
+      end
+    else
+      meta
+    end
+  end
+
+  # A stab clause anchors at its `->` operator (not the clause start), matching Elixir, and records
+  # `newlines:` when its body starts on a later line than the `->`.
+  # Scan for `->` starting AFTER the clause head (the args' span end), never from the clause start —
+  # otherwise a pattern that contains the literal text `->` (e.g. `fn "->" -> x end`) would match
+  # inside the pattern instead of the real arrow.
+  defp stab_arrow_meta(args_node, body_node, view, opts) do
+    if tm?(opts) do
+      case arrow_scan_start(args_node, view) do
+        {line, col} ->
+          last = with({bsl, _, _, _} <- child_span(body_node, view), do: bsl, else: (_ -> line))
+          arrow = scan_op(opts, line, col, "->", last)
+          nls = stab_newlines({line, col}, arrow, opts)
+          Enum.concat([stab_parens_meta(args_node, view, opts), nls, arrow])
+
+        _ ->
+          []
+      end
+    else
+      []
+    end
+  end
+
+  # A parenthesised clause head (`fn (a, b) -> …`, `fn () -> …`, and the guarded `fn () when g -> …`)
+  # records `parens: [line, column, closing: …]` on the `->` (the `(`…`)` span). The patterns are the
+  # head children — unwrapped from a `stab_when` (which appends the guard) when a guard is present.
+  defp stab_parens_meta(args_node, view, opts) do
+    args_node |> stab_head_patterns() |> patterns_parens_meta(view, opts)
+  end
+
+  defp stab_head_patterns(args_node) do
+    case CST.children(args_node) do
+      [{:node, :stab_when, _sp, when_ch, _f, _d}] -> Enum.drop(when_ch, -1)
+      children -> children
+    end
+  end
+
+  # An empty `()` head is a single empty `:paren` node; a non-empty parenthesised head is the bare
+  # patterns with a `(` just before the first and a `)` just after the last.
+  defp patterns_parens_meta([{:node, :paren, {sl, sc, el, ec}, [], _f, _d}], _view, _opts),
+    do: [parens: [line: sl, column: sc, closing: [line: el, column: ec - 1]]]
+
+  defp patterns_parens_meta([first | _] = pats, view, opts) do
+    with {asl, asc, _, _} when asc > 1 <- child_span(first, view),
+         {_, _, ael, aec} <- child_span(List.last(pats), view),
+         "(" <- src_slice(opts, {asl, asc - 1}, {asl, asc}),
+         ")" <- src_slice(opts, {ael, aec}, {ael, aec + 1}) do
+      [parens: [line: asl, column: asc - 1, closing: [line: ael, column: aec]]]
+    else
+      _ -> []
+    end
+  end
+
+  defp patterns_parens_meta(_pats, _view, _opts), do: []
+
+  # Where to begin scanning for the clause `->`: after the last pattern (so its text can't contain a
+  # false `->`); for an empty head (`fn -> …`) there is no pattern, so start at the head's span start.
+  defp arrow_scan_start(args_node, view) do
+    case CST.children(args_node) do
+      [] ->
+        with({sl, sc, _, _} <- child_span(args_node, view), do: {sl, sc}, else: (_ -> nil))
+
+      children ->
+        with(
+          {_, _, el, ec} <- child_span(List.last(children), view),
+          do: {el, ec},
+          else: (_ -> nil)
+        )
+    end
+  end
+
+  # newlines AFTER the `->` (comment-aware), scanning from just past the arrow.
+  # newlines adjacent to the `->`: the count AFTER it (arrow at line end) if any, else BEFORE it
+  # (arrow at line start, e.g. a guard then `\n  -> body`). Comment-aware via `gap_newlines`.
+  defp stab_newlines({hl, hc}, [line: al, column: ac], opts) do
+    after_n = gap_newlines(opts, al, ac + 2)
+    n = if after_n > 0, do: after_n, else: gap_newlines(opts, hl, hc)
+    if n > 0, do: [newlines: n], else: []
+  end
+
+  defp stab_newlines(_start, _arrow, _opts), do: []
+
+  # Find `needle` in the source starting at (line, col), up to and including `last_line`. Returns
+  # `[line: l, column: c]` (codepoint column) or `[]`. Used for operator anchors (`->`, `|`).
+  defp scan_op(opts, line, col, needle, last_line) when line <= last_line do
+    case src_line(opts, line) do
+      nil ->
+        []
+
+      text ->
+        seg = String.slice(text, col - 1, max(String.length(text) - (col - 1), 0))
+
+        case String.split(seg, needle, parts: 2) do
+          [before, _] -> [line: line, column: col + String.length(before)]
+          _ -> scan_op(opts, line + 1, 1, needle, last_line)
+        end
+    end
+  end
+
+  defp scan_op(_opts, _line, _col, _needle, _last_line), do: []
+
+  # `delimiter:` — the opening string/charlist/sigil delimiter, read from the source: at the node
+  # span start for strings/charlists, after the leading `:` for quoted atoms, and after `~` + the
+  # sigil name for sigils. A heredoc opens with the quote tripled (`"""` / `'''`).
+  defp delimiter_keys(kind, cst, opts) when kind in [:string, :charlist, :quoted_atom, :sigil] do
+    case CST.span(cst) do
+      {sl, sc, _el, ec} ->
+        head = src_slice(opts, {sl, sc}, {sl, sc + 40})
+
+        case head && opening_delimiter(kind, head) do
+          d when is_binary(d) -> [{:delimiter, d} | heredoc_indent(kind, d, ec)]
+          _ -> []
+        end
+
+      _ ->
+        []
+    end
+  end
+
+  defp delimiter_keys(_kind, _cst, _opts), do: []
+
+  # A string/charlist heredoc carries `indentation:` = the closing delimiter's column − 1 (= the
+  # node-span end col − 4, since the `"""`/`'''` close is 3 chars and the span end is exclusive).
+  # Sigil heredocs put `indentation:` on their inner `<<>>` instead (see `build_sigil`).
+  defp heredoc_indent(kind, d, ec) when kind in [:string, :charlist] and byte_size(d) == 3,
+    do: [indentation: ec - 4]
+
+  defp heredoc_indent(_kind, _d, _ec), do: []
+
+  defp opening_delimiter(:string, head), do: delim_at(head)
+  defp opening_delimiter(:charlist, head), do: delim_at(head)
+  defp opening_delimiter(:quoted_atom, ":" <> rest), do: delim_at(rest)
+  defp opening_delimiter(:quoted_atom, _), do: nil
+  defp opening_delimiter(:sigil, "~" <> rest), do: delim_at(skip_sigil_name(rest))
+  defp opening_delimiter(:sigil, _), do: nil
+
+  # Skip the sigil name to reach the opening delimiter. Names are letters AND digits (an uppercase
+  # sigil may carry digits, e.g. `~A1(…)`), so a digit must not be mistaken for the delimiter.
+  defp skip_sigil_name(<<c, rest::binary>>) when c in ?a..?z or c in ?A..?Z or c in ?0..?9,
+    do: skip_sigil_name(rest)
+
+  defp skip_sigil_name(rest), do: rest
+
+  defp delim_at(~S(""") <> _), do: ~S(""")
+  defp delim_at("'''" <> _), do: "'''"
+  defp delim_at(<<c::utf8, _::binary>>), do: <<c::utf8>>
+  defp delim_at(_), do: nil
+
+  # `token:` — the raw source text of a numeric / char literal (preserves `0x1F`, `1_000`, `?a`).
+  defp tm_token(view, idx, opts) do
+    if tm?(opts) do
+      {sl, sc, el, ec} = Tokens.span(view, idx)
+
+      case src_slice(opts, {sl, sc}, {el, ec}) do
+        t when is_binary(t) -> [token: t]
+        _ -> []
+      end
+    else
+      []
+    end
+  end
+
+  # Kinds with an UNCONDITIONAL close delimiter: list `]`, tuple/map/map-update `}` (1 char);
+  # bitstring `>>` (2); `fn … end` (3). A struct (`%Foo{…}`) carries no `closing:` itself — the inner
+  # `%{}` map / map-update node does. Calls have OPTIONAL parens (`foo(a)` vs `try do … end`, both
+  # `:call`; `Mod.fun(x)` vs `a.b`, both `:remote_call`), so confirm the span ends at `)` against the
+  # source — a paren-less remote call instead gets `no_parens: true`.
+  defp closing_keys(kind, cst, view, opts) do
+    case {kind, CST.span(cst)} do
+      {k, {_sl, _sc, el, ec}} when k in [:list, :tuple, :map, :map_update, :dot_tuple] ->
+        [closing: [line: el, column: ec - 1]]
+
+      {:bitstring, {_sl, _sc, el, ec}} ->
+        [closing: [line: el, column: ec - 2]]
+
+      {:fn, {_sl, _sc, el, ec}} ->
+        [closing: [line: el, column: ec - 3]]
+
+      {k, {_sl, _sc, el, ec}} when k in [:call, :remote_call] ->
+        call_closing(k, cst, el, ec, view, opts)
+
+      _ ->
+        []
+    end
+  end
+
+  # A call carries `closing:` only when it has actual parens — detected by a `(` immediately after
+  # the callee/member (NOT by the span ending in `)`, which `IO.puts foo(x)` would falsely satisfy).
+  # When the parenthesised args are followed by a do-block (`quote(x) do … end`), the `)` sits before
+  # the block, so locate it; otherwise it is the span's last char. A bare zero-arity remote call
+  # (`a.b`) instead gets `no_parens: true`.
+  defp call_closing(k, cst, el, ec, view, opts) do
+    cond do
+      after_open_paren(cst, callee_idx(k), view, opts) == nil ->
+        if k == :remote_call and remote_zero_arity?(cst), do: [no_parens: true], else: []
+
+      src_slice(opts, {el, ec - 1}, {el, ec}) == ")" ->
+        [closing: [line: el, column: ec - 1]]
+
+      true ->
+        close_paren_before_do(cst, opts)
+    end
+  end
+
+  defp callee_idx(:call), do: 0
+  defp callee_idx(:remote_call), do: 1
+
+  # The `)` closing a paren call's args when a do-block follows (`quote(x) do … end`): the last `)`
+  # in the source from the call start up to the do-block's `do`.
+  defp close_paren_before_do(cst, opts) do
+    with {:node, :do_block, {dsl, dsc, _, _}, _, _, _} <-
+           Enum.find(CST.children(cst), &match?({:node, :do_block, _, _, _, _}, &1)),
+         {sl, sc, _el, _ec} <- CST.span(cst) do
+      last_paren(opts, sl, sc, dsl, dsc)
+    else
+      _ -> []
+    end
+  end
+
+  defp last_paren(opts, sl, sc, dsl, dsc) do
+    Enum.reduce(sl..dsl, [], fn line, acc ->
+      text = src_line(opts, line) || ""
+      from = if line == sl, do: sc, else: 1
+      upto = if line == dsl, do: dsc - 1, else: String.length(text)
+      seg = String.slice(text, from - 1, max(upto - from + 1, 0))
+
+      case last_index_of(seg, ")") do
+        nil -> acc
+        i -> [closing: [line: line, column: from + i]]
+      end
+    end)
+  end
+
+  defp last_index_of(s, ch) do
+    case String.split(s, ch) do
+      [_] -> nil
+      parts -> String.length(s) - String.length(List.last(parts)) - 1
+    end
+  end
+
+  # `do:` / `end:` come from the do-block span (start = `do`, end − 3 = `end`). On TOLERANT/invalid
+  # input the block may be unterminated (recovered missing `end`), which would yield an impossible
+  # position (e.g. column 0); emit each key only when the source actually has the keyword there.
+  # A remote call with exactly `[base, member]` children — no argument and no do-block, i.e. `a.b`.
+  defp remote_zero_arity?(cst), do: match?([_base, _member], CST.children(cst))
+
+  defp doend_keys(cst, opts) do
+    case Enum.find(CST.children(cst), &match?({:node, :do_block, _, _, _, _}, &1)) do
+      {:node, :do_block, {sl, sc, el, ec}, _ch, _f, _d} ->
+        Enum.concat(kw_at(opts, sl, sc, "do", :do), kw_at(opts, el, ec - 3, "end", :end))
+
+      _ ->
+        []
+    end
+  end
+
+  defp kw_at(opts, line, col, word, key) do
+    if col >= 1 and src_slice(opts, {line, col}, {line, col + String.length(word)}) == word,
+      do: [{key, [line: line, column: col]}],
+      else: []
   end
 
   # Attach this CST node's span as the range — UNLESS the lowered result already carries one, which
@@ -208,8 +773,8 @@ defmodule Toxic2.Lower do
   defp lower_kind(:expr_list, ch, _cst, view, opts, acc, nid),
     do: lower_block(ch, view, opts, acc, nid)
 
-  defp lower_kind(:paren, ch, _cst, view, opts, acc, nid),
-    do: lower_paren(ch, view, opts, acc, nid)
+  defp lower_kind(:paren, ch, cst, view, opts, acc, nid),
+    do: lower_paren(ch, cst, view, opts, acc, nid)
 
   # A leading `;` empty statement in a stab body (`-> ;t` => `__block__([nil, t])`) lowers to `nil`.
   defp lower_kind(:empty_stmt, _ch, _cst, _view, _opts, acc, nid), do: {nil, acc, nid}
@@ -238,8 +803,10 @@ defmodule Toxic2.Lower do
   defp lower_kind(:call, ch, _cst, view, opts, acc, nid), do: lower_call(ch, view, opts, acc, nid)
 
   # A no-parens call lowers identically to a paren call (`f a` and `f(a)` produce the same AST).
-  defp lower_kind(:np_call, ch, _cst, view, opts, acc, nid),
-    do: lower_call(ch, view, opts, acc, nid)
+  defp lower_kind(:np_call, ch, _cst, view, opts, acc, nid) do
+    {ast, acc, nid} = lower_call(ch, view, opts, acc, nid)
+    {ambiguous_op_meta(ast, ch, view, opts), acc, nid}
+  end
 
   defp lower_kind(:alias, ch, _cst, view, opts, acc, nid),
     do: lower_alias(ch, view, opts, acc, nid)
@@ -247,15 +814,18 @@ defmodule Toxic2.Lower do
   defp lower_kind(:remote_call, ch, _cst, view, opts, acc, nid),
     do: lower_remote_call(ch, view, opts, acc, nid)
 
-  # `Foo.{A, B}` => `{{:., _, [base, :{}]}, _, [elems]}` (multi-alias / `alias Foo.{...}`).
+  # `Foo.{A, B}` => `{{:., _, [base, :{}]}, _, [elems]}` (multi-alias / `alias Foo.{...}`). The dot
+  # and the call both anchor at the `.` (between base and `{`); `closing:` (the `}`) is added by
+  # `closing_keys`/`finalize_node`.
   defp lower_kind(:dot_tuple, [base | elems], _cst, view, opts, acc, nid) do
     {base_ast, acc, nid} = lower(base, view, opts, acc, nid)
     {elem_asts, acc, nid} = lower_args(elems, view, opts, acc, nid)
-    {{{:., [], [base_ast, :{}]}, [], elem_asts}, acc, nid}
+    dm = remote_dot_meta(base, view, opts) || []
+    {{{:., dm, [base_ast, :{}]}, dm, elem_asts}, acc, nid}
   end
 
-  defp lower_kind(:anon_call, ch, _cst, view, opts, acc, nid),
-    do: lower_anon_call(ch, view, opts, acc, nid)
+  defp lower_kind(:anon_call, ch, cst, view, opts, acc, nid),
+    do: lower_anon_call(ch, cst, view, opts, acc, nid)
 
   defp lower_kind(:kw_pair, ch, _cst, view, opts, acc, nid),
     do: lower_kw_pair(ch, view, opts, acc, nid)
@@ -263,8 +833,8 @@ defmodule Toxic2.Lower do
   defp lower_kind(:bitstring, ch, _cst, view, opts, acc, nid),
     do: lower_bitstring(ch, view, opts, acc, nid)
 
-  defp lower_kind(:access, ch, _cst, view, opts, acc, nid),
-    do: lower_access(ch, view, opts, acc, nid)
+  defp lower_kind(:access, ch, cst, view, opts, acc, nid),
+    do: lower_access(ch, cst, view, opts, acc, nid)
 
   defp lower_kind(:map, ch, _cst, view, opts, acc, nid), do: lower_map(ch, view, opts, acc, nid)
 
@@ -288,7 +858,7 @@ defmodule Toxic2.Lower do
   defp lower_kind(:stab, [args_node, body_node], _cst, view, opts, acc, nid) do
     {args, acc, nid} = lower_stab_args(args_node, view, opts, acc, nid)
     {body, acc, nid} = lower_stab_body(body_node, view, opts, acc, nid)
-    {{:->, [], [args, body]}, acc, nid}
+    {{:->, stab_arrow_meta(args_node, body_node, view, opts), [args, body]}, acc, nid}
   end
 
   defp lower_kind(:string, ch, _cst, view, opts, acc, nid),
@@ -297,14 +867,14 @@ defmodule Toxic2.Lower do
   defp lower_kind(:charlist, ch, _cst, view, opts, acc, nid),
     do: lower_charlist(ch, view, opts, acc, nid)
 
-  defp lower_kind(:sigil, ch, _cst, view, opts, acc, nid),
-    do: lower_sigil(ch, view, opts, acc, nid)
+  defp lower_kind(:sigil, ch, cst, view, opts, acc, nid),
+    do: lower_sigil(ch, cst, view, opts, acc, nid)
 
   # `:"..."` / `:'...'` — no interpolation lowers to the atom (atom policy); with interpolation to
   # `:erlang.binary_to_atom(<<...>>, :utf8)`.
-  defp lower_kind(:quoted_atom, [inner], _cst, view, opts, acc, nid) do
+  defp lower_kind(:quoted_atom, [inner], cst, view, opts, acc, nid) do
     {parts, acc, nid} = quoted_parts_ast(CST.children(inner), view, opts, acc, nid)
-    build_quoted_atom(parts, inner, view, opts, acc, nid)
+    build_quoted_atom(parts, inner, cst, false, view, opts, acc, nid)
   end
 
   # An interpolation's inner is a block (`#{a; b}` → `{:__block__, ...}`, `#{a}` → `a`).
@@ -317,14 +887,14 @@ defmodule Toxic2.Lower do
   # fragments stay binaries; each interpolation becomes a `Kernel.to_string/1` ::-binary segment.
   defp lower_string(children, view, opts, acc, nid) do
     {parts, acc, nid} = quoted_parts_ast(children, view, opts, acc, nid)
-    build_string(parts, acc, nid)
+    build_string(parts, opts, acc, nid)
   end
 
   # A charlist lowers to a literal codepoint list with no interpolation, else to
   # `List.to_charlist([...])` where interpolations are bare `Kernel.to_string/1` (no ::-binary).
   defp lower_charlist(children, view, opts, acc, nid) do
     {parts, acc, nid} = quoted_parts_ast(children, view, opts, acc, nid)
-    build_charlist(parts, acc, nid)
+    build_charlist(parts, opts, acc, nid)
   end
 
   # Collect a quoted literal's parts as `{:frag, binary}` / `{:interp, ast}`, in source order.
@@ -357,38 +927,85 @@ defmodule Toxic2.Lower do
   defp lower_interp_part(child, view, opts, parts, acc, nid) do
     if CST.node_kind(child) == :interp do
       {ast, acc, nid} = lower_block(CST.children(child), view, opts, acc, nid)
-      {[{:interp, ast} | parts], acc, nid}
+      {[{:interp, ast, CST.span(child)} | parts], acc, nid}
     else
       {parts, acc, nid}
     end
   end
 
-  defp build_string(parts, acc, nid) do
-    if Enum.any?(parts, &match?({:interp, _}, &1)) do
-      {{:<<>>, [], Enum.map(parts, &string_segment/1)}, acc, nid}
+  defp build_string(parts, opts, acc, nid) do
+    if Enum.any?(parts, &match?({:interp, _, _}, &1)) do
+      {{:<<>>, [], Enum.map(parts, &string_segment(&1, opts))}, acc, nid}
     else
       {parts |> Enum.map(fn {:frag, b} -> b end) |> IO.iodata_to_binary(), acc, nid}
     end
   end
 
-  defp build_charlist(parts, acc, nid) do
-    if Enum.any?(parts, &match?({:interp, _}, &1)) do
-      {{{:., [], [List, :to_charlist]}, [], [Enum.map(parts, &charlist_segment/1)]}, acc, nid}
+  defp build_charlist(parts, opts, acc, nid) do
+    if Enum.any?(parts, &match?({:interp, _, _}, &1)) do
+      {{{:., [], [List, :to_charlist]}, [], [Enum.map(parts, &charlist_segment(&1, opts))]}, acc,
+       nid}
     else
       bin = parts |> Enum.map(fn {:frag, b} -> b end) |> IO.iodata_to_binary()
       {safe_to_charlist(bin), acc, nid}
     end
   end
 
-  defp build_quoted_atom(parts, inner, view, opts, acc, nid) do
-    if Enum.any?(parts, &match?({:interp, _}, &1)) do
-      segs = Enum.map(parts, &string_segment/1)
-      {{{:., [], [:erlang, :binary_to_atom]}, [], [{:<<>>, [], segs}, :utf8]}, acc, nid}
+  defp build_quoted_atom(parts, inner, anchor, kw?, view, opts, acc, nid) do
+    if Enum.any?(parts, &match?({:interp, _, _}, &1)) do
+      segs = Enum.map(parts, &string_segment(&1, opts))
+      pos = qatom_pos(anchor, view, opts)
+      head = qatom_head(anchor, kw?, view, opts)
+
+      {{{:., pos, [:erlang, :binary_to_atom]}, Enum.concat(head, pos),
+        [{:<<>>, pos, segs}, :utf8]}, acc, nid}
     else
       bin = parts |> Enum.map(fn {:frag, b} -> b end) |> IO.iodata_to_binary()
       atomize_quoted(bin, inner, opts, view, acc, nid)
     end
   end
+
+  # token_metadata for an INTERPOLATED quoted atom / keyword key (`:"a#{b}"`, `"k#{i}": v`), which
+  # lowers to an `:erlang.binary_to_atom` construction. `pos` anchors at the atom/key start; the
+  # call also carries the opening `delimiter:` and, for a keyword key, `format: :keyword`.
+  defp qatom_pos(anchor, view, opts) do
+    if tm?(opts) do
+      case child_span(anchor, view) do
+        {sl, sc, _el, _ec} -> [line: sl, column: sc]
+        _ -> []
+      end
+    else
+      []
+    end
+  end
+
+  # Only a keyword key needs the head built here: it is lowered inline (no `finalize_node`), so its
+  # `delimiter:` + `format: :keyword` must be added now. A bare `:"a#{b}"` atom literal IS finalized,
+  # which supplies `delimiter:` — adding it here too would duplicate it.
+  defp qatom_head(anchor, true = _kw?, view, opts) do
+    if tm?(opts) do
+      delim =
+        case child_span(anchor, view) do
+          {sl, sc, _el, _ec} ->
+            head = src_slice(opts, {sl, sc}, {sl, sc + 40}) || ""
+
+            case head do
+              ":" <> rest -> delim_at(rest)
+              _ -> delim_at(head)
+            end
+
+          _ ->
+            nil
+        end
+
+      d = if is_binary(delim), do: [delimiter: delim], else: []
+      Enum.concat(d, format: :keyword)
+    else
+      []
+    end
+  end
+
+  defp qatom_head(_anchor, false = _kw?, _view, _opts), do: []
 
   defp atomize_quoted(bin, inner, opts, view, acc, nid) do
     case to_atom(bin, opts) do
@@ -415,22 +1032,81 @@ defmodule Toxic2.Lower do
 
   defp atom_span(inner, _view), do: CST.span(inner) || {1, 1, 1, 1}
 
-  defp string_segment({:frag, bin}), do: bin
+  defp string_segment({:frag, bin}, _opts), do: bin
 
-  defp string_segment({:interp, ast}),
-    do: {:"::", [], [{{:., [], [Kernel, :to_string]}, [], [ast]}, {:binary, [], nil}]}
+  defp string_segment({:interp, ast, span}, opts) do
+    pos = interp_pos(span, opts)
+    {:"::", pos, [interp_to_string(ast, span, opts), {:binary, pos, nil}]}
+  end
 
-  defp charlist_segment({:frag, bin}), do: bin
-  defp charlist_segment({:interp, ast}), do: {{:., [], [Kernel, :to_string]}, [], [ast]}
+  defp charlist_segment({:frag, bin}, _opts), do: bin
+  defp charlist_segment({:interp, ast, span}, opts), do: interp_to_string(ast, span, opts)
+
+  # The `Kernel.to_string/1` call wrapping an interpolation `#{…}`. Under `token_metadata: true` it
+  # carries `from_interpolation: true` + `closing:` (the `}` = interp span end − 1), all anchored at
+  # the interpolation start (the `#`). Otherwise the synthetic meta stays empty.
+  defp interp_to_string(ast, span, opts) do
+    pos = interp_pos(span, opts)
+    callmeta = interp_call_meta(span, opts)
+    {{:., pos, [Kernel, :to_string]}, callmeta, [ast]}
+  end
+
+  defp interp_pos(_span, %{token_metadata: false}), do: []
+  defp interp_pos({sl, sc, _el, _ec}, _opts), do: [line: sl, column: sc]
+  defp interp_pos(_other, _opts), do: []
+
+  defp interp_call_meta(_span, %{token_metadata: false}), do: []
+
+  defp interp_call_meta({sl, sc, el, ec}, _opts),
+    do: [from_interpolation: true, closing: [line: el, column: ec - 1], line: sl, column: sc]
+
+  defp interp_call_meta(_other, _opts), do: []
 
   # A sigil → `{:"sigil_<name>", [], [{:<<>>, [], segs}, modifier_charlist]}`. Content segments are
   # like a string's (the sigil macro does any further unescaping at expansion); the name atom
   # respects the atom policy. children = [start_leaf | parts... | end_leaf].
-  defp lower_sigil([start_leaf | rest], view, opts, acc, nid) do
+  defp lower_sigil([start_leaf | rest], cst, view, opts, acc, nid) do
     name = Tokens.value(view, CST.token_index(start_leaf))
     {part_children, mods} = sigil_split(rest, view)
     {parts, acc, nid} = quoted_parts_ast(part_children, view, opts, acc, nid)
-    build_sigil(name, parts, mods, start_leaf, view, opts, acc, nid)
+
+    build_sigil(
+      name,
+      parts,
+      mods,
+      start_leaf,
+      sigil_inner_meta(cst, mods, opts),
+      view,
+      opts,
+      acc,
+      nid
+    )
+  end
+
+  # The inner `<<>>` of a sigil anchors at the sigil start; a heredoc sigil (`~s\"\"\"…\"\"\"`) also
+  # carries `indentation:` there (the closing-delimiter column − 1 = span end − 4).
+  defp sigil_inner_meta(cst, mods, opts) do
+    if tm?(opts) do
+      case CST.span(cst) do
+        {sl, sc, _el, ec} ->
+          head = src_slice(opts, {sl, sc}, {sl, sc + 40})
+
+          case head && opening_delimiter(:sigil, head) do
+            # Heredoc sigil: `indentation:` = the closing `"""`/`'''` column − 1. The span end also
+            # spans any trailing modifiers (`~r'''…'''x`), so discount their length too.
+            d when is_binary(d) and byte_size(d) == 3 ->
+              [indentation: ec - String.length(mods) - 4, line: sl, column: sc]
+
+            _ ->
+              [line: sl, column: sc]
+          end
+
+        _ ->
+          []
+      end
+    else
+      []
+    end
   end
 
   # The modifiers live on the trailing `:sigil_end` leaf (last child), if the run closed.
@@ -450,10 +1126,11 @@ defmodule Toxic2.Lower do
     end
   end
 
-  defp build_sigil(name, parts, mods, start_leaf, view, opts, acc, nid) do
+  defp build_sigil(name, parts, mods, start_leaf, inner_meta, view, opts, acc, nid) do
     case to_atom("sigil_" <> name, opts) do
       {:ok, atom} ->
-        {{atom, [], [{:<<>>, [], sigil_segments(parts)}, safe_to_charlist(mods)]}, acc, nid}
+        {{atom, [], [{:<<>>, inner_meta, sigil_segments(parts, opts)}, safe_to_charlist(mods)]},
+         acc, nid}
 
       :error ->
         {id, acc, nid} =
@@ -474,25 +1151,36 @@ defmodule Toxic2.Lower do
   end
 
   # A sigil's `<<>>` always has at least one (possibly empty) binary segment (`~s()` → [""]).
-  defp sigil_segments([]), do: [""]
-  defp sigil_segments(parts), do: Enum.map(parts, &string_segment/1)
+  defp sigil_segments([], _opts), do: [""]
+  defp sigil_segments(parts, opts), do: Enum.map(parts, &string_segment(&1, opts))
 
   defp lower_block([], _view, _opts, acc, nid), do: {{:__block__, [], []}, acc, nid}
 
   defp lower_block([only], view, opts, acc, nid) do
     {ast, acc, nid} = lower(only, view, opts, acc, nid)
-    {wrap_splice(ast), acc, nid}
+    {wrap_splice(attach_eoe(ast, only, view, opts)), acc, nid}
   end
 
   defp lower_block(children, view, opts, acc, nid) do
-    {asts, acc, nid} = lower_each(children, view, opts, acc, nid)
+    {asts, acc, nid} = lower_stmts(children, view, opts, acc, nid)
     {{:__block__, [], asts}, acc, nid}
+  end
+
+  # Like `lower_each`, but attaches `end_of_expression` to each statement (token_metadata).
+  defp lower_stmts(children, view, opts, acc, nid) do
+    {rev, acc, nid} =
+      Enum.reduce(children, {[], acc, nid}, fn child, {asts, a, n} ->
+        {ast, a, n} = lower(child, view, opts, a, n)
+        {[attach_eoe(ast, child, view, opts) | asts], a, n}
+      end)
+
+    {:lists.reverse(rev), acc, nid}
   end
 
   # Parentheses are transparent in the AST (they only carry metadata upstream).
   # A paren is a statement block: empty => empty block, one => the expr (transparent), many =>
   # `__block__`. A trailing recovered `:missing` (no `)`) is skipped — its diagnostic is emitted.
-  defp lower_paren(children, view, opts, acc, nid) do
+  defp lower_paren(children, cst, view, opts, acc, nid) do
     children = Enum.reject(children, &(CST.tag(&1) == :missing))
 
     # A paren of stab clauses (`(a -> b; c -> d)`) lowers to the bare clause LIST `[{:->, …}, …]`,
@@ -501,7 +1189,82 @@ defmodule Toxic2.Lower do
       lower_each(children, view, opts, acc, nid)
     else
       {ast, acc, nid} = lower_block(children, view, opts, acc, nid)
-      {wrap_paren_negation(ast), acc, nid}
+      {add_parens_meta(wrap_paren_negation(ast), children, cst, opts), acc, nid}
+    end
+  end
+
+  # Empty parens. `()` is Elixir's `empty_paren` → `{:__block__, [parens: …], []}`; `(;)` is the
+  # `open_paren ';' close_paren` rule → `{:__block__, [closing: …, line, column], []}`. Both lower to
+  # an empty block here, so the `;` is detected from the source (only meaningful under token_metadata,
+  # where `source_lines` is available; otherwise the empty block stays bare, matching `()` no-tm).
+  defp add_parens_meta({:__block__, _meta, []}, [], cst, opts) do
+    with true <- tm?(opts),
+         {sl, sc, el, ec} <- CST.span(cst) do
+      closing = [line: el, column: ec - 1]
+
+      if String.contains?(src_slice(opts, {sl, sc + 1}, {el, ec - 1}) || "", ";"),
+        do: {:__block__, [closing: closing, line: sl, column: sc], []},
+        else: {:__block__, [parens: [line: sl, column: sc, closing: closing]], []}
+    else
+      _ -> {:__block__, [], []}
+    end
+  end
+
+  # A single-expression parenthesised group (`(a + b)`) records the parens on the inner node's meta
+  # as `parens: [line, column, closing: …]` (the `(`…`)` span), matching Elixir. Each nesting layer
+  # prepends another entry (`((a))` → two), outermost first. Multi-statement parens are a block and
+  # carry `closing:` instead (handled as a node), so only the single-child case attaches `parens:`.
+  # A MULTI-statement parenthesised group lowers to a `__block__` that corresponds to real `(`…`)`
+  # delimiters; unlike the implicit top-level block it carries `closing:` (the `)`) and a
+  # `line:`/`column:` anchor at the `(`. (A single-expression `__block__` here is the synthetic
+  # `(not x)` negation wrapper — Elixir leaves that one anchorless, so it must NOT match.)
+  defp add_parens_meta({:__block__, meta, stmts}, [_, _ | _], cst, opts) do
+    parens_block(meta, stmts, cst, opts)
+  end
+
+  # `(unquote_splicing(x))` is a single-child paren that `wrap_splice` turns into a `__block__`; it is
+  # still a real `(`…`)` group (unlike the `(not x)` negation wrapper), so it gets the block anchor.
+  defp add_parens_meta(
+         {:__block__, meta, [{:unquote_splicing, _, _}] = stmts},
+         [_single],
+         cst,
+         opts
+       ),
+       do: parens_block(meta, stmts, cst, opts)
+
+  # `(not x)` / `(! x)` is `wrap_paren_negation`'s synthetic `__block__` (empty meta, a single unary
+  # node) — Elixir leaves it anchorless, so it gets NO `parens:` entry.
+  defp add_parens_meta({:__block__, [], [{op, _, [_]}]} = ast, [_single], _cst, _opts)
+       when op in [:not, :!],
+       do: ast
+
+  # Any other single-expression parenthesised group records `parens: [line, column, closing: …]` on
+  # the inner node's meta (each nesting layer prepends one; `((a))` → two, outermost first). This
+  # includes encoder-wrapped literals (`({a, b})`) and a paren around a multi-statement block.
+  defp add_parens_meta({f, meta, a}, [_single], cst, opts) do
+    if tm?(opts) do
+      case CST.span(cst) do
+        {sl, sc, el, ec} ->
+          {f, [{:parens, [line: sl, column: sc, closing: [line: el, column: ec - 1]]} | meta], a}
+
+        _ ->
+          {f, meta, a}
+      end
+    else
+      {f, meta, a}
+    end
+  end
+
+  defp add_parens_meta(ast, _children, _cst, _opts), do: ast
+
+  defp parens_block(meta, stmts, cst, opts) do
+    case tm?(opts) && CST.span(cst) do
+      {sl, sc, el, ec} ->
+        anchor = [closing: [line: el, column: ec - 1], line: sl, column: sc]
+        {:__block__, Enum.concat(anchor, meta), stmts}
+
+      _ ->
+        {:__block__, meta, stmts}
     end
   end
 
@@ -528,7 +1291,26 @@ defmodule Toxic2.Lower do
       true ->
         {l, acc, nid} = lower(lhs, view, opts, acc, nid)
         {r, acc, nid} = lower(rhs, view, opts, acc, nid)
-        {{op_atom(op_leaf, view), op_meta(op_leaf, view), [l, r]}, acc, nid}
+        meta = Enum.concat(op_newlines(lhs, op_leaf, rhs, view, opts), op_meta(op_leaf, view))
+        {{op_atom(op_leaf, view), meta, [l, r]}, acc, nid}
+    end
+  end
+
+  # A binary operator records `newlines:` when a line break is adjacent to it — the count after the
+  # operator (operator at line end) if any, else the count before it (operator at line start). The
+  # count is the line delta between the operand and the operator (blank lines included).
+  # `newlines:` on a binary operator: the count AFTER the operator (operator at line end) if any,
+  # else the count BEFORE it (operator at line start). `gap_newlines` stops at the next token, so
+  # scanning from the operator end yields the after-count and from the lhs end the before-count.
+  defp op_newlines(lhs, op_leaf, _rhs, view, opts) do
+    if tm?(opts) do
+      {_l1, _c1, lel, lec} = child_span(lhs, view)
+      {_osl, _osc, oel, oec} = child_span(op_leaf, view)
+      after_n = gap_newlines(opts, oel, oec)
+      n = if after_n > 0, do: after_n, else: gap_newlines(opts, lel, lec)
+      if n > 0, do: [newlines: n], else: []
+    else
+      []
     end
   end
 
@@ -539,9 +1321,11 @@ defmodule Toxic2.Lower do
     {r, acc, nid} = lower(rhs, view, opts, acc, nid)
 
     case l do
-      # Valid only as the range step: `a..b//c` (lhs a 2-element range, incl. through parens).
-      {:.., _m, [a, b]} ->
-        {{:..//, [], [a, b, r]}, acc, nid}
+      # Valid only as the range step: `a..b//c` (lhs a 2-element range, incl. through parens). The
+      # `..//` anchors where the range's `..` does (Elixir reuses that position) — take only the
+      # line/column anchor, not the lhs `range:`, so `..//` still gets its own (wider) range.
+      {:.., m, [a, b]} ->
+        {{:..//, Keyword.take(m, [:line, :column]), [a, b, r]}, acc, nid}
 
       # `//` is NOT a general binary operator — Elixir rejects `a // b`, `a..b//c//d`,
       # `a..(b // c)`. Toxic2 is tolerant: emit an error and keep a best-effort `//` node (P1/P5).
@@ -581,7 +1365,9 @@ defmodule Toxic2.Lower do
     {_id, acc, nid} =
       Diagnostics.emit(acc, nid, :lowerer, :warning, :deprecated_not_in, span, %{})
 
-    {{neg, [], [{:in, [], [o, r]}]}, acc, nid}
+    # `not x in y` (deprecated): Elixir anchors both `not` and `in` at the `in` operator.
+    m = if tm?(opts), do: op_meta(op_leaf, view), else: []
+    {{neg, m, [{:in, m, [o, r]}]}, acc, nid}
   end
 
   # `not a in b` / `!a in b` — a bare `not`/`!` left of `in` is the membership-negation form
@@ -652,8 +1438,17 @@ defmodule Toxic2.Lower do
   # expression and wrap it.
   defp lower_callee(_tag, callee, args, view, opts, acc, nid) do
     {callee_ast, acc, nid} = lower(callee, view, opts, acc, nid)
-    {{callee_ast, [], args}, acc, nid}
+    {{callee_ast, callee_anchor(callee_ast, opts), args}, acc, nid}
   end
+
+  # A call whose callee is itself an expression (`a.unquote(b)(c)`, `(expr)(c)`) anchors where its
+  # callee does — Elixir reuses the callee's `line:`/`column:`, not the whole call's span start.
+  defp callee_anchor(_callee, %{token_metadata: false}), do: []
+
+  defp callee_anchor({_f, meta, _a}, _opts) when is_list(meta),
+    do: Keyword.take(meta, [:line, :column])
+
+  defp callee_anchor(_callee, _opts), do: []
 
   # Alias chain: `{:__aliases__, meta, segments}`. A leading alias segment contributes its atom;
   # a leading non-alias base (e.g. `foo.Bar`) contributes its lowered AST as the first segment.
@@ -666,20 +1461,49 @@ defmodule Toxic2.Lower do
       build_alias([first | rest], meta, view, opts, acc, nid)
     else
       {base_ast, acc, nid} = lower(first, view, opts, acc, nid)
+      meta = alias_base_meta(first, meta, view, opts)
 
       case seg_atoms(rest, view, opts) do
-        {:ok, atoms} -> {{:__aliases__, meta, [base_ast | atoms]}, acc, nid}
-        {:error, leaf} -> alias_seg_error(leaf, view, acc, nid)
+        {:ok, atoms} ->
+          {{:__aliases__, with_alias_last(meta, List.last(rest), view, opts), [base_ast | atoms]},
+           acc, nid}
+
+        {:error, leaf} ->
+          alias_seg_error(leaf, view, acc, nid)
       end
+    end
+  end
+
+  # An alias with a NON-alias base (`__MODULE__.Any`, `unquote(x).Foo`) anchors at the base's span
+  # end (the `.` before the first alias segment), not the base start — matching Elixir.
+  defp alias_base_meta(_first, meta, _view, %{token_metadata: false}), do: meta
+
+  defp alias_base_meta(first, meta, view, _opts) do
+    case child_span(first, view) do
+      {_sl, _sc, el, ec} -> [line: el, column: ec]
+      _ -> meta
     end
   end
 
   defp build_alias(leaves, meta, view, opts, acc, nid) do
     case seg_atoms(leaves, view, opts) do
-      {:ok, atoms} -> {{:__aliases__, meta, atoms}, acc, nid}
-      {:error, leaf} -> alias_seg_error(leaf, view, acc, nid)
+      {:ok, atoms} ->
+        {{:__aliases__, with_alias_last(meta, List.last(leaves), view, opts), atoms}, acc, nid}
+
+      {:error, leaf} ->
+        alias_seg_error(leaf, view, acc, nid)
     end
   end
+
+  # `last:` — the position of the alias's final segment (`Foo.Bar.Baz` → `Baz`; single `Foo` → `Foo`).
+  defp with_alias_last(meta, _last_leaf, _view, %{token_metadata: false}), do: meta
+
+  defp with_alias_last(meta, {:token, idx, _f, _d}, view, _opts) do
+    {sl, sc, _el, _ec} = Tokens.span(view, idx)
+    [{:last, [line: sl, column: sc]} | meta]
+  end
+
+  defp with_alias_last(meta, _last_leaf, _view, _opts), do: meta
 
   # Atomize every alias segment through the gated policy; the first that fails (a fresh atom under
   # `existing_atoms_only`, or invalid UTF-8) short-circuits to `{:error, that_leaf}`.
@@ -703,30 +1527,54 @@ defmodule Toxic2.Lower do
   defp lower_remote_call([base, name_leaf | arg_children], view, opts, acc, nid) do
     {base_ast, acc, nid} = lower(base, view, opts, acc, nid)
     {args, acc, nid} = lower_call_args(arg_children, view, opts, acc, nid)
-    remote_name(CST.tag(name_leaf), name_leaf, base_ast, args, view, opts, acc, nid)
+    dotmeta = remote_dot_meta(base, view, opts)
+    remote_name(CST.tag(name_leaf), name_leaf, base_ast, args, dotmeta, view, opts, acc, nid)
   end
 
-  defp remote_name(:token, name_leaf, base_ast, args, view, opts, acc, nid) do
+  # Under `token_metadata: true` the `.` operator anchors at the dot itself (between the base and the
+  # member name), not at the name — matching Elixir. Off, the dot reuses the name meta (unchanged).
+  defp remote_dot_meta(_base, _view, %{token_metadata: false}), do: nil
+
+  defp remote_dot_meta(base, view, opts) do
+    case child_span(base, view) do
+      {_sl, _sc, bel, bec} ->
+        case src_slice(opts, {bel, bec}, {bel, bec + 20}) do
+          s when is_binary(s) ->
+            case :binary.match(s, ".") do
+              {off, _} -> [line: bel, column: bec + off]
+              :nomatch -> nil
+            end
+
+          _ ->
+            nil
+        end
+
+      _ ->
+        nil
+    end
+  end
+
+  defp remote_name(:token, name_leaf, base_ast, args, dotmeta, view, opts, acc, nid) do
     idx = CST.token_index(name_leaf)
     meta = tmeta(view, idx)
 
     case member_atom(Tokens.kind(view, idx), Tokens.value(view, idx), opts) do
-      {:ok, name} -> {{{:., meta, [base_ast, name]}, meta, args}, acc, nid}
+      {:ok, name} -> {{{:., dotmeta || meta, [base_ast, name]}, meta, args}, acc, nid}
       :error -> name_error(name_leaf, view, acc, nid)
     end
   end
 
   # A recovered missing name (`foo.` with nothing after) — its diagnostic was already emitted by
   # the parser; lower to an error node (P5: total, never raises).
-  defp remote_name(:missing, name_leaf, _base_ast, _args, view, _opts, acc, nid),
+  defp remote_name(:missing, name_leaf, _base_ast, _args, _dotmeta, view, _opts, acc, nid),
     do: name_error(name_leaf, view, acc, nid)
 
   # `a."foo"` — the function name is a quoted literal. No interpolation allowed (Elixir rejects
   # `a."f#{x}"`): atomize the concatenated fragments; on interpolation, error + best-effort.
-  defp remote_name(:node, name_node, base_ast, args, view, opts, acc, nid) do
+  defp remote_name(:node, name_node, base_ast, args, dotmeta, view, opts, acc, nid) do
     {parts, acc, nid} = quoted_parts_ast(CST.children(name_node), view, opts, acc, nid)
 
-    if Enum.any?(parts, &match?({:interp, _}, &1)) do
+    if Enum.any?(parts, &match?({:interp, _, _}, &1)) do
       {id, acc, nid} =
         Diagnostics.emit(
           acc,
@@ -743,9 +1591,25 @@ defmodule Toxic2.Lower do
       bin = parts |> Enum.map(fn {:frag, b} -> b end) |> IO.iodata_to_binary()
 
       case to_atom(bin, opts) do
-        {:ok, name} -> {{{:., [], [base_ast, name]}, [], args}, acc, nid}
-        :error -> name_error(name_node, view, acc, nid)
+        {:ok, name} ->
+          dm = dotmeta || []
+          {{{:., dm, [base_ast, name]}, quoted_name_meta(name_node, view, opts), args}, acc, nid}
+
+        :error ->
+          name_error(name_node, view, acc, nid)
       end
+    end
+  end
+
+  # A quoted remote-call member (`foo."bar"(x)`): the call meta anchors at the quoted name and
+  # carries its opening `delimiter:` (the `closing:` for the `)` is added later by `closing_keys`).
+  defp quoted_name_meta(name_node, view, opts) do
+    case tm?(opts) && child_span(name_node, view) do
+      {sl, sc, _el, _ec} = span ->
+        Enum.concat(quoted_key_delimiter(span, opts), line: sl, column: sc)
+
+      _ ->
+        []
     end
   end
 
@@ -758,13 +1622,30 @@ defmodule Toxic2.Lower do
   defp member_atom(_kind, value, _opts) when is_atom(value), do: {:ok, value}
 
   # `a.(args)` => `{{:., m, [base]}, m, args}`.
-  defp lower_anon_call([base | arg_children], view, opts, acc, nid) do
+  defp lower_anon_call([base | arg_children], cst, view, opts, acc, nid) do
     {base_ast, acc, nid} = lower(base, view, opts, acc, nid)
 
     # `lower_call_args` (not `lower_args`) so a trailing do-block becomes `[do: …]` — `f.() do … end`.
     {args, acc, nid} = lower_call_args(arg_children, view, opts, acc, nid)
-    meta = error_meta(base, view)
-    {{{:., meta, [base_ast]}, meta, args}, acc, nid}
+    {dotmeta, callmeta} = anon_call_metas(base, cst, error_meta(base, view), view, opts)
+    {{{:., dotmeta, [base_ast]}, callmeta, args}, acc, nid}
+  end
+
+  # `f.(…)` — under `token_metadata: true` the dot anchors at the `.` (between base and `(`) and the
+  # call meta carries `closing:` (the `)` = node-span end − 1). Off, both reuse the base meta.
+  defp anon_call_metas(_base, _cst, base_meta, _view, %{token_metadata: false}),
+    do: {base_meta, base_meta}
+
+  defp anon_call_metas(base, cst, base_meta, view, opts) do
+    dot = remote_dot_meta(base, view, opts) || base_meta
+
+    closing =
+      case CST.span(cst) do
+        {_sl, _sc, el, ec} -> [closing: [line: el, column: ec - 1]]
+        _ -> []
+      end
+
+    {dot, Enum.concat(closing, dot)}
   end
 
   defp name_error(name_leaf, view, acc, nid) do
@@ -820,7 +1701,7 @@ defmodule Toxic2.Lower do
   # interpolation => the `binary_to_atom` construction (so the pair is `{key_expr, v}`).
   defp kw_key(:node, key_node, v, view, opts, acc, nid) do
     {parts, acc, nid} = quoted_parts_ast(CST.children(key_node), view, opts, acc, nid)
-    {key_ast, acc, nid} = build_quoted_atom(parts, key_node, view, opts, acc, nid)
+    {key_ast, acc, nid} = build_quoted_atom(parts, key_node, key_node, true, view, opts, acc, nid)
     {key_ast, acc, nid} = encode_quoted_kw_key(key_ast, key_node, opts, acc, nid)
     {{key_ast, v}, acc, nid}
   end
@@ -834,11 +1715,12 @@ defmodule Toxic2.Lower do
 
       enc ->
         span = CST.span(key_node)
+        meta = [{:format, :keyword} | literal_meta(span, opts)]
 
         run_encoder_meta(
           enc,
           atom,
-          [{:format, :keyword} | literal_meta(span, opts)],
+          Enum.concat(quoted_key_delimiter(span, opts), meta),
           span,
           acc,
           nid
@@ -847,6 +1729,17 @@ defmodule Toxic2.Lower do
   end
 
   defp encode_quoted_kw_key(other, _key_node, _opts, acc, nid), do: {other, acc, nid}
+
+  # A quoted keyword key (`"foo": v`) carries the opening `delimiter:` under token_metadata, read at
+  # the key's span start (the `"` / `'`), before `format: :keyword`.
+  defp quoted_key_delimiter({sl, sc, _el, _ec}, %{token_metadata: true} = opts) do
+    case src_slice(opts, {sl, sc}, {sl, sc + 4}) do
+      h when is_binary(h) -> if d = delim_at(h), do: [delimiter: d], else: []
+      _ -> []
+    end
+  end
+
+  defp quoted_key_delimiter(_span, _opts), do: []
 
   # Call arguments: a trailing run of keyword pairs is collected into one keyword-list arg
   # (`f(1, a: 2)` => `[1, [a: 2]]`); regular args lower normally.
@@ -940,10 +1833,10 @@ defmodule Toxic2.Lower do
 
       [one] ->
         {ast, acc, nid} = lower(one, view, opts, acc, nid)
-        {wrap_splice(ast), acc, nid}
+        {wrap_splice(attach_eoe(ast, one, view, opts)), acc, nid}
 
       many ->
-        wrap_block(lower_each(many, view, opts, acc, nid))
+        wrap_block(lower_stmts(many, view, opts, acc, nid))
     end
   end
 
@@ -955,10 +1848,29 @@ defmodule Toxic2.Lower do
   end
 
   # `a[b]` => `{{:., m, [Access, :get]}, m, [base, index]}`.
-  defp lower_access([base, idx | _missing], view, opts, acc, nid) do
+  defp lower_access([base, idx | _missing], cst, view, opts, acc, nid) do
     {b, acc, nid} = lower(base, view, opts, acc, nid)
     {k, acc, nid} = lower(idx, view, opts, acc, nid)
-    {{{:., [], [Access, :get]}, [], [b, k]}, acc, nid}
+    dm = access_dot_meta(base, cst, view, opts)
+    {{{:., dm, [Access, :get]}, dm, [b, k]}, acc, nid}
+  end
+
+  # The span of a CST child, whether a node (`CST.span/1`) or a bare token leaf (via the view).
+  defp child_span({:token, idx, _f, _d}, view), do: Tokens.span(view, idx)
+  defp child_span(child, _view), do: CST.span(child)
+
+  # `foo[bar]` => `{{:., dotmeta, [Access, :get]}, [], [foo, bar]}`. Under `token_metadata: true` the
+  # dot meta carries `from_brackets: true` + `closing:` (the `]` = node-span end − 1) and anchors at
+  # the opening `[` (= the base's span end).
+  defp access_dot_meta(_base, _cst, _view, %{token_metadata: false}), do: []
+
+  defp access_dot_meta(base, cst, view, _opts) do
+    with {_, _, bel, bec} <- child_span(base, view),
+         {_, _, el, ec} <- CST.span(cst) do
+      [from_brackets: true, closing: [line: el, column: ec - 1], line: bel, column: bec]
+    else
+      _ -> []
+    end
   end
 
   # `%{...}` => `{:%{}, [], entries}`; entries lower to `{key, value}` 2-tuples.
@@ -971,7 +1883,23 @@ defmodule Toxic2.Lower do
   defp lower_map_update([base | entry_children], view, opts, acc, nid) do
     {base_ast, acc, nid} = lower(base, view, opts, acc, nid)
     {entries, acc, nid} = lower_each(entry_children, view, opts, acc, nid)
-    {{:%{}, [], [{:|, [], [base_ast, entries]}]}, acc, nid}
+    {{:%{}, [], [{:|, cons_meta(base, view, opts), [base_ast, entries]}]}, acc, nid}
+  end
+
+  # The `|` of a map update (`%{m | …}`) anchors at the bar, found just past the base in the source.
+  defp cons_meta(base, view, opts) do
+    if tm?(opts) do
+      with {_sl, _sc, el, ec} <- child_span(base, view),
+           [line: bl, column: bc] = pos <- scan_op(opts, el, ec, "|", el + 3) do
+        after_n = gap_newlines(opts, bl, bc + 1)
+        n = if after_n > 0, do: after_n, else: gap_newlines(opts, el, ec)
+        if n > 0, do: [{:newlines, n} | pos], else: pos
+      else
+        _ -> []
+      end
+    else
+      []
+    end
   end
 
   # `%Name{...}` => `{:%, [], [name, map]}`.
@@ -984,6 +1912,25 @@ defmodule Toxic2.Lower do
   # Stab clause head -> the arg list. A `when` guard wraps the patterns: `[{:when, [], [pats, g]}]`.
   # A trailing keyword run in the patterns is grouped into one keyword-list arg (`fn x, a: 1 -> …`
   # => `[x, [a: 1]]`), matching call/list args; the guard (always last) stays a separate element.
+  # A clause-head `when` guard anchors at the `when` keyword (between the last pattern and the guard).
+  defp when_meta(pats, guard, view, opts) do
+    with true <- tm?(opts),
+         {_, _, pel, pec} <- pats |> List.last() |> then(&(&1 && child_span(&1, view))),
+         {gsl, _, _, _} <- child_span(guard, view) do
+      case scan_op(opts, pel, pec, "when", gsl) do
+        [line: wl, column: wc] = w ->
+          after_n = gap_newlines(opts, wl, wc + 4)
+          n = if after_n > 0, do: after_n, else: gap_newlines(opts, pel, pec)
+          if n > 0, do: [{:newlines, n} | w], else: w
+
+        w ->
+          w
+      end
+    else
+      _ -> []
+    end
+  end
+
   defp lower_stab_args(args_node, view, opts, acc, nid) do
     case CST.children(args_node) do
       [{:node, :stab_when, _sp, when_ch, _f, _d}] ->
@@ -993,7 +1940,9 @@ defmodule Toxic2.Lower do
         # the guard (`{:when, [], [g]}`), mirroring the bare `fn () -> …` => `[]` case below.
         {pat_asts, acc, nid} = lower_args(strip_empty_paren_head(pats), view, opts, acc, nid)
         {guard_ast, acc, nid} = lower(guard, view, opts, acc, nid)
-        {[{:when, [], Enum.concat(pat_asts, [guard_ast])}], acc, nid}
+
+        {[{:when, when_meta(pats, guard, view, opts), Enum.concat(pat_asts, [guard_ast])}], acc,
+         nid}
 
       # `fn () -> ... end`: an empty parenthesised head is ZERO args (`[]`), not one block arg.
       [{:node, :paren, _sp, [], _f, _d}] ->
@@ -1012,10 +1961,10 @@ defmodule Toxic2.Lower do
 
       [one] ->
         {ast, acc, nid} = lower(one, view, opts, acc, nid)
-        {wrap_splice(ast), acc, nid}
+        {wrap_splice(attach_eoe(ast, one, view, opts)), acc, nid}
 
       many ->
-        wrap_block(lower_each(many, view, opts, acc, nid))
+        wrap_block(lower_stmts(many, view, opts, acc, nid))
     end
   end
 
@@ -1032,14 +1981,52 @@ defmodule Toxic2.Lower do
   defp lower_not_in([lhs, rhs], view, opts, acc, nid) do
     {l, acc, nid} = lower(lhs, view, opts, acc, nid)
     {r, acc, nid} = lower(rhs, view, opts, acc, nid)
-    {{:not, [], [{:in, [], [l, r]}]}, acc, nid}
+    {not_m, in_m} = not_in_meta(lhs, view, opts)
+    {{:not, not_m, [{:in, in_m, [l, r]}]}, acc, nid}
+  end
+
+  # `x not in y`: `not` and `in` are separate keywords after the lhs (`x not in …`); anchor each at
+  # its keyword position, found by scanning the source just past the lhs.
+  defp not_in_meta(_lhs, _view, %{token_metadata: false}), do: {[], []}
+
+  defp not_in_meta(lhs, view, opts) do
+    with {_, _, lel, lec} <- child_span(lhs, view),
+         [line: nl, column: nc] = not_m <- scan_op(opts, lel, lec, "not", lel + 1) do
+      {not_m, scan_op(opts, nl, nc + 3, "in", nl + 1)}
+    else
+      _ -> {[], []}
+    end
   end
 
   # `key => value` map entry => `{key, value}` 2-tuple.
   defp lower_assoc([key, val], view, opts, acc, nid) do
     {k, acc, nid} = lower(key, view, opts, acc, nid)
     {v, acc, nid} = lower(val, view, opts, acc, nid)
-    {{k, v}, acc, nid}
+    {{put_assoc(k, key, view, opts), v}, acc, nid}
+  end
+
+  # `assoc:` — for a `key => value` pair, the key's meta records the `=>` operator position (found in
+  # the source just past the key). Only carried under `token_metadata: true`, and only when the key
+  # lowered to a node with a metadata slot (a bare un-encoded literal has nowhere to put it).
+  defp put_assoc(k, _key, _view, %{token_metadata: false}), do: k
+
+  defp put_assoc({f, meta, a}, key, view, opts) do
+    case assoc_pos(key, view, opts) do
+      nil -> {f, meta, a}
+      pos -> {f, [{:assoc, pos} | meta], a}
+    end
+  end
+
+  defp put_assoc(k, _key, _view, _opts), do: k
+
+  defp assoc_pos(key, view, opts) do
+    with {_sl, _sc, kel, kec} <- child_span(key, view),
+         head when is_binary(head) <- src_slice(opts, {kel, kec}, {kel, kec + 40}),
+         {off, _} <- :binary.match(head, "=>") do
+      [line: kel, column: kec + off]
+    else
+      _ -> nil
+    end
   end
 
   # Thread the accumulator while lowering a list of children.
