@@ -4,7 +4,8 @@ defmodule Toxic2.ParserTest do
   alias Toxic2.{CST, Parser, Tokens}
 
   defp parse(src) do
-    {view, []} = Tokens.from_source(src)
+    # `from_source` now also returns lexer warning notices; these unit tests assert on parser diags.
+    {view, _notices} = Tokens.from_source(src)
     {cst, diags} = Parser.parse_tokens(view)
     {view, cst, diags}
   end
@@ -239,7 +240,7 @@ defmodule Toxic2.ParserTest do
 
     test "quoted keyword keys: \"foo\": v / 'bar': v / interpolated key" do
       assert {[foo: 1], []} = Toxic2.parse_to_ast("[\"foo\": 1]")
-      assert {[bar: 2], []} = Toxic2.parse_to_ast("['bar': 2]")
+      assert {[bar: 2], [_charlist_warning]} = Toxic2.parse_to_ast("['bar': 2]")
       assert {["a b": 1], []} = Toxic2.parse_to_ast("[\"a b\": 1]")
       assert {{:%{}, _, [k: 1]}, []} = Toxic2.parse_to_ast("%{\"k\": 1}")
 
@@ -566,7 +567,7 @@ defmodule Toxic2.ParserTest do
       assert {{:fn, _, [{:->, _, [[{:when, _, [{:a, _, nil}, [foo: 1]]}], {:x, _, nil}]}]}, []} =
                Toxic2.parse_to_ast("fn (a) when foo: 1 -> x end")
 
-      assert {[{:->, _, [[[a: 1]], {:foo, _, []}]}], []} =
+      assert {[{:->, _, [[[a: 1]], {:foo, _, []}]}], [_charlist_warning]} =
                Toxic2.parse_to_ast("(('a': 1) -> foo())")
     end
 
@@ -666,10 +667,10 @@ defmodule Toxic2.ParserTest do
       {_view, [c], []} = exprs("'abc'")
       assert CST.node_kind(c) == :charlist
 
-      assert {[97, 98, 99], []} = Toxic2.parse_to_ast("'abc'")
-      assert {[], []} = Toxic2.parse_to_ast("''")
+      assert {[97, 98, 99], [_charlist_warning]} = Toxic2.parse_to_ast("'abc'")
+      assert {[], [_charlist_warning]} = Toxic2.parse_to_ast("''")
 
-      {ast, []} = Toxic2.parse_to_ast("'a\#{b}c'")
+      {ast, [_charlist_warning]} = Toxic2.parse_to_ast("'a\#{b}c'")
 
       assert {{:., _, [List, :to_charlist]}, _,
               [["a", {{:., _, [Kernel, :to_string]}, _, [{:b, _, nil}]}, "c"]]} = ast
@@ -711,7 +712,7 @@ defmodule Toxic2.ParserTest do
 
     test "quoted strings/charlists may span newlines (not just heredocs)" do
       assert {"a\nb", []} = Toxic2.parse_to_ast("\"a\nb\"")
-      assert {~c"a\nb", []} = Toxic2.parse_to_ast("'a\nb'")
+      assert {~c"a\nb", [_charlist_warning]} = Toxic2.parse_to_ast("'a\nb'")
     end
 
     test "full escape forms decode like Elixir (hex / unicode / line continuation)" do

@@ -4,8 +4,9 @@ defmodule Toxic2.LexerTest do
   alias Toxic2.Token
 
   defp tokens(src) do
-    {toks, warnings} = Toxic2.tokenize(src)
-    assert warnings == [], "phase 2 lexer must not emit out-of-band warnings"
+    # The lexer now emits deprecation/ambiguity WARNINGS on the notice channel (`{toks, notices}`);
+    # token-shape tests only care about `toks`. Warning behavior is covered by the diagnostics suites.
+    {toks, _notices} = Toxic2.tokenize(src)
     toks
   end
 

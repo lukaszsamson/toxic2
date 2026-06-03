@@ -95,9 +95,10 @@ defmodule Toxic2.Parser do
   """
   @spec parse(binary(), keyword()) :: result()
   def parse(source, opts \\ []) when is_binary(source) do
-    {view, lexer_warnings} = Tokens.from_source(source, opts)
+    {view, lex_notices} = Tokens.from_source(source, opts)
     {cst, parser_diags} = parse_tokens(view)
-    {cst, Diagnostics.merge_sorted([lexer_warnings, parser_diags])}
+    {lex_diags, _nid} = Diagnostics.number(lex_notices, Diagnostics.next_id(parser_diags))
+    {cst, Diagnostics.merge_sorted([lex_diags, parser_diags])}
   end
 
   @doc "Parse a prepared `Toxic2.Tokens` view into `{cst, diagnostics}`."

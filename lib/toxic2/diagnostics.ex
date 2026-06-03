@@ -50,6 +50,28 @@ defmodule Toxic2.Diagnostics do
   @spec errors([Diagnostic.t()]) :: [Diagnostic.t()]
   def errors(diags), do: Enum.filter(diags, &Diagnostic.error?/1)
 
+  @doc """
+  Number a list of id-less lexer notices (`{phase, severity, code, span, details}`, in source order)
+  into full diagnostics, allocating ids from `start_id`. Returns `{diagnostics, next_id}`.
+
+  Lexer WARNINGS travel as `:warning` tokens that `Tokens.from_source` partitions out of the parse
+  stream into notices; their ids are allocated here, AFTER the parser's, so the combined stream stays
+  unique (lexer errors keep their own transport — an `:error` token the parser converts to a diag).
+  """
+  @spec number([tuple()], pos_integer()) :: {[Diagnostic.t()], pos_integer()}
+  def number(notices, start_id) do
+    {rev, nid} =
+      Enum.reduce(notices, {[], start_id}, fn {phase, severity, code, span, details}, {acc, id} ->
+        {[Diagnostic.new(id, phase, severity, code, span, details) | acc], id + 1}
+      end)
+
+    {:lists.reverse(rev), nid}
+  end
+
+  @doc "One past the highest id in `diags` (1 when empty) — the next free id."
+  @spec next_id([Diagnostic.t()]) :: pos_integer()
+  def next_id(diags), do: Enum.reduce(diags, 0, &max(Diagnostic.id(&1), &2)) + 1
+
   @doc "Merge already-source-ordered streams into one, stably ordered by start position."
   @spec merge_sorted([[Diagnostic.t()]]) :: [Diagnostic.t()]
   def merge_sorted(streams) do

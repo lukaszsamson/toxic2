@@ -201,7 +201,7 @@ defmodule Toxic2.Lexer do
     do: open_heredoc(rest, line, col, acc, w, st, ?")
 
   defp lex(<<?', ?', ?', rest::binary>>, line, col, acc, w, st),
-    do: open_heredoc(rest, line, col, acc, w, st, ?')
+    do: open_heredoc(rest, line, col, acc, charlist_notice(w, acc, line, col, 3), st, ?')
 
   # --- quoted literals: linear form (start, fragments, interp, end) ------
   defp lex(<<?", rest::binary>>, line, col, acc, w, st) do
@@ -211,6 +211,7 @@ defmodule Toxic2.Lexer do
 
   defp lex(<<?', rest::binary>>, line, col, acc, w, st) do
     start = {:charlist_start, line, col, line, col + 1, nil}
+    w = charlist_notice(w, acc, line, col, 1)
     read_quoted(rest, line, col + 1, [], {line, col + 1}, [start | acc], w, st, :charlist)
   end
 
@@ -268,11 +269,12 @@ defmodule Toxic2.Lexer do
         {elen, exp_ok} = scan_exp(rest_at(bin, ilen + 1 + flen))
         total = ilen + 1 + flen + elen
 
-        if int_ok and frac_ok and exp_ok do
-          value = bin |> binary_part(0, total) |> strip_underscores() |> String.to_float()
+        # `String.to_float/1` raises on overflow (`1.0e309` → infinity); stay total and diagnose it.
+        with true <- int_ok and frac_ok and exp_ok,
+             {:ok, value} <- safe_to_float(strip_underscores(binary_part(bin, 0, total))) do
           cont(rest_at(bin, total), {:flt, line, col, line, col + total, value}, acc, w, st)
         else
-          num_error(bin, total, line, col, acc, w, st)
+          _ -> num_error(bin, total, line, col, acc, w, st)
         end
 
       _ ->
@@ -362,6 +364,17 @@ defmodule Toxic2.Lexer do
   end
 
   # --- percent (parser combines with `{`/alias for maps/structs) ---------
+  # `% {` — a map opener with a space before the brace is invalid (`%{...}` must be adjacent; a
+  # space is fine before an alias, `% Foo{}`). Emit an error, then lex the `%` as usual (tolerant).
+  defp lex(<<?%, c, _::binary>> = bin, line, col, acc, w, st) when c in [?\s, ?\t] do
+    if match?(<<?{, _::binary>>, skip_spaces_tabs(rest_at(bin, 1))) do
+      acc = [{:error, line, col, line, col + 1, LexError.new(:space_before_curly, %{})} | acc]
+      cont(rest_at(bin, 1), {:percent, line, col, line, col + 1, nil}, acc, w, st)
+    else
+      cont(rest_at(bin, 1), {:percent, line, col, line, col + 1, nil}, acc, w, st)
+    end
+  end
+
   # `%{}:`/`%:` followed by a kw separator are operator keyword keys (handled via op_kw_len).
   defp lex(<<?%, _::binary>> = bin, line, col, acc, w, st) do
     case op_kw_len(bin) do
@@ -604,11 +617,25 @@ defmodule Toxic2.Lexer do
 
   defp lower_token(name, l, c, n) do
     cond do
-      m = @reserved_ops[name] -> reserved_token(m, l, c, n)
-      Map.has_key?(@terminators, name) -> {@terminators[name], l, c, l, c + n, nil}
-      Map.has_key?(@value_literals, name) -> {:literal, l, c, l, c + n, @value_literals[name]}
-      Map.has_key?(@block_labels, name) -> {:block_label, l, c, l, c + n, @block_labels[name]}
-      true -> {:identifier, l, c, l, c + n, name}
+      m = @reserved_ops[name] ->
+        reserved_token(m, l, c, n)
+
+      Map.has_key?(@terminators, name) ->
+        {@terminators[name], l, c, l, c + n, nil}
+
+      Map.has_key?(@value_literals, name) ->
+        {:literal, l, c, l, c + n, @value_literals[name]}
+
+      Map.has_key?(@block_labels, name) ->
+        {:block_label, l, c, l, c + n, @block_labels[name]}
+
+      # `__aliases__` / `__block__` are reserved (they name AST nodes) and cannot be used as plain
+      # identifiers; emit a lexer error (tolerant: the parser reports it and recovers).
+      name in ["__aliases__", "__block__"] ->
+        {:error, l, c, l, c + n, LexError.new(:reserved_token, %{name: name})}
+
+      true ->
+        {:identifier, l, c, l, c + n, name}
     end
   end
 
@@ -1397,6 +1424,25 @@ defmodule Toxic2.Lexer do
   end
 
   defp strip_underscores(bin), do: :binary.replace(bin, "_", "", [:global])
+
+  defp skip_spaces_tabs(<<c, rest::binary>>) when c in [?\s, ?\t], do: skip_spaces_tabs(rest)
+  defp skip_spaces_tabs(bin), do: bin
+
+  # A bare single-quoted string (`'...'`, `'''...'''`) is a deprecated charlist — Elixir warns,
+  # suggesting `~c"..."` / `""`. Recorded as an id-less lexer notice on the out-of-band channel
+  # (numbered at the parse boundary). A single-quoted REMOTE-CALL name (`a.'foo'`) is preceded by a
+  # `.` and gets its own deprecation (backlog), so it is skipped here.
+  defp charlist_notice(w, [{:dot, _, _, _, _, _} | _], _line, _col, _len), do: w
+
+  defp charlist_notice(w, _acc, line, col, open_len),
+    do: [{:lexer, :warning, :deprecated_charlist, {line, col, line, col + open_len}, %{}} | w]
+
+  # `String.to_float/1` raises on an out-of-range magnitude (e.g. `1.0e309`); keep the lexer total.
+  defp safe_to_float(bin) do
+    {:ok, String.to_float(bin)}
+  rescue
+    ArgumentError -> :error
+  end
 
   defp radix(b) when b in [?x, ?X], do: {16, &hex?/1}
   defp radix(b) when b in [?o, ?O], do: {8, &oct?/1}

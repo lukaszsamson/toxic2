@@ -52,18 +52,16 @@ defmodule Toxic2 do
   """
   @spec parse_to_ast(binary(), keyword()) :: {Macro.t(), [Toxic2.Diagnostic.t()]}
   def parse_to_ast(source, opts \\ []) when is_binary(source) do
-    {view, warnings} = Toxic2.Tokens.from_source(source, opts)
+    {view, lex_notices} = Toxic2.Tokens.from_source(source, opts)
     {cst, parser_diags} = Toxic2.Parser.parse_tokens(view)
-    # Lowerer ids continue past lexer/parser ids so the combined stream stays unique.
-    {ast, lowerer_diags} =
-      Toxic2.Lower.to_ast(cst, view, source, opts, next_id(warnings, parser_diags))
 
-    {ast, Toxic2.Diagnostics.merge_sorted([warnings, parser_diags, lowerer_diags])}
-  end
+    # Ids: parser first, then lexer warning notices, then the lowerer — each range disjoint so the
+    # combined stream stays unique (lexer ERRORS are already numbered by the parser in-stream).
+    {lex_diags, nid} =
+      Toxic2.Diagnostics.number(lex_notices, Toxic2.Diagnostics.next_id(parser_diags))
 
-  defp next_id(warnings, parser_diags) do
-    Enum.concat(warnings, parser_diags)
-    |> Enum.reduce(0, fn d, max -> max(max, elem(d, 0)) end)
-    |> Kernel.+(1)
+    {ast, lowerer_diags} = Toxic2.Lower.to_ast(cst, view, source, opts, nid)
+
+    {ast, Toxic2.Diagnostics.merge_sorted([lex_diags, parser_diags, lowerer_diags])}
   end
 end

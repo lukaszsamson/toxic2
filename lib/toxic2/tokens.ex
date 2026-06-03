@@ -37,11 +37,17 @@ defmodule Toxic2.Tokens do
     {toks, tuple_size(toks)}
   end
 
-  @doc "Convenience: tokenize `source` and build the view. Returns `{view, warnings}`."
-  @spec from_source(binary(), keyword()) :: {t(), [term()]}
+  @doc """
+  Convenience: tokenize `source` and build the view. Returns `{view, notices}` where each notice is
+  an id-less lexer warning `{:lexer, :warning, code, span, details}` (the parse boundary numbers them
+  — see `Diagnostics.number/2`). Lexer ERRORS keep their own transport (an `:error` token in the
+  view that the parser converts and recovers from); warnings annotate valid constructs, so they ride
+  the out-of-band notice channel rather than the parse stream.
+  """
+  @spec from_source(binary(), keyword()) :: {t(), [tuple()]}
   def from_source(source, opts \\ []) when is_binary(source) do
-    {tokens, warnings} = Toxic2.Lexer.tokenize(source, opts)
-    {from_list(tokens), warnings}
+    {tokens, notices} = Toxic2.Lexer.tokenize(source, opts)
+    {from_list(tokens), notices}
   end
 
   @doc "Number of tokens in the view."
