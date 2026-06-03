@@ -199,10 +199,28 @@ defmodule Toxic2.DiagnosticsConformanceTest do
 
     test "single-quoted atoms :'foo' warn (deprecated) but stay valid" do
       assert errors(":'foo'") == []
-      [w] = warnings(":'foo'")
-      assert {Diagnostic.code(w), Diagnostic.span(w)} == {:deprecated_quoted_atom, {1, 1, 1, 3}}
-      # double-quoted atoms do not warn
-      assert warnings(~S(:"foo")) == []
+
+      # a single-quoted atom that needs no quotes carries BOTH the single-quote deprecation and the
+      # unnecessary-quote note (matching Elixir); a double-quoted one carries only the latter.
+      codes = fn src -> Enum.map(warnings(src), &Diagnostic.code/1) |> Enum.sort() end
+      assert codes.(":'foo'") == [:deprecated_quoted_atom, :unnecessary_quoted_atom]
+      assert codes.(~S(:"foo")) == [:unnecessary_quoted_atom]
+      # an atom that genuinely needs quotes warns only about the single quotes (not "unnecessary")
+      assert codes.(":'foo bar'") == [:deprecated_quoted_atom]
+      assert warnings(~S(:"foo bar")) == []
+    end
+
+    test "quoted keyword keys / remote calls warn (unnecessary or single-quote deprecation)" do
+      codes = fn src -> Enum.map(warnings(src), &Diagnostic.code/1) |> Enum.sort() end
+      # unnecessary quotes take precedence over the single-quote deprecation for keywords
+      assert codes.("['foo': 1]") == [:unnecessary_quoted_keyword]
+      assert codes.(~S(["foo": 1])) == [:unnecessary_quoted_keyword]
+      # a single-quoted call carries both; a double-quoted one only the unnecessary note
+      assert codes.("a.'foo'()") == [:deprecated_quoted_call, :unnecessary_quoted_call]
+      assert codes.("a.\"foo\"()") == [:unnecessary_quoted_call]
+      # quotes that are actually required don't trigger the unnecessary note
+      assert warnings("[\"foo bar\": 1]") == []
+      assert warnings("a.\"foo bar\"()") == []
     end
   end
 

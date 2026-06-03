@@ -225,9 +225,11 @@ defmodule Toxic2.ParserTest do
     end
 
     test "dot-quoted remote calls use the string as the function-name atom" do
-      assert {{{:., _, [{:a, _, nil}, :foo]}, _, []}, []} = Toxic2.parse_to_ast("a.\"foo\"")
-      assert {{{:., _, [{:a, _, nil}, :foo]}, _, [1]}, []} = Toxic2.parse_to_ast("a.\"foo\"(1)")
-      assert {{{:., _, [{:a, _, nil}, :foo]}, _, []}, []} = Toxic2.parse_to_ast("a.'foo'")
+      # the quotes are unnecessary here, so each call carries a deprecation/unnecessary warning
+      assert {{{:., _, [{:a, _, nil}, :foo]}, _, []}, [_]} = Toxic2.parse_to_ast("a.\"foo\"")
+      assert {{{:., _, [{:a, _, nil}, :foo]}, _, [1]}, [_]} = Toxic2.parse_to_ast("a.\"foo\"(1)")
+      # single-quoted: both the single-quote-call deprecation and the unnecessary-quote note
+      assert {{{:., _, [{:a, _, nil}, :foo]}, _, []}, [_, _]} = Toxic2.parse_to_ast("a.'foo'")
       # an interpolated name is rejected (tolerantly)
       {_a, diags} = Toxic2.parse_to_ast("a.\"f\#{x}\"")
       assert Enum.any?(diags, &(elem(&1, 2) == :error))
@@ -239,10 +241,12 @@ defmodule Toxic2.ParserTest do
     end
 
     test "quoted keyword keys: \"foo\": v / 'bar': v / interpolated key" do
-      assert {[foo: 1], []} = Toxic2.parse_to_ast("[\"foo\": 1]")
-      assert {[bar: 2], [_charlist_warning]} = Toxic2.parse_to_ast("['bar': 2]")
+      # `foo` / `bar` / `k` don't need quotes → an unnecessary-quoted-keyword warning each
+      assert {[foo: 1], [_]} = Toxic2.parse_to_ast("[\"foo\": 1]")
+      assert {[bar: 2], [_]} = Toxic2.parse_to_ast("['bar': 2]")
+      # `"a b"` genuinely needs quotes → no warning
       assert {["a b": 1], []} = Toxic2.parse_to_ast("[\"a b\": 1]")
-      assert {{:%{}, _, [k: 1]}, []} = Toxic2.parse_to_ast("%{\"k\": 1}")
+      assert {{:%{}, _, [k: 1]}, [_]} = Toxic2.parse_to_ast("%{\"k\": 1}")
 
       {ast, []} = Toxic2.parse_to_ast("[\"f\#{x}\": 1]")
       assert [{{{:., _, [:erlang, :binary_to_atom]}, _, _}, 1}] = ast
@@ -845,9 +849,11 @@ defmodule Toxic2.ParserTest do
 
   describe "quoted atoms (:\"...\")" do
     test "no interpolation lowers to the atom (escapes processed)" do
-      assert {:a, []} = Toxic2.parse_to_ast(":\"a\"")
-      # single-quoted atoms are deprecated: same atom, but with a warning diagnostic
-      assert {:a, [_deprecated_quoted_atom]} = Toxic2.parse_to_ast(":'a'")
+      # `a` needs no quotes → an unnecessary-quoted-atom warning
+      assert {:a, [_unnecessary]} = Toxic2.parse_to_ast(":\"a\"")
+      # single-quoted AND unnecessary: both the deprecation and the unnecessary-quote note
+      assert {:a, [_deprecated, _unnecessary]} = Toxic2.parse_to_ast(":'a'")
+      # `"a b"` / `""` genuinely need quotes → no warning
       assert {:"a b", []} = Toxic2.parse_to_ast(":\"a b\"")
       assert {:"", []} = Toxic2.parse_to_ast(":\"\"")
     end

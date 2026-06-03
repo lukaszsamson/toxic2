@@ -213,15 +213,19 @@ defmodule Toxic2.Lexer do
     do: open_heredoc(rest, line, col, acc, charlist_notice(w, acc, line, col, 3), st, ?')
 
   # --- quoted literals: linear form (start, fragments, interp, end) ------
+  # The quote warning (charlist / keyword / call deprecations, unnecessary quotes) is deferred to
+  # `close_quoted`, where the role and full content are known. The role is computed here: a literal
+  # right after a `.` is a CALL name (`a."foo"()`), otherwise a bare string (maybe a keyword key).
   defp lex(<<?", rest::binary>>, line, col, acc, w, st) do
     start = {:string_start, line, col, line, col + 1, nil}
-    read_quoted(rest, line, col + 1, [], {line, col + 1}, [start | acc], w, st, :dquote)
+    lit = {:dquote, quote_role(acc, line, col)}
+    read_quoted(rest, line, col + 1, [], {line, col + 1}, [start | acc], w, st, lit)
   end
 
   defp lex(<<?', rest::binary>>, line, col, acc, w, st) do
     start = {:charlist_start, line, col, line, col + 1, nil}
-    w = charlist_notice(w, acc, line, col, 1)
-    read_quoted(rest, line, col + 1, [], {line, col + 1}, [start | acc], w, st, :charlist)
+    lit = {:charlist, quote_role(acc, line, col)}
+    read_quoted(rest, line, col + 1, [], {line, col + 1}, [start | acc], w, st, lit)
   end
 
   # --- sigils: ~name<delim>...<delim>modifiers ---------------------------
@@ -244,6 +248,7 @@ defmodule Toxic2.Lexer do
 
   defp lex(<<??, ?\\, e, rest::binary>>, line, col, acc, w, st) do
     value = Map.get(@char_escapes, e, e)
+    w = unknown_char_escape_notice(e, line, col, w)
     cont(rest, {:char, line, col, line, col + 3, value}, acc, w, st)
   end
 
@@ -312,18 +317,20 @@ defmodule Toxic2.Lexer do
     do: cont(<<>>, {:type_op, line, col, line, col + 2, :"::"}, acc, w, st)
 
   # --- quoted atoms `:"..."` / `:'...'` (a `:quoted_atom` marker + the quoted literal's tokens) --
+  # Quoted atoms carry the `:atom` role; their warnings (single-quote deprecation, unnecessary
+  # quotes) are emitted at `close_quoted` once the content is known.
   defp lex(<<?:, ?", rest::binary>>, line, col, acc, w, st) do
     marker = {:quoted_atom, line, col, line, col + 1, nil}
     start = {:string_start, line, col + 1, line, col + 2, nil}
-    read_quoted(rest, line, col + 2, [], {line, col + 2}, [start, marker | acc], w, st, :dquote)
+    lit = {:dquote, {:atom, line, col}}
+    read_quoted(rest, line, col + 2, [], {line, col + 2}, [start, marker | acc], w, st, lit)
   end
 
   defp lex(<<?:, ?', rest::binary>>, line, col, acc, w, st) do
     marker = {:quoted_atom, line, col, line, col + 1, nil}
     start = {:charlist_start, line, col + 1, line, col + 2, nil}
-    # single quotes around atoms (`:'foo'`) are deprecated in favour of `:"foo"`.
-    w = [{:lexer, :warning, :deprecated_quoted_atom, {line, col, line, col + 2}, %{}} | w]
-    read_quoted(rest, line, col + 2, [], {line, col + 2}, [start, marker | acc], w, st, :charlist)
+    lit = {:charlist, {:atom, line, col}}
+    read_quoted(rest, line, col + 2, [], {line, col + 2}, [start, marker | acc], w, st, lit)
   end
 
   # --- atoms: :name and :<operator> -------------------------------------
@@ -718,6 +725,14 @@ defmodule Toxic2.Lexer do
   # A keyword key colon must be followed by `is_space` (space/tab/CR/LF) — `foo:bar`/`foo:1`/`foo:`
   # at EOF are rejected by Elixir ("keyword argument must be followed by space"). `foo::` is the
   # type operator, never a keyword.
+  # `?\X` where X is an ASCII letter that is NOT a recognised escape (`?\q`, `?\x`, `?\Q`) is a
+  # no-op backslash — Elixir warns to use `?X` instead. Digits/punctuation (`?\7`, `?\(`) don't warn.
+  defp unknown_char_escape_notice(e, line, col, w)
+       when (e in ?a..?z or e in ?A..?Z) and not is_map_key(@char_escapes, e),
+       do: [{:lexer, :warning, :unknown_char_escape, {line, col, line, col + 3}, %{char: e}} | w]
+
+  defp unknown_char_escape_notice(_e, _line, _col, w), do: w
+
   # Look back past any `:eol` tokens (newlines fold into a preceding `;` in Elixir) for a `;`.
   defp prev_semicolon?([{:eol, _, _, _, _, _} | rest]), do: prev_semicolon?(rest)
   defp prev_semicolon?([{:";", _, _, _, _, _} | _]), do: true
@@ -787,30 +802,34 @@ defmodule Toxic2.Lexer do
   # literals MAY span newlines (Elixir accepts `"a\nb"`); only EOF before the closer is
   # unterminated. Escapes (`\n`, `\xHH`, `\u{..}`, line-continuation `\<newline>`, …) are decoded
   # by `decode_escape`. `fs = {line, col}` is the start of the fragment accumulated in `buf`.
-  defp read_quoted(<<?\\, rest::binary>>, line, col, buf, fs, acc, w, st, qk) do
+  # `lit = {qk, role}` bundles the quote kind (`:dquote`/`:charlist`) and the role (`{:atom|:call|
+  # :string, open_line, open_col}`) so the scanner stays within Credo's arity budget; `qk` is
+  # destructured locally where the close char / fragment kind is needed.
+  defp read_quoted(<<?\\, rest::binary>>, line, col, buf, fs, acc, w, st, lit) do
     {app, rest2, line2, col2, err} = decode_escape(rest, line, col)
 
     case err do
       nil ->
-        read_quoted(rest2, line2, col2, [app | buf], fs, acc, w, st, qk)
+        read_quoted(rest2, line2, col2, [app | buf], fs, acc, w, st, lit)
 
       {code, details} ->
+        {qk, _role} = lit
         acc = flush_fragment(buf, fs, line, col, acc, frag_kind(qk))
         acc = [{:error, line, col, line2, col2, LexError.new(code, details)} | acc]
-        read_quoted(rest2, line2, col2, [app], {line2, col2}, acc, w, st, qk)
+        read_quoted(rest2, line2, col2, [app], {line2, col2}, acc, w, st, lit)
     end
   end
 
-  defp read_quoted(<<?#, ?{, rest::binary>>, line, col, buf, fs, acc, w, st, qk) do
+  defp read_quoted(<<?#, ?{, rest::binary>>, line, col, buf, fs, acc, w, st, {qk, _role} = lit) do
     acc = flush_fragment(buf, fs, line, col, acc, frag_kind(qk))
     acc = [{:begin_interpolation, line, col, line, col + 2, nil} | acc]
-    lex(rest, line, col + 2, acc, w, [{:interp, {:quoted, qk}} | st])
+    lex(rest, line, col + 2, acc, w, [{:interp, {:quoted, lit}} | st])
   end
 
-  defp read_quoted(<<?\n, rest::binary>>, line, _col, buf, fs, acc, w, st, qk),
-    do: read_quoted(rest, line + 1, 1, [<<?\n>> | buf], fs, acc, w, st, qk)
+  defp read_quoted(<<?\n, rest::binary>>, line, _col, buf, fs, acc, w, st, lit),
+    do: read_quoted(rest, line + 1, 1, [<<?\n>> | buf], fs, acc, w, st, lit)
 
-  defp read_quoted(<<>>, line, col, buf, fs, acc, w, _st, qk) do
+  defp read_quoted(<<>>, line, col, buf, fs, acc, w, _st, {qk, _role}) do
     acc = flush_fragment(buf, fs, line, col, acc, frag_kind(qk))
     err = {:error, line, col, line, col, LexError.new(:string_missing_terminator, %{})}
     {[{end_kind(qk), line, col, line, col, nil}, err | acc], w}
@@ -820,12 +839,12 @@ defmodule Toxic2.Lexer do
   # instead of one `<<c>>`+cons per char (the dominant string/heredoc allocation — see tprof). The
   # guard also matches the close quote (a printable ASCII byte); the run scanner stops at it, so a
   # 0-length run means "the close is here" and we hand off to `close_quoted`.
-  defp read_quoted(<<c, _::binary>> = bin, line, col, buf, fs, acc, w, st, qk)
+  defp read_quoted(<<c, _::binary>> = bin, line, col, buf, fs, acc, w, st, {qk, _role} = lit)
        when c >= 32 and c < 128 and c != ?\\ and c != ?# do
     close = close_char(qk)
 
     if c == close do
-      close_quoted(rest_at(bin, 1), line, col, buf, fs, acc, w, st, qk)
+      close_quoted(rest_at(bin, 1), line, col, buf, fs, acc, w, st, lit)
     else
       n = plain_run_len(bin, close, close, 0)
 
@@ -838,15 +857,15 @@ defmodule Toxic2.Lexer do
         acc,
         w,
         st,
-        qk
+        lit
       )
     end
   end
 
-  defp read_quoted(<<c::utf8, rest::binary>>, line, col, buf, fs, acc, w, st, qk) do
+  defp read_quoted(<<c::utf8, rest::binary>>, line, col, buf, fs, acc, w, st, {qk, _role} = lit) do
     cond do
       c == close_char(qk) ->
-        close_quoted(rest, line, col, buf, fs, acc, w, st, qk)
+        close_quoted(rest, line, col, buf, fs, acc, w, st, lit)
 
       bidi?(c) ->
         acc = flush_fragment(buf, fs, line, col, acc, frag_kind(qk))
@@ -855,38 +874,133 @@ defmodule Toxic2.Lexer do
           {:error, line, col, line, col + 1, LexError.new(:invalid_bidi, %{codepoint: c})} | acc
         ]
 
-        read_quoted(rest, line, col + 1, [<<c::utf8>>], {line, col + 1}, acc, w, st, qk)
+        read_quoted(rest, line, col + 1, [<<c::utf8>>], {line, col + 1}, acc, w, st, lit)
 
       true ->
-        read_quoted(rest, line, col + 1, [<<c::utf8>> | buf], fs, acc, w, st, qk)
+        read_quoted(rest, line, col + 1, [<<c::utf8>> | buf], fs, acc, w, st, lit)
     end
   end
 
   # A stray non-UTF-8 byte inside a quoted literal: keep it verbatim and keep scanning (tolerant).
-  defp read_quoted(<<byte, rest::binary>>, line, col, buf, fs, acc, w, st, qk) do
-    read_quoted(rest, line, col + 1, [<<byte>> | buf], fs, acc, w, st, qk)
+  defp read_quoted(<<byte, rest::binary>>, line, col, buf, fs, acc, w, st, lit) do
+    read_quoted(rest, line, col + 1, [<<byte>> | buf], fs, acc, w, st, lit)
   end
 
-  # Close a quoted literal: flush the pending fragment, emit the end token, then check for a quoted
-  # keyword colon. `rest` is the input AFTER the close quote.
-  defp close_quoted(rest, line, col, buf, fs, acc, w, st, qk) do
+  # Close a quoted literal: flush the pending fragment, emit the end token, then decide keyword-key
+  # vs literal and emit any quote warning (charlist / single-quote / unnecessary-quote) now that the
+  # role and full content are known. `simple?` (no interpolation) is read off `acc` BEFORE flushing
+  # — the start token is still at the head only when the literal had a single fragment.
+  defp close_quoted(rest, line, col, buf, fs, acc, w, st, {qk, _role} = lit) do
+    simple? = single_part?(acc)
     acc = flush_fragment(buf, fs, line, col, acc, frag_kind(qk))
     acc = [{end_kind(qk), line, col, line, col + 1, nil} | acc]
-    # A `:` immediately after the close quote (not `::`) makes this a quoted keyword KEY
-    # (`"foo": 1`): emit a `:kw_quote` marker the parser pairs with the preceding literal.
-    maybe_kw_colon(rest, line, col + 1, acc, w, st)
+    close_kw_colon(rest, line, col + 1, acc, w, st, lit, simple?, buf)
   end
 
-  defp maybe_kw_colon(<<?:, c, _::binary>> = rest, line, col, acc, w, st) when c != ?: do
+  defp single_part?([{:string_start, _, _, _, _, _} | _]), do: true
+  defp single_part?([{:charlist_start, _, _, _, _, _} | _]), do: true
+  defp single_part?(_), do: false
+
+  # A `:` + whitespace after the close quote makes a `:string`-role literal a quoted keyword KEY
+  # (`"foo": 1`): emit a `:kw_quote` marker the parser pairs with the preceding literal. A `:` +
+  # non-space (not `::`) is the keyword-missing-space error (`"foo":bar`). `:atom`/`:call` roles are
+  # never keyword keys, so they fall to the final clause.
+  defp close_kw_colon(
+         <<?:, c, _::binary>> = rest,
+         line,
+         col,
+         acc,
+         w,
+         st,
+         {_, {:string, _, _}} = lit,
+         simple?,
+         buf
+       )
+       when c in [?\s, ?\t, ?\r, ?\n] do
+    w = emit_quote_warnings(lit, true, simple?, buf, w)
     tok = {:kw_quote, line, col, line, col + 1, nil}
     lex(rest_at(rest, 1), line, col + 1, [tok | acc], w, st)
   end
 
-  defp maybe_kw_colon(<<?:>>, line, col, acc, w, st) do
+  defp close_kw_colon(
+         <<?:, c, _::binary>> = rest,
+         line,
+         col,
+         acc,
+         w,
+         st,
+         {_, {:string, _, _}} = lit,
+         simple?,
+         buf
+       )
+       when c != ?: do
+    w = emit_quote_warnings(lit, true, simple?, buf, w)
+    err = {:error, line, col, line, col + 1, LexError.new(:kw_missing_space, %{})}
+    tok = {:kw_quote, line, col, line, col + 1, nil}
+    lex(rest_at(rest, 1), line, col + 1, [tok, err | acc], w, st)
+  end
+
+  defp close_kw_colon(<<?:>>, line, col, acc, w, st, {_, {:string, _, _}} = lit, simple?, buf) do
+    w = emit_quote_warnings(lit, true, simple?, buf, w)
     lex(<<>>, line, col + 1, [{:kw_quote, line, col, line, col + 1, nil} | acc], w, st)
   end
 
-  defp maybe_kw_colon(rest, line, col, acc, w, st), do: lex(rest, line, col, acc, w, st)
+  defp close_kw_colon(rest, line, col, acc, w, st, lit, simple?, buf) do
+    w = emit_quote_warnings(lit, false, simple?, buf, w)
+    lex(rest, line, col, acc, w, st)
+  end
+
+  # Quote warnings, mirroring elixir_tokenizer: an atom/call may carry BOTH the single-quote
+  # deprecation and an unnecessary-quote note; a keyword takes unnecessary-OR-single-quote (not
+  # both); a bare string/charlist only the charlist deprecation. `qk == :charlist` ⟺ single quotes.
+  # `unnecessary?/2` is computed lazily per clause so the common bare-double-quoted string (which
+  # needs no warning) never touches `buf`.
+  defp emit_quote_warnings({qk, {kind, ol, oc}}, is_kw, simple?, buf, w),
+    do: quote_warn(kind, qk == :charlist, is_kw, simple?, buf, ol, oc, w)
+
+  defp quote_warn(:atom, single?, _kw, simple?, buf, ol, oc, w) do
+    w = if single?, do: qn(:deprecated_quoted_atom, ol, oc, w), else: w
+    if unnecessary?(simple?, buf), do: qn(:unnecessary_quoted_atom, ol, oc, w), else: w
+  end
+
+  defp quote_warn(:call, single?, _kw, simple?, buf, ol, oc, w) do
+    w = if single?, do: qn(:deprecated_quoted_call, ol, oc, w), else: w
+    if unnecessary?(simple?, buf), do: qn(:unnecessary_quoted_call, ol, oc, w), else: w
+  end
+
+  defp quote_warn(:string, single?, true, simple?, buf, ol, oc, w) do
+    cond do
+      unnecessary?(simple?, buf) -> qn(:unnecessary_quoted_keyword, ol, oc, w)
+      single? -> qn(:deprecated_quoted_keyword, ol, oc, w)
+      true -> w
+    end
+  end
+
+  defp quote_warn(:string, single?, false, _simple?, _buf, ol, oc, w),
+    do: if(single?, do: qn(:deprecated_charlist, ol, oc, w), else: w)
+
+  defp qn(code, ol, oc, w), do: [{:lexer, :warning, code, {ol, oc, ol, oc + 1}, %{}} | w]
+
+  # The quotes are unnecessary when the (single-fragment, no-interpolation) content is itself a
+  # valid ASCII identifier with no leftover and no `@` — matching elixir_tokenizer's
+  # `is_unnecessary_quote/2`.
+  defp unnecessary?(false, _buf), do: false
+
+  defp unnecessary?(true, buf),
+    do: ascii_identifier?(:erlang.iolist_to_binary(:lists.reverse(buf)))
+
+  # The vendored tokenizer assumes valid UTF-8 (it is total only there), so guard invalid bytes —
+  # they are never an unnecessary quote anyway.
+  defp ascii_identifier?(content) do
+    if String.valid?(content) do
+      case Toxic2.String.Tokenizer.tokenize(content) do
+        {:identifier, _, "", _, true, special} -> :at not in special
+        _ -> false
+      end
+    else
+      false
+    end
+  end
 
   defp close_char(:dquote), do: ?"
   defp close_char(:charlist), do: ?'
@@ -979,8 +1093,8 @@ defmodule Toxic2.Lexer do
   end
 
   # An interpolation's matching `}` resumes whatever literal it opened inside (P3: one scanner).
-  defp resume_interp({:quoted, qk}, rest, line, col, acc, w, st),
-    do: read_quoted(rest, line, col, [], {line, col}, acc, w, st, qk)
+  defp resume_interp({:quoted, lit}, rest, line, col, acc, w, st),
+    do: read_quoted(rest, line, col, [], {line, col}, acc, w, st, lit)
 
   defp resume_interp({:sigil, sm}, rest, line, col, acc, w, st),
     do: read_sigil(rest, line, col, [], {line, col}, acc, w, st, sm)
@@ -1520,14 +1634,16 @@ defmodule Toxic2.Lexer do
   defp skip_spaces_tabs(<<c, rest::binary>>) when c in [?\s, ?\t], do: skip_spaces_tabs(rest)
   defp skip_spaces_tabs(bin), do: bin
 
-  # A bare single-quoted string (`'...'`, `'''...'''`) is a deprecated charlist — Elixir warns,
-  # suggesting `~c"..."` / `""`. Recorded as an id-less lexer notice on the out-of-band channel
-  # (numbered at the parse boundary). A single-quoted REMOTE-CALL name (`a.'foo'`) is preceded by a
-  # `.` and gets its own deprecation (backlog), so it is skipped here.
-  defp charlist_notice(w, [{:dot, _, _, _, _, _} | _], _line, _col, _len), do: w
-
+  # A single-quoted HEREDOC (`'''...'''`) is a deprecated charlist — Elixir warns, suggesting
+  # `~c"""..."""`. (Single-line `'...'` warnings are deferred to `close_quoted`, which knows the
+  # role; heredocs are always bare charlists, so the notice is emitted eagerly here.)
   defp charlist_notice(w, _acc, line, col, open_len),
     do: [{:lexer, :warning, :deprecated_charlist, {line, col, line, col + open_len}, %{}} | w]
+
+  # The role of a `"`/`'` literal, for deferred quote warnings: a literal immediately after a `.`
+  # is a remote-CALL name (`a."foo"()`), anything else is a bare string (possibly a keyword key).
+  defp quote_role([{:dot, _, _, _, _, _} | _], line, col), do: {:call, line, col}
+  defp quote_role(_acc, line, col), do: {:string, line, col}
 
   # `String.to_float/1` raises on an out-of-range magnitude (e.g. `1.0e309`); keep the lexer total.
   defp safe_to_float(bin) do
