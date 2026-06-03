@@ -362,6 +362,29 @@ defmodule Toxic2.Parser do
       np_call_args(kind, CST.children(node)) != []
   end
 
+  # `foo do end <- bar baz, x` — an expression ending in a `do…end` block, followed by an operator
+  # whose RHS is a multi-arg no-parens call, is ambiguous; Elixir warns to add parentheses. The RHS
+  # must be a `no_parens_expr` (so `foo do end <- bar baz` with a single arg does NOT warn), and the
+  # LHS must carry a do-block (so `fn -> x end <- …`, which is not a do-block call, is excluded).
+  defp maybe_no_parens_after_do(t, i, lhs, rhs, diags, nid) do
+    if has_do_block?(lhs) and no_parens_expr?(rhs) do
+      {_id, diags, nid} =
+        Diagnostics.emit(
+          diags,
+          nid,
+          :parser,
+          :warning,
+          :no_parens_after_do_op,
+          Tokens.span(t, i),
+          %{}
+        )
+
+      {diags, nid}
+    else
+      {diags, nid}
+    end
+  end
+
   # Build the no-parens call, marking it `:no_parens` (so a container can detect the ambiguous
   # `[f a, b]`). A plain identifier callee becomes `:np_call`; a bare remote (`a.b`) gains args.
   defp build_np_call(t, lhs, args, end_i) do
@@ -871,6 +894,7 @@ defmodule Toxic2.Parser do
           )
 
         {diags, nid} = maybe_ambiguous_pipe(t, i, rhs, diags, nid)
+        {diags, nid} = maybe_no_parens_after_do(t, i, lhs, rhs, diags, nid)
         led(t, k, node, min_bp, ctx, diags, nid, fuel)
 
       _ ->

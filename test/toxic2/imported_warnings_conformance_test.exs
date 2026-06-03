@@ -91,10 +91,17 @@ defmodule Toxic2.ImportedWarningsConformanceTest do
       assert :empty_stab_clause in toxic2_codes("fn x -> end")
     end
 
-    # DEFERRED — no test: `warn_no_parens_after_do_op` (`<do-block> <op> <multi-arg no-parens
-    # call>`, e.g. `quote do case do end || raise 1, 2 end`) is the one warning category from the
-    # ported suite that toxic2 intentionally does NOT emit — near-zero real-world frequency and an
-    # awkward shape to detect. Recorded here so the omission is explicit.
+    test "missing parens after operator" do
+      src = """
+      quote do
+        case do
+        end || raise 1, 2
+      end
+      """
+
+      assert_conforms(src)
+      assert :no_parens_after_do_op in toxic2_codes(src)
+    end
   end
 
   describe "lexer-level warnings (reused inputs, oracle-classified)" do
