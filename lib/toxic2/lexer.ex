@@ -541,7 +541,7 @@ defmodule Toxic2.Lexer do
         emit_unicode_name(:identifier, name, rest, len, line, col, acc, w, st)
 
       {:alias, name, rest, len, _ascii?, _special} ->
-        emit_unicode_name(:alias, name, rest, len, line, col, acc, w, st)
+        emit_unicode_alias(name, rest, len, line, col, acc, w, st)
 
       {:atom, name, rest, len, _ascii?, _special} ->
         # A unicode-uppercase word is valid only as an atom name — `Σ` alone is rejected, but as a
@@ -565,6 +565,25 @@ defmodule Toxic2.Lexer do
 
       {:error, _reason} ->
         unicode_error(bin, line, col, acc, w, st)
+    end
+  end
+
+  # A unicode word with an uppercase-ASCII start (`Café`, `Foó`) is `:alias`-kind, but aliases must
+  # be pure ASCII — Elixir rejects them. As a keyword KEY it's fine, though (`[Café: 1]` is a valid
+  # atom keyword), so only the non-keyword alias usage errors. Reaching here implies a >127
+  # codepoint, so the alias is always invalid.
+  defp emit_unicode_alias(name, rest, len, line, col, acc, w, st) do
+    case kw_suffix(rest) do
+      {:kw, r} ->
+        cont(r, {:kw_identifier, line, col, line, col + len + 1, name}, acc, w, st)
+
+      {:kw_nospace, r} ->
+        acc = kw_nospace_error(name, line, col, len, acc)
+        cont(r, {:kw_identifier, line, col, line, col + len + 1, name}, acc, w, st)
+
+      :no ->
+        err = LexError.new(:invalid_alias, %{name: name})
+        cont(rest, {:error, line, col, line, col + len, err}, acc, w, st)
     end
   end
 

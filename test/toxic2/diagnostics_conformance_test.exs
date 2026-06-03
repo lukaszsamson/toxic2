@@ -125,6 +125,18 @@ defmodule Toxic2.DiagnosticsConformanceTest do
       assert_classified("a;b;c")
     end
 
+    test "aliases must be pure ASCII (a non-ASCII module name is rejected)" do
+      assert_classified("Foó")
+      assert_classified("Café")
+      assert_classified("Módulo")
+      assert_classified("Café.Bar")
+      assert_classified("x = Café")
+      # but a non-ASCII KEYWORD key is a valid atom, and unicode atoms / vars are fine
+      assert_classified("[Café: 1]")
+      assert_classified(":Σ")
+      assert_classified("café")
+    end
+
     test "already-covered escape / sigil / bidi rejections still hold" do
       assert_classified("\"\\xG\"")
       assert_classified("\"\\u{110000}\"")
