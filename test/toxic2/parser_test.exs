@@ -122,7 +122,8 @@ defmodule Toxic2.ParserTest do
       assert {{:__block__, _, [{:a, _, nil}, {:b, _, nil}]}, []} = Toxic2.parse_to_ast("(a; b)")
       assert {{:a, _, nil}, []} = Toxic2.parse_to_ast("(a)")
       assert {{:a, _, nil}, []} = Toxic2.parse_to_ast("(a;)")
-      assert {{:__block__, _, []}, []} = Toxic2.parse_to_ast("(;)")
+      # an empty parenthesised expression carries the empty-paren warning
+      assert {{:__block__, _, []}, [_empty_paren]} = Toxic2.parse_to_ast("(;)")
       # inner statements are a no-parens context
       assert {{:f, _, [{:a, _, nil}, {:b, _, nil}]}, []} = Toxic2.parse_to_ast("(f a, b)")
     end
@@ -321,8 +322,9 @@ defmodule Toxic2.ParserTest do
     end
 
     test "a paren call allows a trailing comma only after a keyword arg" do
-      assert {{:foo, _, [[bar: 1]]}, []} = Toxic2.parse_to_ast("foo(bar: 1,)")
-      assert {{:foo, _, [1, [a: 2]]}, []} = Toxic2.parse_to_ast("foo(1, a: 2,)")
+      # parsed, but Elixir warns that trailing commas aren't allowed in call args
+      assert {{:foo, _, [[bar: 1]]}, [_trailing]} = Toxic2.parse_to_ast("foo(bar: 1,)")
+      assert {{:foo, _, [1, [a: 2]]}, [_trailing]} = Toxic2.parse_to_ast("foo(1, a: 2,)")
 
       # a trailing comma after a positional arg is still rejected
       {_v, _es, diags} = exprs("foo(1, 2,)")
@@ -448,7 +450,8 @@ defmodule Toxic2.ParserTest do
     test "an operator's rightmost operand may be a multi-arg no-parens call (no_parens_op_expr)" do
       assert {{:+, _, [1, {:foo, _, [2, 3]}]}, []} = Toxic2.parse_to_ast("1 + foo 2, 3")
 
-      assert {{:|>, _, [{:a, _, nil}, {:foo, _, [1, 2]}]}, []} =
+      # piping into a no-parens call is parsed, but carries the ambiguous-pipe warning
+      assert {{:|>, _, [{:a, _, nil}, {:foo, _, [1, 2]}]}, [_ambiguous_pipe]} =
                Toxic2.parse_to_ast("a |> foo 1, 2")
 
       # a do-block still attaches to that rightmost operand
@@ -496,7 +499,8 @@ defmodule Toxic2.ParserTest do
       assert {{:when, _, [{:x, _, nil}, [foo: 1, bar: 2]]}, []} =
                Toxic2.parse_to_ast("x when foo: 1, bar: 2")
 
-      assert {{:when, _, [{:x, _, nil}, [foo: {:bar, _, [1, 2]}]]}, []} =
+      # the keyword value is a multi-arg no-parens call → nested-no-parens-keyword warning
+      assert {{:when, _, [{:x, _, nil}, [foo: {:bar, _, [1, 2]}]]}, [_nested]} =
                Toxic2.parse_to_ast("x when foo: bar 1, 2")
     end
 
@@ -546,7 +550,8 @@ defmodule Toxic2.ParserTest do
       assert {{:fn, _, [{:->, _, [[{:when, _, [{:x, _, nil}, {:>, _, _}]}], {:x, _, nil}]}]}, []} =
                Toxic2.parse_to_ast("fn x when x > 0 -> x end")
 
-      assert {{:fn, _, [{:->, _, [[], nil]}]}, []} = Toxic2.parse_to_ast("fn -> end")
+      # an empty `->` body warns (an expression is required after ->) but still lowers to nil
+      assert {{:fn, _, [{:->, _, [[], nil]}]}, [_empty_stab]} = Toxic2.parse_to_ast("fn -> end")
     end
 
     test "multi-statement body lowers to a block" do

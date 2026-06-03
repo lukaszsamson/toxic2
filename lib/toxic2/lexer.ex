@@ -248,12 +248,14 @@ defmodule Toxic2.Lexer do
 
   defp lex(<<??, ?\\, e, rest::binary>>, line, col, acc, w, st) do
     value = Map.get(@char_escapes, e, e)
-    w = unknown_char_escape_notice(e, line, col, w)
+    w = char_escape_notice(e, line, col, 3, w)
     cont(rest, {:char, line, col, line, col + 3, value}, acc, w, st)
   end
 
-  defp lex(<<??, cp::utf8, rest::binary>>, line, col, acc, w, st),
-    do: cont(rest, {:char, line, col, line, col + 2, cp}, acc, w, st)
+  defp lex(<<??, cp::utf8, rest::binary>>, line, col, acc, w, st) do
+    w = unusual_char_notice(cp, line, col, 2, w)
+    cont(rest, {:char, line, col, line, col + 2, cp}, acc, w, st)
+  end
 
   # --- numbers: 0x / 0o / 0b ---------------------------------------------
   defp lex(<<?0, b, _::binary>> = bin, line, col, acc, w, st)
@@ -751,13 +753,28 @@ defmodule Toxic2.Lexer do
   # A keyword key colon must be followed by `is_space` (space/tab/CR/LF) — `foo:bar`/`foo:1`/`foo:`
   # at EOF are rejected by Elixir ("keyword argument must be followed by space"). `foo::` is the
   # type operator, never a keyword.
-  # `?\X` where X is an ASCII letter that is NOT a recognised escape (`?\q`, `?\x`, `?\Q`) is a
-  # no-op backslash — Elixir warns to use `?X` instead. Digits/punctuation (`?\7`, `?\(`) don't warn.
-  defp unknown_char_escape_notice(e, line, col, w)
-       when (e in ?a..?z or e in ?A..?Z) and not is_map_key(@char_escapes, e),
-       do: [{:lexer, :warning, :unknown_char_escape, {line, col, line, col + 3}, %{char: e}} | w]
+  # Char-literal codepoints Elixir suggests writing with a named escape (`? `→`?\s`, raw tab, …):
+  # null/alert/bs/tab/lf/vt/ff/cr/esc/space/del. Applies to `?<c>` and `?\<c>` alike.
+  @named_escape_chars [0, 7, 8, 9, 10, 11, 12, 13, 27, 32, 127]
 
-  defp unknown_char_escape_notice(_e, _line, _col, w), do: w
+  # `?\X` warnings: `X` a special char that has a named escape (`?\<space>`) → use `?\s`; or `X` an
+  # ASCII letter that ISN'T a recognised escape (`?\q`, `?\x`) → use `?X`. Digits/punctuation don't.
+  defp char_escape_notice(e, line, col, len, w) when e in @named_escape_chars,
+    do: [{:lexer, :warning, :unusual_char_literal, {line, col, line, col + len}, %{char: e}} | w]
+
+  defp char_escape_notice(e, line, col, len, w)
+       when (e in ?a..?z or e in ?A..?Z) and not is_map_key(@char_escapes, e),
+       do: [
+         {:lexer, :warning, :unknown_char_escape, {line, col, line, col + len}, %{char: e}} | w
+       ]
+
+  defp char_escape_notice(_e, _line, _col, _len, w), do: w
+
+  # A bare `?<c>` where `c` is a control/space char Elixir suggests writing with a named escape.
+  defp unusual_char_notice(cp, line, col, len, w) when cp in @named_escape_chars,
+    do: [{:lexer, :warning, :unusual_char_literal, {line, col, line, col + len}, %{char: cp}} | w]
+
+  defp unusual_char_notice(_cp, _line, _col, _len, w), do: w
 
   # Look back past any `:eol` tokens (newlines fold into a preceding `;` in Elixir) for a `;`.
   defp prev_semicolon?([{:eol, _, _, _, _, _} | rest]), do: prev_semicolon?(rest)
@@ -1135,10 +1152,18 @@ defmodule Toxic2.Lexer do
   # opener token (`:sigil_start`, value = name) is emitted in `lex`; `:sigil_end` carries the
   # trailing modifier letters (value = binary). `sm = {close_char, interp?}`.
 
-  # `\<close>` → literal delimiter (drop the backslash).
-  defp read_sigil(<<?\\, c, rest::binary>>, line, col, buf, fs, acc, w, st, {close, _} = sm)
-       when c == close,
-       do: read_sigil(rest, line, col + 2, [<<c::utf8>> | buf], fs, acc, w, st, sm)
+  # `\<close>` → literal delimiter (drop the backslash). In a NON-interpolating (uppercase) sigil
+  # this is the deprecated way to escape the closing delimiter — Elixir warns; in a lowercase sigil
+  # `\<close>` is a normal escape, no warning.
+  defp read_sigil(<<?\\, c, rest::binary>>, line, col, buf, fs, acc, w, st, {close, interp?} = sm)
+       when c == close do
+    w =
+      if interp?,
+        do: w,
+        else: [{:lexer, :warning, :deprecated_sigil_escape, {line, col, line, col + 2}, %{}} | w]
+
+    read_sigil(rest, line, col + 2, [<<c::utf8>> | buf], fs, acc, w, st, sm)
+  end
 
   # any other `\x` is kept verbatim (no parse-time unescape for sigils).
   defp read_sigil(<<?\\, c, rest::binary>>, line, col, buf, fs, acc, w, st, sm),

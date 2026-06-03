@@ -342,6 +342,26 @@ defmodule Toxic2.Parser do
   defp np_call_args(:remote_call, [_base, _name | args]), do: args
   defp np_call_args(_kind, _children), do: []
 
+  # `a |> b c` — piping into a no-parens CALL is ambiguous (does `c` belong to `b` or the pipe?);
+  # Elixir warns. `a |> b` (no call) and `a |> b(c)` (parens) are fine. Fires for any arrow op.
+  defp maybe_ambiguous_pipe(t, i, rhs, diags, nid) do
+    if tk(t, i) == :arrow_op and np_call?(rhs) do
+      {_id, diags, nid} =
+        Diagnostics.emit(diags, nid, :parser, :warning, :ambiguous_pipe, Tokens.span(t, i), %{})
+
+      {diags, nid}
+    else
+      {diags, nid}
+    end
+  end
+
+  defp np_call?(node) do
+    kind = CST.tag(node) == :node and CST.node_kind(node)
+
+    kind in [:np_call, :remote_call] and CST.category(node) == :no_parens and
+      np_call_args(kind, CST.children(node)) != []
+  end
+
   # Build the no-parens call, marking it `:no_parens` (so a container can detect the ambiguous
   # `[f a, b]`). A plain identifier callee becomes `:np_call`; a bare remote (`a.b`) gains args.
   defp build_np_call(t, lhs, args, end_i) do
@@ -850,6 +870,7 @@ defmodule Toxic2.Parser do
             nil
           )
 
+        {diags, nid} = maybe_ambiguous_pipe(t, i, rhs, diags, nid)
         led(t, k, node, min_bp, ctx, diags, nid, fuel)
 
       _ ->
@@ -1193,6 +1214,7 @@ defmodule Toxic2.Parser do
 
     if tk(t, arrow_i) == :stab_op do
       {body, k, diags, nid, fuel} = parse_clause_body(t, arrow_i + 1, [], stop, diags, nid, fuel)
+      {diags, nid} = maybe_empty_stab_warn(t, arrow_i, body, diags, nid)
 
       {CST.node(:stab, merge(cst_span(t, head), cst_span(t, body)), [head, body], :matched, nil),
        k, diags, nid, fuel}
@@ -1207,6 +1229,27 @@ defmodule Toxic2.Parser do
          :matched,
          nil
        ), arrow_i, diags, nid, fuel}
+    end
+  end
+
+  # `1 ->` with no expression after the `->` (`case x do 1 -> end`, `fn -> end`) — Elixir warns an
+  # expression is always required on the right side of `->`. The body is an empty `:stab_body`.
+  defp maybe_empty_stab_warn(t, arrow_i, body, diags, nid) do
+    if CST.tag(body) == :node and CST.node_kind(body) == :stab_body and CST.children(body) == [] do
+      {_id, diags, nid} =
+        Diagnostics.emit(
+          diags,
+          nid,
+          :parser,
+          :warning,
+          :empty_stab_clause,
+          tok_span(t, arrow_i),
+          %{}
+        )
+
+      {diags, nid}
+    else
+      {diags, nid}
     end
   end
 
@@ -1879,10 +1922,15 @@ defmodule Toxic2.Parser do
       tk(t, nxt) != close ->
         seq_elems(t, nxt, acc, seen_kw, close, mode, diags, nid, fuel)
 
-      # Lists/tuples/bitstrings allow a trailing comma freely; a paren call allows it only after a
-      # keyword arg (`foo(a: 1,)` is ok, `foo(1,)` is not) — keywords must come last, so `seen_kw`
-      # means the final argument was a keyword pair.
+      # Lists/tuples/bitstrings allow a trailing comma freely (no warning). A paren call allows it
+      # only after a keyword arg (`foo(a: 1,)`; `foo(1,)` is the error below) — and even then Elixir
+      # warns that trailing commas are not allowed inside call arguments.
       mode != :call or seen_kw ->
+        {diags, nid} =
+          if mode == :call,
+            do: trailing_comma_warn(t, comma_i, diags, nid),
+            else: {diags, nid}
+
         {:lists.reverse(acc), nxt + 1, diags, nid, fuel}
 
       true ->
@@ -1899,6 +1947,13 @@ defmodule Toxic2.Parser do
 
         {:lists.reverse([CST.missing(close, nxt, diag: id) | acc]), nxt + 1, diags, nid, fuel}
     end
+  end
+
+  defp trailing_comma_warn(t, comma_i, diags, nid) do
+    {_id, diags, nid} =
+      Diagnostics.emit(diags, nid, :parser, :warning, :trailing_comma, tok_span(t, comma_i), %{})
+
+    {diags, nid}
   end
 
   # An element is a `key: value` keyword pair (only in lists/calls) or an expression. Returns the
