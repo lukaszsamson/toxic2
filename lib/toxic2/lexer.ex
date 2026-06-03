@@ -345,10 +345,12 @@ defmodule Toxic2.Lexer do
 
       _ ->
         total = 1 + wlen
+        name = binary_part(bin, 1, wlen)
+        w = bang_before_eq_notice(name, after_name, line, col, total, w)
 
         cont(
           rest_at(bin, total),
-          {:atom, line, col, line, col + total, binary_part(bin, 1, wlen)},
+          {:atom, line, col, line, col + total, name},
           acc,
           w,
           st
@@ -464,6 +466,7 @@ defmodule Toxic2.Lexer do
             cont(rest, {:kw_identifier, line, col, line, col + len + 1, name}, acc, w, st)
 
           :no ->
+            w = bang_before_eq_notice(name, after_name, line, col, len, w)
             cont(after_name, lower_token(name, line, col, len), acc, w, st)
         end
     end
@@ -521,9 +524,24 @@ defmodule Toxic2.Lexer do
 
       true ->
         w = deprecated_op_notice(value, len, line, col, w)
+        w = too_many_same_char_notice(bin, line, col, w)
         cont(rest_at(bin, len), {kind, line, col, line, col + len, value}, acc, w, st)
     end
   end
+
+  # `foo!=1` / `bar?=1` — an identifier/atom ending in `!`/`?` immediately followed by `=` is
+  # ambiguous (`foo! = 1` vs `foo != 1`); Elixir warns. A space on either side removes it.
+  defp bang_before_eq_notice(name, <<?=, _::binary>>, line, col, len, w) do
+    case :binary.last(name) do
+      c when c in [??, ?!] ->
+        [{:lexer, :warning, :ambiguous_bang_before_equals, {line, col, line, col + len}, %{}} | w]
+
+      _ ->
+        w
+    end
+  end
+
+  defp bang_before_eq_notice(_name, _after, _line, _col, _len, w), do: w
 
   defp deprecated_op_notice(value, len, line, col, w) do
     case @deprecated_ops do
@@ -531,6 +549,14 @@ defmodule Toxic2.Lexer do
       _ -> w
     end
   end
+
+  # A 3-char repeated-char operator (`&&&`/`|||`/`^^^`/`+++`/`---`) directly followed by a 4th
+  # occurrence of the same char (`&&&&`, `++++`) — Elixir warns to put a space between them.
+  defp too_many_same_char_notice(<<c, c, c, c, _::binary>>, line, col, w)
+       when c in [?&, ?|, ?^, ?+, ?-],
+       do: [{:lexer, :warning, :too_many_same_char, {line, col, line, col + 3}, %{char: c}} | w]
+
+  defp too_many_same_char_notice(_bin, _line, _col, w), do: w
 
   defp atom_op_kw_len(<<"<<>>", rest::binary>>), do: if(kw_colon?(rest), do: 4)
   defp atom_op_kw_len(<<"..//", rest::binary>>), do: if(kw_colon?(rest), do: 4)
@@ -1387,9 +1413,24 @@ defmodule Toxic2.Lexer do
       heredoc_close(rest, line, buf, fs, acc, w, st, hc)
     else
       {dropped, rest2} = drop_indent(rest, strip)
+      w = outdented_notice(dropped, strip, rest2, line, w)
       read_heredoc(rest2, line, 1 + dropped, buf, fs, acc, w, st, hc)
     end
   end
+
+  # A content line indented LESS than the closing delimiter (`dropped < strip`, and it isn't a blank
+  # line) is an outdented heredoc line — Elixir warns; contents should be indented at least as much
+  # as the closing `"""`.
+  defp outdented_notice(dropped, strip, rest2, line, w) when dropped < strip do
+    case rest2 do
+      <<?\n, _::binary>> -> w
+      <<?\r, _::binary>> -> w
+      <<>> -> w
+      _ -> [{:lexer, :warning, :outdented_heredoc, {line, 1, line, 1 + dropped}, %{}} | w]
+    end
+  end
+
+  defp outdented_notice(_dropped, _strip, _rest2, _line, w), do: w
 
   # The closer is `\s*<delim>x3` at the start of a line; consume it and emit the end token.
   defp heredoc_close(rest, line, buf, fs, acc, w, st, {_d, _m, _i, _strip, ek}) do

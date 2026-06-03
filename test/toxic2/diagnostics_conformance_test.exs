@@ -222,6 +222,43 @@ defmodule Toxic2.DiagnosticsConformanceTest do
       assert warnings("[\"foo bar\": 1]") == []
       assert warnings("a.\"foo bar\"()") == []
     end
+
+    test "an identifier/atom ending in ! or ? immediately before = is ambiguous" do
+      codes = fn src -> Enum.map(warnings(src), &Diagnostic.code/1) end
+      assert codes.("a!=b") == [:ambiguous_bang_before_equals]
+      assert codes.("a?=1") == [:ambiguous_bang_before_equals]
+      assert codes.(":foo!=1") == [:ambiguous_bang_before_equals]
+      # a space on either side (or no following `=`) removes the ambiguity
+      assert warnings("foo! = 1") == []
+      assert warnings("foo? =1") == []
+      assert warnings("x = foo!") == []
+      assert warnings("a != b") == []
+    end
+
+    test "a 4th repeat of a &&& / ^^^ / +++ / --- operator char warns" do
+      # `&&&` / `+++` / `---` aren't deprecated ops, so only the too-many-same-char warning
+      for src <- ["a &&&& b", "a ++++ b", "a ---- b"] do
+        assert errors(src) == []
+        assert Enum.map(warnings(src), &Diagnostic.code/1) == [:too_many_same_char]
+      end
+
+      # `^^^` IS deprecated, so `^^^^` carries both warnings (matching Elixir)
+      assert errors("a ^^^^ b") == []
+
+      assert Enum.sort(Enum.map(warnings("a ^^^^ b"), &Diagnostic.code/1)) ==
+               [:deprecated_op_xor, :too_many_same_char]
+
+      # the 3-char operators themselves are fine
+      assert warnings("a &&& b") == []
+      assert warnings("a +++ b") == []
+    end
+
+    test "a heredoc line outdented past its closing delimiter warns" do
+      outdented = "x = \"\"\"\n  hi\n    \"\"\"\n"
+      aligned = "x = \"\"\"\n    hi\n    \"\"\"\n"
+      assert Enum.map(warnings(outdented), &Diagnostic.code/1) == [:outdented_heredoc]
+      assert warnings(aligned) == []
+    end
   end
 
   describe "oracle-valid input must stay clean (no false-positive errors)" do
