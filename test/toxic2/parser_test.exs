@@ -846,7 +846,8 @@ defmodule Toxic2.ParserTest do
   describe "quoted atoms (:\"...\")" do
     test "no interpolation lowers to the atom (escapes processed)" do
       assert {:a, []} = Toxic2.parse_to_ast(":\"a\"")
-      assert {:a, []} = Toxic2.parse_to_ast(":'a'")
+      # single-quoted atoms are deprecated: same atom, but with a warning diagnostic
+      assert {:a, [_deprecated_quoted_atom]} = Toxic2.parse_to_ast(":'a'")
       assert {:"a b", []} = Toxic2.parse_to_ast(":\"a b\"")
       assert {:"", []} = Toxic2.parse_to_ast(":\"\"")
     end

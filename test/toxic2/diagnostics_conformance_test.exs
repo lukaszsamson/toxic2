@@ -117,6 +117,40 @@ defmodule Toxic2.DiagnosticsConformanceTest do
     test "a warning never trips the strict-mode error filter" do
       assert errors("'hello'") == []
     end
+
+    test "deprecated operators ~~~ / ^^^ / <|> warn but stay valid" do
+      for {src, code, span} <- [
+            {"~~~x", :deprecated_op_bnot, {1, 1, 1, 4}},
+            {"x ^^^ y", :deprecated_op_xor, {1, 3, 1, 6}},
+            {"x <|> y", :deprecated_op_pipe, {1, 3, 1, 6}}
+          ] do
+        assert errors(src) == []
+        [w] = warnings(src)
+        assert {Diagnostic.code(w), Diagnostic.span(w)} == {code, span}
+      end
+
+      # a non-deprecated bitwise op (`&&&`) and the deprecated op used as a keyword key do not warn
+      assert warnings("x &&& y") == []
+      assert warnings("[^^^: 1]") == []
+    end
+
+    test "::: warns (must be written as :\"::\") but parses to the atom :\"::\"" do
+      assert errors(":::") == []
+      [w] = warnings(":::")
+      assert {Diagnostic.code(w), Diagnostic.span(w)} == {:ambiguous_quoted_atom, {1, 1, 1, 4}}
+      assert {:"::", _} = Toxic2.parse_to_ast(":::")
+      # the type operator and the explicitly-quoted atom stay clean
+      assert warnings("x :: y") == []
+      assert warnings(~S(:"::")) == []
+    end
+
+    test "single-quoted atoms :'foo' warn (deprecated) but stay valid" do
+      assert errors(":'foo'") == []
+      [w] = warnings(":'foo'")
+      assert {Diagnostic.code(w), Diagnostic.span(w)} == {:deprecated_quoted_atom, {1, 1, 1, 3}}
+      # double-quoted atoms do not warn
+      assert warnings(~S(:"foo")) == []
+    end
   end
 
   describe "oracle-valid input must stay clean (no false-positive errors)" do

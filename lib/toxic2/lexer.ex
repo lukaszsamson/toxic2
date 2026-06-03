@@ -127,6 +127,15 @@ defmodule Toxic2.Lexer do
     ?' => ?'
   }
 
+  # Operators Elixir still parses but deprecates (warned only when emitted as an OPERATOR, never as
+  # a keyword key — matching elixir_tokenizer's handle_op, where the kw_identifier clause returns
+  # before the deprecation case). Value → toxic2 warning code.
+  @deprecated_ops %{
+    :"~~~" => :deprecated_op_bnot,
+    :"^^^" => :deprecated_op_xor,
+    :"<|>" => :deprecated_op_pipe
+  }
+
   @reserved_ops %{
     "not" => {:unary_op, :not},
     "and" => {:and_op, :and},
@@ -289,7 +298,13 @@ defmodule Toxic2.Lexer do
 
   # --- type operator :: (before the atom `:` clause) ---------------------
   # `:::` is NOT `::` + `:`; it's the atom `:"::"` (a leading `:` taking `::` as its operator
-  # name), so the `::` operator must yield when a third `:` follows — the atom clause handles it.
+  # name). Elixir accepts it but warns it should be written `:"::"` to avoid ambiguity.
+  defp lex(<<?:, ?:, ?:, rest::binary>>, line, col, acc, w, st) do
+    w = [{:lexer, :warning, :ambiguous_quoted_atom, {line, col, line, col + 3}, %{}} | w]
+    cont(rest, {:atom, line, col, line, col + 3, "::"}, acc, w, st)
+  end
+
+  # `::` followed by a non-`:` byte is the type operator (the `:::` atom case is handled above).
   defp lex(<<?:, ?:, next, _::binary>> = bin, line, col, acc, w, st) when next != ?:,
     do: cont(rest_at(bin, 2), {:type_op, line, col, line, col + 2, :"::"}, acc, w, st)
 
@@ -306,6 +321,8 @@ defmodule Toxic2.Lexer do
   defp lex(<<?:, ?', rest::binary>>, line, col, acc, w, st) do
     marker = {:quoted_atom, line, col, line, col + 1, nil}
     start = {:charlist_start, line, col + 1, line, col + 2, nil}
+    # single quotes around atoms (`:'foo'`) are deprecated in favour of `:"foo"`.
+    w = [{:lexer, :warning, :deprecated_quoted_atom, {line, col, line, col + 2}, %{}} | w]
     read_quoted(rest, line, col + 2, [], {line, col + 2}, [start, marker | acc], w, st, :charlist)
   end
 
@@ -476,7 +493,15 @@ defmodule Toxic2.Lexer do
         emit_op_kw(bin, len, line, col, acc, w, st)
 
       true ->
+        w = deprecated_op_notice(value, len, line, col, w)
         cont(rest_at(bin, len), {kind, line, col, line, col + len, value}, acc, w, st)
+    end
+  end
+
+  defp deprecated_op_notice(value, len, line, col, w) do
+    case @deprecated_ops do
+      %{^value => code} -> [{:lexer, :warning, code, {line, col, line, col + len}, %{}} | w]
+      _ -> w
     end
   end
 
