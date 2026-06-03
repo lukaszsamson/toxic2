@@ -277,5 +277,28 @@ defmodule Toxic2.DiagnosticsConformanceTest do
         assert_classified(src)
       end
     end
+
+    # Regression: a no-parens call whose args are ALL keywords is a SINGLE (keyword-list) argument,
+    # so it is not "nested no-parens keyword" — `defmodule Foo, do: defstruct a: 1, b: 2` is common
+    # and must stay clean (was a false positive caught by the fuzzer corpus on real earmark code).
+    test "kw-only no-parens call as a keyword value does not warn" do
+      assert warnings("defmodule Blank, do: defstruct lnb: 0, line: \"\"") == []
+      assert warnings("foo do: defstruct a: 1, b: 2") == []
+      assert warnings("foo(x: bar a: 1)") == []
+      # a MULTI-positional no-parens kw value still warns
+      assert Enum.map(warnings("foo a: bar b, c"), &Diagnostic.code/1) == [
+               :nested_no_parens_keyword
+             ]
+    end
+
+    # Regression: `(;)` is a `;`-block, not the `empty_paren` rule — and `fn () -> …` parens are a
+    # clause-head argument list, not an expression — so neither warns; only a literal `()` does.
+    test "empty-paren warning is precise (() yes; (;) and fn () no)" do
+      assert Enum.map(warnings("()"), &Diagnostic.code/1) == [:empty_paren]
+      assert Enum.map(warnings("( )"), &Diagnostic.code/1) == [:empty_paren]
+      assert warnings("(;)") == []
+      assert warnings("fn () -> 1 end") == []
+      assert warnings("fn () when node() == x -> true end") == []
+    end
   end
 end

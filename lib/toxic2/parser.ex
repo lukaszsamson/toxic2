@@ -328,10 +328,17 @@ defmodule Toxic2.Parser do
     kind = CST.tag(arg) == :node and CST.node_kind(arg)
 
     if kind in [:np_call, :remote_call] and CST.category(arg) == :no_parens do
-      case np_call_args(kind, CST.children(arg)) do
-        [_, _ | _] -> true
-        [single] -> no_parens_expr?(single)
-        _ -> false
+      args = np_call_args(kind, CST.children(arg))
+
+      # a trailing run of keyword pairs is ONE argument (`f a: 1, b: 2` is `call_args_no_parens_kw`,
+      # a single kw-list arg), so it is NOT `no_parens_many`; only ≥2 positional groups are.
+      {kws, positional} = Enum.split_with(args, &kw_pair_node?/1)
+      groups = length(positional) + if kws == [], do: 0, else: 1
+
+      cond do
+        positional != [] and groups >= 2 -> true
+        match?([_], positional) and kws == [] -> no_parens_expr?(hd(positional))
+        true -> false
       end
     else
       false

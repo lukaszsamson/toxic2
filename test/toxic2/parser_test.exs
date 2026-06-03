@@ -122,8 +122,9 @@ defmodule Toxic2.ParserTest do
       assert {{:__block__, _, [{:a, _, nil}, {:b, _, nil}]}, []} = Toxic2.parse_to_ast("(a; b)")
       assert {{:a, _, nil}, []} = Toxic2.parse_to_ast("(a)")
       assert {{:a, _, nil}, []} = Toxic2.parse_to_ast("(a;)")
-      # an empty parenthesised expression carries the empty-paren warning
-      assert {{:__block__, _, []}, [_empty_paren]} = Toxic2.parse_to_ast("(;)")
+      # `(;)` is a `;`-block (NOT the `empty_paren` rule), so it does NOT warn — unlike `()`
+      assert {{:__block__, _, []}, []} = Toxic2.parse_to_ast("(;)")
+      assert {{:__block__, _, []}, [_empty_paren]} = Toxic2.parse_to_ast("()")
       # inner statements are a no-parens context
       assert {{:f, _, [{:a, _, nil}, {:b, _, nil}]}, []} = Toxic2.parse_to_ast("(f a, b)")
     end

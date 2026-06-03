@@ -58,7 +58,9 @@ defmodule Toxic2.Lower do
       range: Keyword.get(opts, :range, false),
       literal_encoder: Keyword.get(opts, :literal_encoder),
       token_metadata: tm,
-      source_lines: if(tm, do: source_lines(source), else: nil)
+      # always available: `src_slice` is needed for the empty-paren `;` check even without tm (the
+      # tm-only meta helpers that also use it are simply not called when tm is off).
+      source_lines: source_lines(source)
     }
   end
 
@@ -1189,21 +1191,29 @@ defmodule Toxic2.Lower do
       lower_each(children, view, opts, acc, nid)
     else
       {ast, acc, nid} = lower_block(children, view, opts, acc, nid)
-      {acc, nid} = maybe_empty_paren_warn(ast, cst, view, acc, nid)
+      {acc, nid} = maybe_empty_paren_warn(ast, cst, opts, acc, nid)
       {add_parens_meta(wrap_paren_negation(ast), children, cst, opts), acc, nid}
     end
   end
 
-  # `()` (and `(;)`) is an empty parenthesised expression — Elixir warns it's invalid; pass a value
-  # such as `nil` instead. The lowered shape is an empty `__block__`.
-  defp maybe_empty_paren_warn({:__block__, _meta, []}, cst, view, acc, nid) do
-    {_id, acc, nid} =
-      Diagnostics.emit(acc, nid, :parser, :warning, :empty_paren, child_span(cst, view), %{})
+  # `()` (also `( )`, `(\n)`) is an empty parenthesised expression — Elixir warns it's invalid; pass
+  # a value like `nil` instead. But `(;)` is a `;`-block (a different grammar production) and does
+  # NOT warn, so check the source between the delimiters for a `;`. Scoped to paren EXPRESSIONS:
+  # stab-clause-head `()` (`fn () -> …`) is lowered elsewhere, not through here.
+  defp maybe_empty_paren_warn({:__block__, _meta, []}, cst, opts, acc, nid) do
+    {sl, sc, el, ec} = CST.span(cst)
 
-    {acc, nid}
+    if String.contains?(src_slice(opts, {sl, sc + 1}, {el, ec}) || "", ";") do
+      {acc, nid}
+    else
+      {_id, acc, nid} =
+        Diagnostics.emit(acc, nid, :parser, :warning, :empty_paren, CST.span(cst), %{})
+
+      {acc, nid}
+    end
   end
 
-  defp maybe_empty_paren_warn(_ast, _cst, _view, acc, nid), do: {acc, nid}
+  defp maybe_empty_paren_warn(_ast, _cst, _opts, acc, nid), do: {acc, nid}
 
   # Empty parens. `()` is Elixir's `empty_paren` → `{:__block__, [parens: …], []}`; `(;)` is the
   # `open_paren ';' close_paren` rule → `{:__block__, [closing: …, line, column], []}`. Both lower to
@@ -1722,16 +1732,22 @@ defmodule Toxic2.Lower do
     end
   end
 
-  # Mirrors the parser's `no_parens_expr?`: a no-parens call with MANY args (`bar b, c`) or whose
-  # single arg is itself such a call. A plain single-arg no-parens call (`bar b`) is fine.
+  # Mirrors the parser's `no_parens_expr?`: a no-parens call with ≥2 POSITIONAL arg groups (`bar b,
+  # c`), or whose single positional arg is itself such a call. A trailing run of keyword pairs is
+  # ONE argument, so a kw-only call (`defstruct a: 1, b: 2`, the value of `do: …`) is NOT multi-arg
+  # — and a plain single-arg call (`bar b`) is fine.
   defp no_parens_call_cst?(node) do
     kind = CST.tag(node) == :node and CST.node_kind(node)
 
     if kind in [:np_call, :remote_call] and CST.category(node) == :no_parens do
-      case np_call_args_cst(kind, CST.children(node)) do
-        [_, _ | _] -> true
-        [single] -> no_parens_call_cst?(single)
-        _ -> false
+      args = np_call_args_cst(kind, CST.children(node))
+      {kws, positional} = Enum.split_with(args, &kw_pair_cst?/1)
+      groups = length(positional) + if kws == [], do: 0, else: 1
+
+      cond do
+        positional != [] and groups >= 2 -> true
+        match?([_], positional) and kws == [] -> no_parens_call_cst?(hd(positional))
+        true -> false
       end
     else
       false
@@ -1741,6 +1757,8 @@ defmodule Toxic2.Lower do
   defp np_call_args_cst(:np_call, [_callee | args]), do: args
   defp np_call_args_cst(:remote_call, [_base, _name | args]), do: args
   defp np_call_args_cst(_kind, _children), do: []
+
+  defp kw_pair_cst?(node), do: CST.tag(node) == :node and CST.node_kind(node) == :kw_pair
 
   defp kw_key(:token, key_leaf, v, view, opts, acc, nid) do
     idx = CST.token_index(key_leaf)
