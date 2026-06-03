@@ -175,8 +175,33 @@ defmodule Toxic2.Lexer do
   @spec tokenize(binary(), keyword()) :: {[token()], [warning()]}
   def tokenize(source, _opts \\ []) when is_binary(source) do
     {rev_tokens, rev_warnings} = lex(source, 1, 1, [], [], [])
-    {:lists.reverse(rev_tokens), :lists.reverse(rev_warnings)}
+    tokens = :lists.reverse(rev_tokens)
+    warnings = :lists.reverse(rev_warnings)
+
+    # UTS-39 confusable-identifier lint: a whole-file pass, run only when a non-ASCII identifier is
+    # present (matching Elixir's `ascii_identifiers_only` gate — keeps the ASCII-only hot path free).
+    warnings =
+      if any_unicode_name?(tokens),
+        do: Enum.concat(warnings, confusable_lint(tokens)),
+        else: warnings
+
+    {tokens, warnings}
   end
+
+  @identifier_name_kinds [:identifier, :kw_identifier, :alias, :atom]
+
+  defp any_unicode_name?(tokens) do
+    Enum.any?(tokens, fn
+      {kind, _, _, _, _, v} when kind in @identifier_name_kinds and is_binary(v) -> not ascii?(v)
+      _ -> false
+    end)
+  end
+
+  defp ascii?(<<c, rest::binary>>) when c < 128, do: ascii?(rest)
+  defp ascii?(<<>>), do: true
+  defp ascii?(_), do: false
+
+  defp confusable_lint(tokens), do: Toxic2.String.Tokenizer.Security.lint(tokens)
 
   # `st` is a terminator stack used ONLY to tell an interpolation-closing `}` (which ends a
   # string interpolation and resumes string scanning) apart from a `}` that closes a `{`. `{`
@@ -934,6 +959,10 @@ defmodule Toxic2.Lexer do
 
         read_quoted(rest, line, col + 1, [<<c::utf8>>], {line, col + 1}, acc, w, st, lit)
 
+      break?(c) ->
+        w = break_notice(c, line, col, w)
+        read_quoted(rest, line, col + 1, [<<c::utf8>> | buf], fs, acc, w, st, lit)
+
       true ->
         read_quoted(rest, line, col + 1, [<<c::utf8>> | buf], fs, acc, w, st, lit)
     end
@@ -1209,6 +1238,7 @@ defmodule Toxic2.Lexer do
       acc = [{:sigil_end, line, col, line, col + 1 + mlen, mods} | acc]
       lex(after_mods, line, col + 1 + mlen, acc, w, st)
     else
+      w = if break?(c), do: break_notice(c, line, col, w), else: w
       read_sigil(rest, line, col + 1, [<<c::utf8>> | buf], fs, acc, w, st, sm)
     end
   end
@@ -1230,21 +1260,36 @@ defmodule Toxic2.Lexer do
   defp bidi?(c),
     do: c in [0x202A, 0x202B, 0x202C, 0x202D, 0x202E, 0x2066, 0x2067, 0x2068, 0x2069]
 
-  # Scan a (to-be-dropped) comment's content for a bidi control; emit a lexer error at the first one.
+  # Unsupported line-break characters (Elixir's `?break` macro): VT, FF, NEL, LS, PS. Rejected in
+  # comments (they'd break the one-line comment invisibly) and warned in strings/sigils.
+  defp break?(c), do: c in [0x000B, 0x000C, 0x0085, 0x2028, 0x2029]
+
+  # Inside a string/sigil/heredoc a `?break` char is kept verbatim but Elixir warns to use its
+  # escaped `\uXXXX` form instead (the char would otherwise be an invisible line break).
+  defp break_notice(c, line, col, w),
+    do: [{:lexer, :warning, :unsupported_break, {line, col, line, col + 1}, %{codepoint: c}} | w]
+
+  # Scan a (to-be-dropped) comment for a bidi/break control; emit a lexer error at the first one.
   defp comment_bidi_check(bin, line, col, acc) do
-    case find_bidi(bin, col) do
+    case find_comment_lint(bin, col) do
       nil -> acc
-      bcol -> [{:error, line, bcol, line, bcol + 1, LexError.new(:invalid_bidi, %{})} | acc]
+      {bcol, code} -> [{:error, line, bcol, line, bcol + 1, LexError.new(code, %{})} | acc]
     end
   end
 
-  defp find_bidi(<<?\n, _::binary>>, _col), do: nil
-  defp find_bidi(<<>>, _col), do: nil
+  defp find_comment_lint(<<?\n, _::binary>>, _col), do: nil
+  defp find_comment_lint(<<>>, _col), do: nil
 
-  defp find_bidi(<<c::utf8, rest::binary>>, col),
-    do: if(bidi?(c), do: col, else: find_bidi(rest, col + 1))
+  defp find_comment_lint(<<c::utf8, rest::binary>>, col) do
+    cond do
+      bidi?(c) -> {col, :invalid_bidi}
+      break?(c) -> {col, :invalid_break}
+      true -> find_comment_lint(rest, col + 1)
+    end
+  end
 
-  defp find_bidi(<<_byte, rest::binary>>, col), do: find_bidi(rest, col + 1)
+  # A stray non-UTF-8 byte in a comment: keep scanning (tolerant — never raise).
+  defp find_comment_lint(<<_, rest::binary>>, col), do: find_comment_lint(rest, col + 1)
 
   # A sigil name is either a single lowercase letter or an uppercase letter followed by uppercase
   # letters / digits (`~r`, `~S`, `~A1`); anything else (`~foo`, `~ab`, `~Ab`, `~A1b`) is invalid.
@@ -1440,8 +1485,10 @@ defmodule Toxic2.Lexer do
     )
   end
 
-  defp read_heredoc(<<c::utf8, rest::binary>>, line, col, buf, fs, acc, w, st, hc),
-    do: read_heredoc(rest, line, col + 1, [<<c::utf8>> | buf], fs, acc, w, st, hc)
+  defp read_heredoc(<<c::utf8, rest::binary>>, line, col, buf, fs, acc, w, st, hc) do
+    w = if break?(c), do: break_notice(c, line, col, w), else: w
+    read_heredoc(rest, line, col + 1, [<<c::utf8>> | buf], fs, acc, w, st, hc)
+  end
 
   defp read_heredoc(<<byte, rest::binary>>, line, col, buf, fs, acc, w, st, hc),
     do: read_heredoc(rest, line, col + 1, [<<byte>> | buf], fs, acc, w, st, hc)

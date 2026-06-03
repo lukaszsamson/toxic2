@@ -866,8 +866,8 @@ defmodule Toxic2.Lower do
   defp lower_kind(:string, ch, _cst, view, opts, acc, nid),
     do: lower_string(ch, view, opts, acc, nid)
 
-  defp lower_kind(:charlist, ch, _cst, view, opts, acc, nid),
-    do: lower_charlist(ch, view, opts, acc, nid)
+  defp lower_kind(:charlist, ch, cst, view, opts, acc, nid),
+    do: lower_charlist(ch, cst, view, opts, acc, nid)
 
   defp lower_kind(:sigil, ch, cst, view, opts, acc, nid),
     do: lower_sigil(ch, cst, view, opts, acc, nid)
@@ -894,9 +894,9 @@ defmodule Toxic2.Lower do
 
   # A charlist lowers to a literal codepoint list with no interpolation, else to
   # `List.to_charlist([...])` where interpolations are bare `Kernel.to_string/1` (no ::-binary).
-  defp lower_charlist(children, view, opts, acc, nid) do
+  defp lower_charlist(children, cst, view, opts, acc, nid) do
     {parts, acc, nid} = quoted_parts_ast(children, view, opts, acc, nid)
-    build_charlist(parts, opts, acc, nid)
+    build_charlist(parts, cst, view, opts, acc, nid)
   end
 
   # Collect a quoted literal's parts as `{:frag, binary}` / `{:interp, ast}`, in source order.
@@ -943,14 +943,37 @@ defmodule Toxic2.Lower do
     end
   end
 
-  defp build_charlist(parts, opts, acc, nid) do
+  defp build_charlist(parts, cst, view, opts, acc, nid) do
     if Enum.any?(parts, &match?({:interp, _, _}, &1)) do
       {{{:., [], [List, :to_charlist]}, [], [Enum.map(parts, &charlist_segment(&1, opts))]}, acc,
        nid}
     else
       bin = parts |> Enum.map(fn {:frag, b} -> b end) |> IO.iodata_to_binary()
+      # A charlist's content is decoded as UTF-8 codepoints, so a non-UTF-8 byte (e.g. `'\xFF'`,
+      # which yields the raw byte rather than codepoint U+00FF) is an error — unlike a string, where
+      # `<<255>>` is a valid binary. The tolerant `[255]` charlist is still produced.
+      {acc, nid} =
+        if String.valid?(bin),
+          do: {acc, nid},
+          else: invalid_charlist_encoding(cst, view, acc, nid)
+
       {safe_to_charlist(bin), acc, nid}
     end
+  end
+
+  defp invalid_charlist_encoding(cst, view, acc, nid) do
+    {_id, acc, nid} =
+      Diagnostics.emit(
+        acc,
+        nid,
+        :lowerer,
+        :error,
+        :invalid_charlist_encoding,
+        child_span(cst, view),
+        %{}
+      )
+
+    {acc, nid}
   end
 
   defp build_quoted_atom(parts, inner, anchor, kw?, view, opts, acc, nid) do

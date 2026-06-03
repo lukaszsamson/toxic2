@@ -144,6 +144,24 @@ defmodule Toxic2.DiagnosticsConformanceTest do
       assert_classified("\"\\u{110000}\"")
       assert_classified("~Ab(foo)")
     end
+
+    test "unsupported line-break chars in a comment are rejected" do
+      # VT/FF/NEL/LS/PS inside a `#` comment (an invisible line break) — Elixir errors
+      for cp <- [0x000B, 0x000C, 0x0085, 0x2028, 0x2029] do
+        assert_classified("# x" <> <<cp::utf8>> <> "\n1")
+      end
+
+      assert_classified("# a normal comment\n1")
+    end
+
+    test "a single-quoted charlist with a non-UTF-8 byte is rejected" do
+      # `'\xFF'` yields the raw byte (not codepoint U+00FF), which is invalid UTF-8 for a charlist
+      assert_classified("'\\xFF'")
+      assert_classified("'''\n\\xFF\n'''")
+      # the codepoint escape and a double-quoted string are fine (`<<255>>` is a valid binary)
+      assert_classified("'\\x{FF}'")
+      assert_classified("\"\\xFF\"")
+    end
   end
 
   defp warnings(src), do: Enum.filter(toxic2_diags(src), &(Diagnostic.severity(&1) == :warning))
@@ -260,6 +278,33 @@ defmodule Toxic2.DiagnosticsConformanceTest do
       aligned = "x = \"\"\"\n    hi\n    \"\"\"\n"
       assert Enum.map(warnings(outdented), &Diagnostic.code/1) == [:outdented_heredoc]
       assert warnings(aligned) == []
+    end
+
+    test "an unsupported line-break char in a string/sigil/heredoc warns (not errors)" do
+      ls = <<0x2028::utf8>>
+
+      for src <- ["\"x" <> ls <> "\"", "~s/x" <> ls <> "/", "~S/x" <> ls <> "/"] do
+        assert errors(src) == []
+        assert :unsupported_break in Enum.map(warnings(src), &Diagnostic.code/1)
+      end
+    end
+
+    test "confusable identifiers warn (UTS-39)" do
+      cyr_a = <<0x0430::utf8>>
+      # Cyrillic `а` and Latin `a` share a skeleton — flagged when both appear
+      assert Enum.map(warnings(cyr_a <> " = 1\na = 2"), &Diagnostic.code/1) == [
+               :confusable_identifier
+             ]
+
+      assert Enum.map(warnings("%{" <> cyr_a <> ": a}"), &Diagnostic.code/1) == [
+               :confusable_identifier
+             ]
+
+      # a lone non-ASCII identifier, or distinct unicode names, do not warn
+      assert warnings(cyr_a <> " = 1") == []
+      assert warnings("café = 1\ncafe = 2") == []
+      # ASCII-only code never runs the lint
+      assert warnings("a = 1\nb = 2") == []
     end
   end
 
