@@ -25,17 +25,44 @@ defmodule Toxic2.Tokens do
 
   alias Toxic2.Token
 
-  @opaque t :: {tokens :: tuple(), size :: non_neg_integer()}
+  @opaque t :: {tokens :: tuple(), size :: non_neg_integer(), cont :: MapSet.t(non_neg_integer())}
 
   @doc """
   Build the parser's read-only token view from the lexer's source-ordered list. `List.to_tuple/1`
-  gives O(1) indexed access.
+  gives O(1) indexed access. `:cont` markers (space-preceded `\\`-newline continuations) are
+  partitioned OUT of the stream into a set of the indices they precede — so they never appear as
+  tokens, but `cont_before?/2` lets the no-parens-arg check see the continuation's leading space.
   """
   @spec from_list([Token.t()]) :: t()
   def from_list(tokens) when is_list(tokens) do
-    toks = List.to_tuple(tokens)
-    {toks, tuple_size(toks)}
+    # Fast path (no `:cont` markers — almost always): a single `List.to_tuple/1` BIF, empty set.
+    # The marker partition (an O(n) Elixir reduce) only runs when a marker is actually present.
+    if has_cont?(tokens) do
+      partition_cont(tokens)
+    else
+      toks = List.to_tuple(tokens)
+      {toks, tuple_size(toks), MapSet.new()}
+    end
   end
+
+  defp has_cont?([{:cont, _, _, _, _, _} | _]), do: true
+  defp has_cont?([_ | rest]), do: has_cont?(rest)
+  defp has_cont?([]), do: false
+
+  defp partition_cont(tokens) do
+    {rev, conts, _n} =
+      Enum.reduce(tokens, {[], [], 0}, fn
+        {:cont, _, _, _, _, _}, {acc, conts, n} -> {acc, [n | conts], n}
+        tok, {acc, conts, n} -> {[tok | acc], conts, n + 1}
+      end)
+
+    toks = rev |> :lists.reverse() |> List.to_tuple()
+    {toks, tuple_size(toks), MapSet.new(conts)}
+  end
+
+  @doc "`true` iff token `i` is immediately preceded by a space-preceded `\\`-newline continuation."
+  @spec cont_before?(t(), integer()) :: boolean()
+  def cont_before?({_toks, _size, cont}, i), do: MapSet.member?(cont, i)
 
   @doc """
   Convenience: tokenize `source` and build the view. Returns `{view, notices}` where each notice is
@@ -52,11 +79,11 @@ defmodule Toxic2.Tokens do
 
   @doc "Number of tokens in the view."
   @spec size(t()) :: non_neg_integer()
-  def size({_toks, size}), do: size
+  def size({_toks, size, _cont}), do: size
 
   @doc "`true` when `i` is at or past the end of the stream."
   @spec at_eof?(t(), integer()) :: boolean()
-  def at_eof?({_toks, size}, i), do: i >= size
+  def at_eof?({_toks, size, _cont}, i), do: i >= size
 
   @doc "Advance the cursor. (Trivial; provided for symmetry — the cursor is just an integer.)"
   @spec advance(integer()) :: integer()
@@ -64,17 +91,17 @@ defmodule Toxic2.Tokens do
 
   @doc "The token tuple at `i`, or `:eof` when out of range."
   @spec token(t(), integer()) :: Token.t() | :eof
-  def token({toks, size}, i) when i >= 0 and i < size, do: elem(toks, i)
+  def token({toks, size, _cont}, i) when i >= 0 and i < size, do: elem(toks, i)
   def token(_t, _i), do: :eof
 
   @doc "Kind at `i`, or `:eof` when out of range."
   @spec kind(t(), integer()) :: atom()
-  def kind({toks, size}, i) when i >= 0 and i < size, do: elem(elem(toks, i), 0)
+  def kind({toks, size, _cont}, i) when i >= 0 and i < size, do: elem(elem(toks, i), 0)
   def kind(_t, _i), do: :eof
 
   @doc "Value at `i`, or `nil` when out of range."
   @spec value(t(), integer()) :: term()
-  def value({toks, size}, i) when i >= 0 and i < size, do: elem(elem(toks, i), 5)
+  def value({toks, size, _cont}, i) when i >= 0 and i < size, do: elem(elem(toks, i), 5)
   def value(_t, _i), do: nil
 
   @doc "Span `{sl, sc, el, ec}` at `i`, or `nil` when out of range."
@@ -95,7 +122,7 @@ defmodule Toxic2.Tokens do
   O(1) prefix index was removed as dead weight — no hot caller; see the moduledoc note).
   """
   @spec eol_between?(t(), integer(), integer()) :: boolean()
-  def eol_between?({toks, size}, i, j)
+  def eol_between?({toks, size, _cont}, i, j)
       when is_integer(i) and is_integer(j) and i >= 0 and i <= j and j <= size do
     scan_eol(toks, i, j)
   end

@@ -57,19 +57,19 @@ defmodule Toxic2.Parser do
 
   # Parser-LOCAL token-view reads. `Tokens.kind/value/token/at_eof?` are cross-module, so a callee-
   # module `@compile :inline` can't reach them — and `Tokens.kind/2` alone was ~12 % of ALL calls.
-  # These read the view tuple `{toks, size}` directly and inline into the hot dispatch.
+  # These read the view tuple `{toks, size, _cont}` directly and inline into the hot dispatch.
   @compile {:inline, tk: 2, tv: 2, tt: 2, t_eof?: 2}
 
-  defp tk({toks, size}, i) when i >= 0 and i < size, do: elem(elem(toks, i), 0)
+  defp tk({toks, size, _cont}, i) when i >= 0 and i < size, do: elem(elem(toks, i), 0)
   defp tk(_t, _i), do: :eof
 
-  defp tv({toks, size}, i) when i >= 0 and i < size, do: elem(elem(toks, i), 5)
+  defp tv({toks, size, _cont}, i) when i >= 0 and i < size, do: elem(elem(toks, i), 5)
   defp tv(_t, _i), do: nil
 
-  defp tt({toks, size}, i) when i >= 0 and i < size, do: elem(toks, i)
+  defp tt({toks, size, _cont}, i) when i >= 0 and i < size, do: elem(toks, i)
   defp tt(_t, _i), do: :eof
 
-  defp t_eof?({_toks, size}, i), do: i >= size
+  defp t_eof?({_toks, size, _cont}, i), do: i >= size
 
   @fuel_base 1_000
 
@@ -453,16 +453,16 @@ defmodule Toxic2.Parser do
 
       # The arg sits on a LATER line than the callee yet the cursor reached it with no `:eol` token
       # between — only a `\`-newline line continuation does that, which joins them into one logical
-      # line: `@x \⏎ File.foo()` => `x(File.foo())`. A leading `+`/`-` is binary here
-      # (`foo\⏎+1` => `foo + 1`), so `:dual_op` is NOT an argument start.
+      # line: `@x \⏎ File.foo()` => `x(File.foo())`.
       #
-      # NB Elixir 1.20 makes a SPACE-preceded continuation (`foo \⏎+1`, a space before the `\`)
-      # behave like a same-line space (=> `foo(+1)`), distinct from the no-space form here. toxic2's
-      # token spans can't tell the two apart after the join (the callee span is identical), so the
-      # rare space-before-continuation-then-unary case stays binary — see FUZZER_GAPS.md.
+      # A leading `+`/`-` is the case Elixir 1.20 split: a SPACE-preceded `\`-newline is whitespace,
+      # so `foo \⏎+1` => `foo(+1)` (like `foo +1`); the no-space `foo\⏎+1` stays `foo + 1`. The
+      # lexer records the space-preceded continuation, so `cont_before?/2` distinguishes them: a
+      # `:dual_op` is an argument start only across a space-preceded continuation (and only when its
+      # operand is adjacent, just like the same-line case).
       {{_, _, el, _ec}, {sl, _sc, _, _}} when el < sl ->
         case tk(t, i) do
-          :dual_op -> false
+          :dual_op -> Tokens.cont_before?(t, i) and np_arg_kind?(t, i, :dual_op)
           :unary_op -> not not_in?(t, i)
           k -> np_first_kind?(k)
         end

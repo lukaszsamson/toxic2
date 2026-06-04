@@ -231,11 +231,16 @@ defmodule Toxic2.Lexer do
   end
 
   # --- line continuation: a `\` right before a newline joins the lines (no :eol emitted) ----
-  defp lex(<<?\\, ?\r, ?\n, rest::binary>>, line, _col, acc, w, st),
-    do: lex(rest, line + 1, 1, acc, w, st)
+  # Since Elixir 1.20 a SPACE-preceded `\`-newline is horizontal whitespace, so `foo \⏎+1` =>
+  # `foo(+1)` (like `foo +1`), distinct from the no-space `foo\⏎+1` => `foo + 1`. After the join
+  # the two forms have identical token spans, so we emit a zero-width `:cont` marker for the
+  # space-preceded form; `Tokens.from_list/1` partitions it out of the stream into a side-set the
+  # parser's no-parens-arg check consults (it never reaches the parser as a token).
+  defp lex(<<?\\, ?\r, ?\n, rest::binary>>, line, col, acc, w, st),
+    do: lex(rest, line + 1, 1, cont_marker(acc, line, col), w, st)
 
-  defp lex(<<?\\, ?\n, rest::binary>>, line, _col, acc, w, st),
-    do: lex(rest, line + 1, 1, acc, w, st)
+  defp lex(<<?\\, ?\n, rest::binary>>, line, col, acc, w, st),
+    do: lex(rest, line + 1, 1, cont_marker(acc, line, col), w, st)
 
   # --- heredocs: `"""` / `'''` (before the single-quote clauses) ---------
   defp lex(<<?", ?", ?", rest::binary>>, line, col, acc, w, st),
@@ -1801,6 +1806,16 @@ defmodule Toxic2.Lexer do
   # is a remote-CALL name (`a."foo"()`), anything else is a bare string (possibly a keyword key).
   defp quote_role([{:dot, _, _, _, _, _} | _], line, col), do: {:call, line, col}
   defp quote_role(_acc, line, col), do: {:string, line, col}
+
+  # A `\`-newline is space-preceded when the `\` (at `col`) sits past the previous token's end on
+  # the same line — i.e. horizontal space was consumed between them. Emits a zero-width `:cont`
+  # marker (partitioned out of the stream by `Tokens.from_list/1`) so the parser's no-parens-arg
+  # check can tell `foo \⏎+1` (=> `foo(+1)`) from the no-space `foo\⏎+1` (=> `foo + 1`).
+  defp cont_marker([{_k, _sl, _sc, el, ec, _v} | _] = acc, line, col)
+       when el == line and col > ec,
+       do: [{:cont, line, col, line, col, nil} | acc]
+
+  defp cont_marker(acc, _line, _col), do: acc
 
   # `String.to_float/1` raises on an out-of-range magnitude (e.g. `1.0e309`); keep the lexer total.
   defp safe_to_float(bin) do

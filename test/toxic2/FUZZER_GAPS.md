@@ -115,17 +115,6 @@ Edge variants of warnings toxic2 already emits in the common case:
 (The `?\<newline>` char-literal warning that previously sat here is now emitted —
 `:unusual_char_literal`, same as any named-escape special char.)
 
-## Known semantic divergence (Elixir 1.20 line continuation)
-
-A `\`-newline is horizontal whitespace in 1.20, but ONLY when preceded by horizontal space:
-`foo \⏎+1` => `foo(+1)` (space before `\`) vs `foo\⏎+1` => `foo + 1` (no space). After the
-continuation joins the lines, toxic2's token spans are identical for the two forms (the callee
-span doesn't record the trailing space), so the no-parens-arg check can't tell them apart. toxic2
-treats both as the no-space form (binary `+`), matching the common/no-space case; the rarer
-space-before-continuation-then-adjacent-unary-op form (`foo \⏎+1`) diverges. The corpus entry for it
-was retired (and dropped from `freeze.json`). Identifier/alias continuations (`foo \⏎bar`,
-`@x \⏎File.foo()`) are unaffected — they're no-parens args regardless of the space.
-
 ## Verdict
 
 The clean upstream lexer/interpolation/security diagnostics that this corpus catalogue had missed

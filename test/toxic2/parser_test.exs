@@ -407,8 +407,12 @@ defmodule Toxic2.ParserTest do
       assert {{:@, _, [{:x, _, [{{:., _, [{:__aliases__, _, [:File]}, :foo]}, _, []}]}]}, []} =
                Toxic2.parse_to_ast("@x \\\nFile.foo()")
 
-      # `+`/`-` directly across a (no-space) continuation are binary, not a unary arg
+      # Elixir 1.20: a SPACE-preceded `\`-newline is whitespace, so a space-adjacent `+`/`-` across
+      # it is a unary no-parens arg (`foo \⏎+1` => `foo(+1)`, like `foo +1`)…
+      assert {{:foo, _, [{:+, _, [1]}]}, []} = Toxic2.parse_to_ast("foo \\\n+1")
+      # …but with NO space before the `\` it stays binary, and `+ 1` (space after the op) too
       assert {{:+, _, [{:foo, _, nil}, 1]}, []} = Toxic2.parse_to_ast("foo\\\n+1")
+      assert {{:+, _, [{:foo, _, nil}, 1]}, []} = Toxic2.parse_to_ast("foo \\\n+ 1")
     end
 
     test "a multi-arg no-parens call ending in `do…end` is a valid container element" do

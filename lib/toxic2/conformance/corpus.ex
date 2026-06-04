@@ -227,13 +227,12 @@ defmodule Toxic2.Conformance.Corpus do
     # a `do` on the next line after a multi-line head (only for a call that already has args)
     {"def f(x) when g\ndo\n:ok\nend", [:do_block]},
     {"with {:ok, a} <- f()\ndo a end", [:do_block]},
-    # `\`-newline joins a no-parens callee with its arg (one logical line)
+    # `\`-newline joins a no-parens callee with its arg (one logical line). Since Elixir 1.20 a
+    # SPACE-preceded `\`-newline is horizontal whitespace, so `foo \⏎+1` => `foo(+1)` (like
+    # `foo +1`), distinct from the no-space `foo\⏎+1` => `foo + 1` (below, in `:layout`).
     {"@x \\\nFile.foo()", [:no_parens]},
     {"foo \\\nbar", [:no_parens]},
-    # NB `{"foo \\\n+1", …}` was dropped: since Elixir 1.20 a SPACE-preceded `\`-newline is
-    # horizontal whitespace, so `foo \⏎+1` => `foo(+1)` (vs the no-space `foo\⏎+1` => `foo + 1`,
-    # still covered below). toxic2's token spans can't tell space- from no-space-continuation after
-    # the join (the callee span is identical) — a known divergence; see FUZZER_GAPS.md.
+    {"foo \\\n+1", [:no_parens]},
     # a multi-arg no-parens call ending in `do…end` is a valid container element (do disambiguates)
     {"[for x <- a, y <- b do x end]", [:do_block]},
     {"[z, for x <- xs, into: [] do x end]", [:do_block]},
