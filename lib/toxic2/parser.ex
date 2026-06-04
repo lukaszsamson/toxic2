@@ -453,8 +453,13 @@ defmodule Toxic2.Parser do
 
       # The arg sits on a LATER line than the callee yet the cursor reached it with no `:eol` token
       # between — only a `\`-newline line continuation does that, which joins them into one logical
-      # line: `@x \⏎ File.foo()` => `x(File.foo())`. A leading `+`/`-` across the continuation is
-      # binary, though (`foo \⏎ +1` => `foo + 1`), so `:dual_op` is NOT an argument start here.
+      # line: `@x \⏎ File.foo()` => `x(File.foo())`. A leading `+`/`-` is binary here
+      # (`foo\⏎+1` => `foo + 1`), so `:dual_op` is NOT an argument start.
+      #
+      # NB Elixir 1.20 makes a SPACE-preceded continuation (`foo \⏎+1`, a space before the `\`)
+      # behave like a same-line space (=> `foo(+1)`), distinct from the no-space form here. toxic2's
+      # token spans can't tell the two apart after the join (the callee span is identical), so the
+      # rare space-before-continuation-then-unary case stays binary — see FUZZER_GAPS.md.
       {{_, _, el, _ec}, {sl, _sc, _, _}} when el < sl ->
         case tk(t, i) do
           :dual_op -> false

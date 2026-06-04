@@ -280,13 +280,21 @@ defmodule Toxic2.DiagnosticsConformanceTest do
       assert warnings(aligned) == []
     end
 
-    test "an unsupported line-break char in a string/sigil/heredoc warns (not errors)" do
-      ls = <<0x2028::utf8>>
+    test "an unsupported line-break char in a string/sigil/heredoc is an error (Elixir 1.20)" do
+      # Elixir 1.20 made `?break` chars inside strings/sigils/heredocs an ERROR (was a warning);
+      # a bare CR (0x0D) is also a break char now (CRLF stays a normal newline).
+      for cp <- [0x000B, 0x000C, 0x000D, 0x0085, 0x2028, 0x2029] do
+        c = <<cp::utf8>>
 
-      for src <- ["\"x" <> ls <> "\"", "~s/x" <> ls <> "/", "~S/x" <> ls <> "/"] do
-        assert errors(src) == []
-        assert :unsupported_break in Enum.map(warnings(src), &Diagnostic.code/1)
+        for src <- ["\"x" <> c <> "\"", "~s/x" <> c <> "/", "~S/x" <> c <> "/"] do
+          assert_classified(src)
+          assert :invalid_break in Enum.map(errors(src), &Diagnostic.code/1)
+        end
       end
+
+      # CRLF in a string is a normal newline, not a break error
+      assert warnings("\"x\r\ny\"") == []
+      assert errors("\"x\r\ny\"") == []
     end
 
     test "confusable identifiers warn (UTS-39)" do

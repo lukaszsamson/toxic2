@@ -518,14 +518,14 @@ defmodule Toxic2.Lower do
   # An empty `()` head is a single empty `:paren` node; a non-empty parenthesised head is the bare
   # patterns with a `(` just before the first and a `)` just after the last.
   defp patterns_parens_meta([{:node, :paren, {sl, sc, el, ec}, [], _f, _d}], _view, _opts),
-    do: [parens: [line: sl, column: sc, closing: [line: el, column: ec - 1]]]
+    do: [parens: [closing: [line: el, column: ec - 1], line: sl, column: sc]]
 
   defp patterns_parens_meta([first | _] = pats, view, opts) do
     with {asl, asc, _, _} when asc > 1 <- child_span(first, view),
          {_, _, ael, aec} <- child_span(List.last(pats), view),
          "(" <- src_slice(opts, {asl, asc - 1}, {asl, asc}),
          ")" <- src_slice(opts, {ael, aec}, {ael, aec + 1}) do
-      [parens: [line: asl, column: asc - 1, closing: [line: ael, column: aec]]]
+      [parens: [closing: [line: ael, column: aec], line: asl, column: asc - 1]]
     else
       _ -> []
     end
@@ -772,6 +772,11 @@ defmodule Toxic2.Lower do
   end
 
   # One trivial clause per node kind (keeps each clause's cyclomatic complexity at 1).
+  # An empty top-level program is the grammar's `$empty`/`eoe` rule: since Elixir 1.20 its
+  # `__block__` is anchored at `[line: 1, column: 1]` (token-metadata only; normalized away otherwise).
+  defp lower_kind(:expr_list, [], _cst, _view, opts, acc, nid),
+    do: {{:__block__, if(tm?(opts), do: [line: 1, column: 1], else: []), []}, acc, nid}
+
   defp lower_kind(:expr_list, ch, _cst, view, opts, acc, nid),
     do: lower_block(ch, view, opts, acc, nid)
 
@@ -1249,7 +1254,7 @@ defmodule Toxic2.Lower do
 
       if String.contains?(src_slice(opts, {sl, sc + 1}, {el, ec - 1}) || "", ";"),
         do: {:__block__, [closing: closing, line: sl, column: sc], []},
-        else: {:__block__, [parens: [line: sl, column: sc, closing: closing]], []}
+        else: {:__block__, [parens: [closing: closing, line: sl, column: sc]], []}
     else
       _ -> {:__block__, [], []}
     end
@@ -1290,7 +1295,7 @@ defmodule Toxic2.Lower do
     if tm?(opts) do
       case CST.span(cst) do
         {sl, sc, el, ec} ->
-          {f, [{:parens, [line: sl, column: sc, closing: [line: el, column: ec - 1]]} | meta], a}
+          {f, [{:parens, [closing: [line: el, column: ec - 1], line: sl, column: sc]} | meta], a}
 
         _ ->
           {f, meta, a}
@@ -1410,9 +1415,11 @@ defmodule Toxic2.Lower do
     {_id, acc, nid} =
       Diagnostics.emit(acc, nid, :lowerer, :warning, :deprecated_not_in, span, %{})
 
-    # `not x in y` (deprecated): Elixir anchors both `not` and `in` at the `in` operator.
-    m = if tm?(opts), do: op_meta(op_leaf, view), else: []
-    {{neg, m, [{:in, m, [o, r]}]}, acc, nid}
+    # `not x in y` (deprecated): since Elixir 1.20 the outer `not`/`!` keeps its OWN meta (the
+    # `not`/`!` token), while the inner `in` is anchored at the `in` operator.
+    not_m = if tm?(opts), do: op_meta(neg_leaf, view), else: []
+    in_m = if tm?(opts), do: op_meta(op_leaf, view), else: []
+    {{neg, not_m, [{:in, in_m, [o, r]}]}, acc, nid}
   end
 
   # `not a in b` / `!a in b` — a bare `not`/`!` left of `in` is the membership-negation form
@@ -1908,9 +1915,26 @@ defmodule Toxic2.Lower do
   end
 
   defp lower_section({:node, :do_section, _sp, [label_leaf, body], _f, _d}, view, opts, acc, nid) do
-    {b, acc, nid} = lower_section_body(body, view, opts, acc, nid)
+    {b, acc, nid} =
+      lower_section_body(body, section_block_meta(label_leaf, view, opts), view, opts, acc, nid)
+
     {key, acc, nid} = section_label(label_leaf, view, opts, acc, nid)
     {{key, b}, acc, nid}
+  end
+
+  # Since Elixir 1.20 the `do` section's body block is anchored at the `do` token
+  # (`build_stab(.., meta_from_token(do))`): a multi-statement / empty body's `__block__` carries
+  # `[line, column]` of `do`, and a single-expression body carries `parens: [line, column]`. Other
+  # sections (`else`/`catch`/…) pass `[]`. Token-metadata only; non-tm meta is normalized away.
+  defp section_block_meta(label_leaf, view, opts) do
+    idx = CST.token_index(label_leaf)
+
+    if tm?(opts) and Tokens.kind(view, idx) == :do do
+      {l, c, _, _} = Tokens.span(view, idx)
+      [line: l, column: c]
+    else
+      []
+    end
   end
 
   # The `do:`/`else:`/`rescue:`/… key of a do-block. It is a literal atom too, so under a literal
@@ -1930,25 +1954,42 @@ defmodule Toxic2.Lower do
   end
 
   # A `:do_body` lowers like a block (nil / expr / __block__); `:do_clauses` lowers to a list of
-  # `{:->, ...}` clauses.
-  defp lower_section_body({:node, :do_clauses, _sp, clauses, _f, _d}, view, opts, acc, nid),
-    do: lower_each(clauses, view, opts, acc, nid)
+  # `{:->, ...}` clauses. `block_meta` is the `do`-token anchor (see `section_block_meta/3`).
+  defp lower_section_body(
+         {:node, :do_clauses, _sp, clauses, _f, _d},
+         _block_meta,
+         view,
+         opts,
+         acc,
+         nid
+       ),
+       do: lower_each(clauses, view, opts, acc, nid)
 
-  defp lower_section_body({:node, :do_body, _sp, stmts, _f, _d}, view, opts, acc, nid) do
+  defp lower_section_body({:node, :do_body, _sp, stmts, _f, _d}, block_meta, view, opts, acc, nid) do
     case stmts do
-      # An empty section body is `{:__block__, [], []}` (`foo do end` => `[do: {:__block__,[],[]}]`),
-      # NOT nil — Elixir distinguishes an empty block from a missing one.
+      # An empty section body is `{:__block__, block_meta, []}` (`foo do end`), NOT nil — Elixir
+      # distinguishes an empty block from a missing one.
       [] ->
-        {{:__block__, [], []}, acc, nid}
+        {{:__block__, block_meta, []}, acc, nid}
 
       [one] ->
         {ast, acc, nid} = lower(one, view, opts, acc, nid)
-        {wrap_splice(attach_eoe(ast, one, view, opts)), acc, nid}
+        {section_parens(wrap_splice(attach_eoe(ast, one, view, opts)), block_meta), acc, nid}
 
       many ->
-        wrap_block(lower_stmts(many, view, opts, acc, nid))
+        {{:__block__, _m, asts}, acc, nid} = wrap_block(lower_stmts(many, view, opts, acc, nid))
+        {{:__block__, block_meta, asts}, acc, nid}
     end
   end
+
+  # A single-expression `do` body carries `parens: <do-token meta>` (Elixir 1.20). Only an expr that
+  # already has a metadata list (a `{op, meta, args}` 3-tuple) takes it — a bare literal does not.
+  defp section_parens(ast, []), do: ast
+
+  defp section_parens({op, meta, args}, block_meta) when is_list(meta),
+    do: {op, [{:parens, block_meta} | meta], args}
+
+  defp section_parens(ast, _block_meta), do: ast
 
   # `<<...>>` => `{:<<>>, [], elems}` (segments incl. `::` are ordinary expressions).
   # Trailing keyword pairs collapse into one keyword-list element (`<<a, k: 1>>` => `[a, [k: 1]]`).

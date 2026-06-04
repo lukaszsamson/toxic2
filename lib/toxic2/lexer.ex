@@ -272,9 +272,21 @@ defmodule Toxic2.Lexer do
   end
 
   # --- char literals: ?\<esc> and ?<codepoint> ---------------------------
+  # A bare carriage return after `?` / `?\` is rejected since Elixir 1.20 (CR is only valid as part
+  # of a CRLF line ending); the char-literal clauses below handle `?\<LF>` and other codepoints.
+  defp lex(<<??, ?\\, ?\r, rest::binary>>, line, col, acc, w, st) do
+    err = {:error, line, col, line, col + 3, LexError.new(:bare_carriage_return, %{})}
+    lex(rest, line, col + 3, [err | acc], w, st)
+  end
+
+  defp lex(<<??, ?\r, rest::binary>>, line, col, acc, w, st) do
+    err = {:error, line, col, line, col + 2, LexError.new(:bare_carriage_return, %{})}
+    lex(rest, line, col + 2, [err | acc], w, st)
+  end
+
   # `?\<newline>` is a valid char (value `\n`) that CONSUMES the newline — the token spans onto the
   # next line, so line state advances and no trailing `:eol` is emitted (matching Elixir). A `\r`
-  # escape (`?\<\r>`, incl. before `\n`) is the ordinary one-char case below — value `\r`, no consume.
+  # escape (`?\r`, the letter) is the ordinary one-char case below — value `\r`, no consume.
   # Like any named-escape special char, Elixir warns to write `?\n` instead.
   defp lex(<<??, ?\\, ?\n, rest::binary>>, line, col, acc, w, st),
     do:
@@ -909,6 +921,10 @@ defmodule Toxic2.Lexer do
     lex(rest, line, col + 2, acc, w, [{:interp, {:quoted, lit}} | st])
   end
 
+  # CRLF is a normal newline kept verbatim (handled before the bare-CR `?break` error below).
+  defp read_quoted(<<?\r, ?\n, rest::binary>>, line, _col, buf, fs, acc, w, st, lit),
+    do: read_quoted(rest, line + 1, 1, [<<?\r, ?\n>> | buf], fs, acc, w, st, lit)
+
   defp read_quoted(<<?\n, rest::binary>>, line, _col, buf, fs, acc, w, st, lit),
     do: read_quoted(rest, line + 1, 1, [<<?\n>> | buf], fs, acc, w, st, lit)
 
@@ -950,18 +966,13 @@ defmodule Toxic2.Lexer do
       c == close_char(qk) ->
         close_quoted(rest, line, col, buf, fs, acc, w, st, lit)
 
-      bidi?(c) ->
+      # bidi controls and unsupported line breaks (incl. a bare CR) are both rejected in a string
+      # (Elixir 1.20 — previously `?break` was a warning); the char is kept for a best-effort tree.
+      bidi?(c) or break?(c) ->
+        code = if bidi?(c), do: :invalid_bidi, else: :invalid_break
         acc = flush_fragment(buf, fs, line, col, acc, frag_kind(qk))
-
-        acc = [
-          {:error, line, col, line, col + 1, LexError.new(:invalid_bidi, %{codepoint: c})} | acc
-        ]
-
+        acc = [{:error, line, col, line, col + 1, LexError.new(code, %{codepoint: c})} | acc]
         read_quoted(rest, line, col + 1, [<<c::utf8>>], {line, col + 1}, acc, w, st, lit)
-
-      break?(c) ->
-        w = break_notice(c, line, col, w)
-        read_quoted(rest, line, col + 1, [<<c::utf8>> | buf], fs, acc, w, st, lit)
 
       true ->
         read_quoted(rest, line, col + 1, [<<c::utf8>> | buf], fs, acc, w, st, lit)
@@ -1112,19 +1123,19 @@ defmodule Toxic2.Lexer do
   end
 
   # `\x{H..}` — a codepoint (deprecated form). Empty braces (`\x{}`) are invalid.
+  # `\x{H..}` was a (deprecated) codepoint form; since Elixir 1.20 it is an ERROR — only `\xHH`
+  # (a byte) or `\uHHHH`/`\u{H..}` (a codepoint) are accepted. Consume the braces, then flag it.
   defp esc(<<?x, ?{, rest::binary>>) do
-    {hex, rest2} = take_hex(rest, <<>>)
-    rest3 = drop_rbrace(rest2)
-
-    if hex == <<>>,
-      do: {<<>>, rest3, :sameline, {:invalid_hex_escape, %{}}},
-      else: wrap_cp(cp_to_utf8(hex), rest3)
+    {_hex, rest2} = take_hex(rest, <<>>)
+    {<<>>, drop_rbrace(rest2), :sameline, {:invalid_hex_escape, %{}}}
   end
 
   defp esc(<<?x, a, b, rest::binary>>) when is_hex(a) and is_hex(b),
     do: {<<hex_val(a) * 16 + hex_val(b)>>, rest, :sameline, nil}
 
-  defp esc(<<?x, a, rest::binary>>) when is_hex(a), do: {<<hex_val(a)>>, rest, :sameline, nil}
+  # `\xH` (a single hex digit) was a byte; since Elixir 1.20 it is an ERROR (use `\xHH`).
+  defp esc(<<?x, a, rest::binary>>) when is_hex(a),
+    do: {<<>>, rest, :sameline, {:invalid_hex_escape, %{}}}
 
   # `\x` not followed by a hex digit or `{` (e.g. `\xG`) — invalid (Elixir rejects it).
   defp esc(<<?x, rest::binary>>), do: {<<?x>>, rest, :sameline, {:invalid_hex_escape, %{}}}
@@ -1220,7 +1231,10 @@ defmodule Toxic2.Lexer do
     lex(rest, line, col + 2, acc, w, [{:interp, {:sigil, sm}} | st])
   end
 
-  # newlines are literal content (non-heredoc sigils may span lines).
+  # newlines are literal content (non-heredoc sigils may span lines); CRLF before the bare-CR check.
+  defp read_sigil(<<?\r, ?\n, rest::binary>>, line, _col, buf, fs, acc, w, st, sm),
+    do: read_sigil(rest, line + 1, 1, [<<?\r, ?\n>> | buf], fs, acc, w, st, sm)
+
   defp read_sigil(<<?\n, rest::binary>>, line, _col, buf, fs, acc, w, st, sm),
     do: read_sigil(rest, line + 1, 1, [<<?\n>> | buf], fs, acc, w, st, sm)
 
@@ -1238,8 +1252,14 @@ defmodule Toxic2.Lexer do
       acc = [{:sigil_end, line, col, line, col + 1 + mlen, mods} | acc]
       lex(after_mods, line, col + 1 + mlen, acc, w, st)
     else
-      w = if break?(c), do: break_notice(c, line, col, w), else: w
-      read_sigil(rest, line, col + 1, [<<c::utf8>> | buf], fs, acc, w, st, sm)
+      if bidi?(c) or break?(c) do
+        code = if bidi?(c), do: :invalid_bidi, else: :invalid_break
+        acc = flush_fragment(buf, fs, line, col, acc, :string_fragment)
+        acc = [{:error, line, col, line, col + 1, LexError.new(code, %{codepoint: c})} | acc]
+        read_sigil(rest, line, col + 1, [<<c::utf8>>], {line, col + 1}, acc, w, st, sm)
+      else
+        read_sigil(rest, line, col + 1, [<<c::utf8>> | buf], fs, acc, w, st, sm)
+      end
     end
   end
 
@@ -1260,14 +1280,10 @@ defmodule Toxic2.Lexer do
   defp bidi?(c),
     do: c in [0x202A, 0x202B, 0x202C, 0x202D, 0x202E, 0x2066, 0x2067, 0x2068, 0x2069]
 
-  # Unsupported line-break characters (Elixir's `?break` macro): VT, FF, NEL, LS, PS. Rejected in
-  # comments (they'd break the one-line comment invisibly) and warned in strings/sigils.
-  defp break?(c), do: c in [0x000B, 0x000C, 0x0085, 0x2028, 0x2029]
-
-  # Inside a string/sigil/heredoc a `?break` char is kept verbatim but Elixir warns to use its
-  # escaped `\uXXXX` form instead (the char would otherwise be an invisible line break).
-  defp break_notice(c, line, col, w),
-    do: [{:lexer, :warning, :unsupported_break, {line, col, line, col + 1}, %{codepoint: c}} | w]
+  # Unsupported line-break characters (Elixir's `?break` macro, 1.20): VT, FF, CR, NEL, LS, PS.
+  # Rejected (an ERROR) in comments and strings/sigils/heredocs — they'd be invisible line breaks.
+  # A bare CR (0x0D) is only valid as part of a CRLF, which every call site handles BEFORE this check.
+  defp break?(c), do: c in [0x000B, 0x000C, 0x000D, 0x0085, 0x2028, 0x2029]
 
   # Scan a (to-be-dropped) comment for a bidi/break control; emit a lexer error at the first one.
   defp comment_bidi_check(bin, line, col, acc) do
@@ -1277,6 +1293,8 @@ defmodule Toxic2.Lexer do
     end
   end
 
+  # A trailing CRLF / LF ends the comment (no error); a BARE CR inside it is a `?break` error.
+  defp find_comment_lint(<<?\r, ?\n, _::binary>>, _col), do: nil
   defp find_comment_lint(<<?\n, _::binary>>, _col), do: nil
   defp find_comment_lint(<<>>, _col), do: nil
 
@@ -1455,6 +1473,10 @@ defmodule Toxic2.Lexer do
     lex(rest, line, col + 2, acc, w, [{:interp, {:heredoc, hc}} | st])
   end
 
+  # CRLF is the line ending (kept verbatim), handled before the bare-CR `?break` error below.
+  defp read_heredoc(<<?\r, ?\n, rest::binary>>, line, _col, buf, fs, acc, w, st, hc),
+    do: heredoc_line_start(rest, line + 1, [<<?\r, ?\n>> | buf], fs, acc, w, st, hc)
+
   defp read_heredoc(<<?\n, rest::binary>>, line, _col, buf, fs, acc, w, st, hc),
     do: heredoc_line_start(rest, line + 1, [<<?\n>> | buf], fs, acc, w, st, hc)
 
@@ -1486,8 +1508,15 @@ defmodule Toxic2.Lexer do
   end
 
   defp read_heredoc(<<c::utf8, rest::binary>>, line, col, buf, fs, acc, w, st, hc) do
-    w = if break?(c), do: break_notice(c, line, col, w), else: w
-    read_heredoc(rest, line, col + 1, [<<c::utf8>> | buf], fs, acc, w, st, hc)
+    if bidi?(c) or break?(c) do
+      {_d, _m, _i, _s, ek} = hc
+      code = if bidi?(c), do: :invalid_bidi, else: :invalid_break
+      acc = flush_fragment(buf, fs, line, col, acc, frag_of(ek))
+      acc = [{:error, line, col, line, col + 1, LexError.new(code, %{codepoint: c})} | acc]
+      read_heredoc(rest, line, col + 1, [<<c::utf8>>], {line, col + 1}, acc, w, st, hc)
+    else
+      read_heredoc(rest, line, col + 1, [<<c::utf8>> | buf], fs, acc, w, st, hc)
+    end
   end
 
   defp read_heredoc(<<byte, rest::binary>>, line, col, buf, fs, acc, w, st, hc),

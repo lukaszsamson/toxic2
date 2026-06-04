@@ -407,8 +407,8 @@ defmodule Toxic2.ParserTest do
       assert {{:@, _, [{:x, _, [{{:., _, [{:__aliases__, _, [:File]}, :foo]}, _, []}]}]}, []} =
                Toxic2.parse_to_ast("@x \\\nFile.foo()")
 
-      # but `+`/`-` across the continuation are binary, not a unary arg
-      assert {{:+, _, [{:foo, _, nil}, 1]}, []} = Toxic2.parse_to_ast("foo \\\n+1")
+      # `+`/`-` directly across a (no-space) continuation are binary, not a unary arg
+      assert {{:+, _, [{:foo, _, nil}, 1]}, []} = Toxic2.parse_to_ast("foo\\\n+1")
     end
 
     test "a multi-arg no-parens call ending in `do…end` is a valid container element" do

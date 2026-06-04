@@ -46,19 +46,23 @@ defmodule Toxic2.YrlEdgeCasesTest do
       assert_lex_rejected("\"\\u1F\"")
       assert_lex_rejected("\"\\u{110000}\"")
       assert_lex_rejected("\"\\u{D800}\"")
+
+      # Elixir 1.20: only `\xHH` (a byte) is accepted — `\xH` (1 digit) and `\x{…}` are now errors
+      assert_lex_rejected("\"\\xA\"")
+      assert_lex_rejected("\"\\x{1F}\"")
     end
 
     test "valid escapes are accepted" do
-      assert_lex_ok("\"\\xA\"")
       assert_lex_ok("\"\\xAB\"")
-      assert_lex_ok("\"\\x{1F}\"")
       assert_lex_ok("\"é\"")
+      # codepoints use `\uHHHH` / `\u{H..}` (NOT `\x{…}`)
       assert_lex_ok("\"\\u{1F600}\"")
       assert_lex_ok("\"\\n\\t plain\"")
     end
 
     test "the same applies inside heredocs" do
       assert_lex_rejected("\"\"\"\n\\xG\n\"\"\"")
+      assert_lex_rejected("\"\"\"\n\\x{1F}\n\"\"\"")
       assert_lex_ok("\"\"\"\n\\xAB\n\"\"\"")
     end
   end
