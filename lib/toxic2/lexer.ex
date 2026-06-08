@@ -272,6 +272,12 @@ defmodule Toxic2.Lexer do
   defp lex(<<>>, _line, _col, acc, w, _st), do: {acc, w}
 
   # --- horizontal whitespace ---------------------------------------------
+  # A pure zero-alloc tail call per space/tab — measured optimal. Both a count-the-run variant
+  # (allocates a tuple/slice per run) and multi-byte clauses (`<<c,c,c,c,…>>` consuming 2/4/8 at
+  # once) were A/B'd in isolation and BOTH regressed monotonically: inter-token runs are mostly
+  # length 1 (leading indentation is coalesced by `consume_eols`), advancing the match context one
+  # byte is nearly free on BEAM, and the extra clauses' equality checks + partial-run fall-through
+  # cascade never pay back — even on aligned/indented input with runs of 4–8.
   defp lex(<<c, rest::binary>>, line, col, acc, w, st) when c in [?\s, ?\t],
     do: lex(rest, line, col + 1, acc, w, st)
 
