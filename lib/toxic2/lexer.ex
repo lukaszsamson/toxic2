@@ -213,6 +213,26 @@ defmodule Toxic2.Lexer do
     end
   end
 
+  # Bytes that could carry a comment bidi/break lint: VT/FF/CR (`0x0B..0x0D`, the only sub-ASCII
+  # break chars) plus every high byte (`0x80..0xFF`) — NEL/LS/PS and the bidi controls are all
+  # multi-byte UTF-8, so each has a high byte. A comment slice matching none of these is provably
+  # lint-free, letting `lex(?#, …)` skip the precise scan. Same compile-once `:persistent_term` cache.
+  defp comment_suspicious_pattern do
+    key = {__MODULE__, :comment_suspicious_pattern}
+
+    case :persistent_term.get(key, nil) do
+      nil ->
+        pattern =
+          :binary.compile_pattern(Enum.map([0x0B, 0x0C, 0x0D | Enum.to_list(128..255)], &<<&1>>))
+
+        :persistent_term.put(key, pattern)
+        pattern
+
+      pattern ->
+        pattern
+    end
+  end
+
   defp any_unicode_name?(tokens) do
     Enum.any?(tokens, fn
       {kind, _, _, _, _, v} when kind in @identifier_name_kinds and is_binary(v) -> not ascii?(v)
@@ -247,10 +267,24 @@ defmodule Toxic2.Lexer do
     do: do_eol(bin, line, col, acc, w, st)
 
   # --- comments (dropped unless preserved; phase 2 drops) ----------------
+  # The comment body was scanned TWICE: once byte-by-byte to find the newline, once more for the
+  # bidi/break lint. Find the newline with a C-level `:binary.match` instead, and gate the lint scan
+  # behind a `:binary.match` pre-check — every bidi/break codepoint has a byte in `0x0B..0x0D` or
+  # `0x80..0xFF` (NEL/LS/PS/bidi controls are all multi-byte UTF-8), so a slice with none of those
+  # can't carry a lint and the second scan is skipped for ordinary ASCII comments (the common case).
   defp lex(<<?#, rest::binary>>, line, col, acc, w, st) do
-    {drop_len, rest2} = take_while(rest, 0, &(&1 != ?\n))
-    acc = comment_bidi_check(rest, line, col + 1, acc)
-    lex(rest2, line, col + 1 + drop_len, acc, w, st)
+    drop_len =
+      case :binary.match(rest, "\n") do
+        {pos, _} -> pos
+        :nomatch -> byte_size(rest)
+      end
+
+    acc =
+      if :binary.match(rest, comment_suspicious_pattern(), scope: {0, drop_len}) != :nomatch,
+        do: comment_bidi_check(rest, line, col + 1, acc),
+        else: acc
+
+    lex(rest_at(rest, drop_len), line, col + 1 + drop_len, acc, w, st)
   end
 
   # --- line continuation: a `\` right before a newline joins the lines (no :eol emitted) ----
