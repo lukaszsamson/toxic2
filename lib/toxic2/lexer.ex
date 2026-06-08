@@ -1601,8 +1601,8 @@ defmodule Toxic2.Lexer do
     heredoc_delim3?(after_ws, d)
   end
 
-  defp heredoc_delim3?(<<a, b, c, _::binary>>, d), do: a == d and b == d and c == d
-  defp heredoc_delim3?(<<a, b, c>>, d), do: a == d and b == d and c == d
+  defp heredoc_delim3?(<<d, d, d, _::binary>>, d), do: true
+  defp heredoc_delim3?(<<d, d, d>>, d), do: true
   defp heredoc_delim3?(_bin, _d), do: false
 
   # Drop up to `n` leading spaces/tabs; returns {dropped_count, rest}.
