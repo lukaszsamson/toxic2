@@ -46,7 +46,7 @@ defmodule Toxic2.Lexer do
   # Narrow inlining of tiny, hot, LOCAL helpers (cross-module calls are unaffected). Recursive
   # scanners (`lex/6`, `word_len/2`, `read_name/1`, `consume_eols/4`, `plain_run_len/4`) are
   # deliberately excluded — inlining them risks code growth / worse i-cache. A/B-measured.
-  @compile {:inline, rest_at: 2, kw_suffix: 1, kw_colon?: 1, reserved_token: 4}
+  @compile {:inline, rest_at: 2, kw_suffix: 1, kw_colon?: 1}
 
   @type token :: Toxic2.Token.t()
   # An id-less lexer warning notice; numbered into a `Diagnostic` at the parse boundary.
@@ -879,31 +879,33 @@ defmodule Toxic2.Lexer do
 
   # --- classification of a lowercase word --------------------------------
 
-  defp lower_token(name, l, c, n) do
-    cond do
-      m = @reserved_ops[name] ->
-        reserved_token(m, l, c, n)
-
-      Map.has_key?(@terminators, name) ->
-        {@terminators[name], l, c, l, c + n, nil}
-
-      Map.has_key?(@value_literals, name) ->
-        {:literal, l, c, l, c + n, @value_literals[name]}
-
-      Map.has_key?(@block_labels, name) ->
-        {:block_label, l, c, l, c + n, @block_labels[name]}
-
-      # `__aliases__` / `__block__` are reserved (they name AST nodes) and cannot be used as plain
-      # identifiers; emit a lexer error (tolerant: the parser reports it and recovers).
-      name in ["__aliases__", "__block__"] ->
-        {:error, l, c, l, c + n, LexError.new(:reserved_token, %{name: name})}
-
-      true ->
-        {:identifier, l, c, l, c + n, name}
-    end
+  # Classify a lowercase word. Generated as direct binary-pattern clauses from the closed-set maps
+  # (so BEAM dispatches via a compiled byte trie + catch-all) instead of 4 runtime map lookups per
+  # identifier — the common `:identifier` case is the fast fall-through.
+  for {name, {kind, atom}} <- @reserved_ops do
+    defp lower_token(unquote(name), l, c, n), do: {unquote(kind), l, c, l, c + n, unquote(atom)}
   end
 
-  defp reserved_token({kind, atom}, l, c, n), do: {kind, l, c, l, c + n, atom}
+  for {name, kind} <- @terminators do
+    defp lower_token(unquote(name), l, c, n), do: {unquote(kind), l, c, l, c + n, nil}
+  end
+
+  for {name, value} <- @value_literals do
+    defp lower_token(unquote(name), l, c, n),
+      do: {:literal, l, c, l, c + n, unquote(value)}
+  end
+
+  for {name, atom} <- @block_labels do
+    defp lower_token(unquote(name), l, c, n),
+      do: {:block_label, l, c, l, c + n, unquote(atom)}
+  end
+
+  # `__aliases__` / `__block__` are reserved (they name AST nodes) and cannot be used as plain
+  # identifiers; emit a lexer error (tolerant: the parser reports it and recovers).
+  defp lower_token(name, l, c, n) when name in ["__aliases__", "__block__"],
+    do: {:error, l, c, l, c + n, LexError.new(:reserved_token, %{name: name})}
+
+  defp lower_token(name, l, c, n), do: {:identifier, l, c, l, c + n, name}
 
   # `foo:` keyword key iff a single `:` follows (not `::`). Works for reserved words too
   # (`do:` is a keyword key, not the `do` terminator).
