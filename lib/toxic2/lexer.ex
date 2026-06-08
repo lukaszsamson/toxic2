@@ -1735,7 +1735,7 @@ defmodule Toxic2.Lexer do
   end
 
   defp heredoc_start_body(body, line, acc, w, st, {delim, mode, interp?, end_kind}) do
-    strip = heredoc_indent(body, delim, 0)
+    strip = heredoc_indent(body, delim, 0, heredoc_sig_pattern())
     hc = {delim, mode, interp?, strip, end_kind}
 
     # Seed an empty fragment: a heredoc always opens with a fragment, so an immediate `#{…}` keeps
@@ -1746,47 +1746,53 @@ defmodule Toxic2.Lexer do
 
   # Pre-scan the body for the closing delimiter's indentation. `depth` tracks `#{...}` nesting so a
   # `"""` inside an interpolation isn't mistaken for the terminator. Returns 0 if none is found.
-  defp heredoc_indent(bin, delim, depth) do
+  # `pat` is the compiled `heredoc_sig_pattern/0` (the `\n`/`\`/`#{` needle), fetched ONCE by the
+  # caller and threaded through so the per-line scan never re-reads it from `:persistent_term`.
+  defp heredoc_indent(bin, delim, depth, pat) do
     {ws, after_ws} = take_while(bin, 0, &(&1 in [?\s, ?\t]))
 
     cond do
       depth == 0 and heredoc_delim3?(after_ws, delim) -> ws
-      true -> heredoc_indent_skip(after_ws, delim, depth)
+      true -> heredoc_indent_skip(after_ws, delim, depth, pat)
     end
   end
 
-  defp heredoc_indent_skip(bin, delim, depth) do
-    case skip_to_eol(bin, depth) do
+  defp heredoc_indent_skip(bin, delim, depth, pat) do
+    case skip_to_eol(bin, depth, pat) do
       :eof -> 0
-      {rest, depth2} -> heredoc_indent(rest, delim, depth2)
+      {rest, depth2} -> heredoc_indent(rest, delim, depth2, pat)
     end
   end
 
   # Scan to the next newline (consumed), tracking `#{`/brace depth and skipping escaped chars.
-  defp skip_to_eol(<<>>, _depth), do: :eof
-  defp skip_to_eol(<<?\n, rest::binary>>, depth), do: {rest, depth}
+  defp skip_to_eol(<<>>, _depth, _pat), do: :eof
+  defp skip_to_eol(<<?\n, rest::binary>>, depth, _pat), do: {rest, depth}
   # A `\`-newline is a content line continuation, but the closing `"""` still lives on its own
   # physical line — so for the indentation pre-scan it counts as a line boundary, not an escape.
-  defp skip_to_eol(<<?\\, ?\r, ?\n, rest::binary>>, depth), do: {rest, depth}
-  defp skip_to_eol(<<?\\, ?\n, rest::binary>>, depth), do: {rest, depth}
-  defp skip_to_eol(<<?\\, _c, rest::binary>>, depth), do: skip_to_eol(rest, depth)
-  defp skip_to_eol(<<?#, ?{, rest::binary>>, depth), do: skip_to_eol(rest, depth + 1)
-  defp skip_to_eol(<<?{, rest::binary>>, depth) when depth > 0, do: skip_to_eol(rest, depth + 1)
-  defp skip_to_eol(<<?}, rest::binary>>, depth) when depth > 0, do: skip_to_eol(rest, depth - 1)
+  defp skip_to_eol(<<?\\, ?\r, ?\n, rest::binary>>, depth, _pat), do: {rest, depth}
+  defp skip_to_eol(<<?\\, ?\n, rest::binary>>, depth, _pat), do: {rest, depth}
+  defp skip_to_eol(<<?\\, _c, rest::binary>>, depth, pat), do: skip_to_eol(rest, depth, pat)
+  defp skip_to_eol(<<?#, ?{, rest::binary>>, depth, pat), do: skip_to_eol(rest, depth + 1, pat)
+
+  defp skip_to_eol(<<?{, rest::binary>>, depth, pat) when depth > 0,
+    do: skip_to_eol(rest, depth + 1, pat)
+
+  defp skip_to_eol(<<?}, rest::binary>>, depth, pat) when depth > 0,
+    do: skip_to_eol(rest, depth - 1, pat)
 
   # Depth-0 fast path: outside interpolation the only bytes that matter are `\n` / `\` / `#{`, so
   # jump straight to the next one with a C-level `:binary.match` instead of byte-recursing the whole
   # line. The 2-byte `#{` needle means lone `#`s (common in markdown heredocs) are skipped for free.
   # The matched byte is re-dispatched through the specific clauses above. (depth > 0 — inside `#{…}`,
   # where `{`/`}` also matter — stays on the byte path below; interpolation bodies are short.)
-  defp skip_to_eol(<<c, _::binary>> = bin, 0) when c != ?\n and c != ?\\ and c != ?# do
-    case :binary.match(bin, heredoc_sig_pattern()) do
+  defp skip_to_eol(<<c, _::binary>> = bin, 0, pat) when c != ?\n and c != ?\\ and c != ?# do
+    case :binary.match(bin, pat) do
       :nomatch -> :eof
-      {pos, _} -> skip_to_eol(rest_at(bin, pos), 0)
+      {pos, _} -> skip_to_eol(rest_at(bin, pos), 0, pat)
     end
   end
 
-  defp skip_to_eol(<<_c, rest::binary>>, depth), do: skip_to_eol(rest, depth)
+  defp skip_to_eol(<<_c, rest::binary>>, depth, pat), do: skip_to_eol(rest, depth, pat)
 
   defp frag_of(:string_end), do: :string_fragment
   defp frag_of(:charlist_end), do: :charlist_fragment
