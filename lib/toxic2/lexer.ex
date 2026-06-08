@@ -1249,6 +1249,29 @@ defmodule Toxic2.Lexer do
     {[{:sigil_end, line, col, line, col, ""}, err | acc], w}
   end
 
+  # Fast path (mirrors `read_quoted`/`read_heredoc`): slice a maximal run of ordinary printable-ASCII
+  # content bytes in ONE `binary_part` instead of one `<<c>>`+cons per char. Sigil content was the
+  # last hot reader still building its fragment a byte at a time — the BEAM-appropriate version of
+  # the bulk-slice win in OTP's JSON encoder / cowlib HTTP parsers (register-SWAR on top is a no-op
+  # here: BEAM's binary match context already makes the byte scan allocation-free). `\`/`#`/newline/
+  # the close delimiter still end the run (handled by the clauses above + the `c != close` guard).
+  defp read_sigil(<<c, _::binary>> = bin, line, col, buf, fs, acc, w, st, {close, _} = sm)
+       when c >= 32 and c < 128 and c != ?\\ and c != ?# and c != close do
+    n = plain_run_len(bin, close, close, 0)
+
+    read_sigil(
+      rest_at(bin, n),
+      line,
+      col + n,
+      [binary_part(bin, 0, n) | buf],
+      fs,
+      acc,
+      w,
+      st,
+      sm
+    )
+  end
+
   defp read_sigil(<<c::utf8, rest::binary>>, line, col, buf, fs, acc, w, st, {close, _} = sm) do
     if c == close do
       acc = flush_fragment(buf, fs, line, col, acc, :string_fragment)
