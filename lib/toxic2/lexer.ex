@@ -178,10 +178,13 @@ defmodule Toxic2.Lexer do
     tokens = :lists.reverse(rev_tokens)
     warnings = :lists.reverse(rev_warnings)
 
-    # UTS-39 confusable-identifier lint: a whole-file pass, run only when a non-ASCII identifier is
+    # UTS-39 confusable-identifier lint: a whole-file pass, run only when a non-ASCII IDENTIFIER is
     # present (matching Elixir's `ascii_identifiers_only` gate — keeps the ASCII-only hot path free).
+    # `nonascii_byte?/1` is a cheap binary scan over the SOURCE that rejects pure-ASCII files (the
+    # common case) in one pass; the costlier token scan (`any_unicode_name?/1`, which also rules out
+    # non-ASCII that's only in strings/comments) runs only when the source has a non-ASCII byte.
     warnings =
-      if any_unicode_name?(tokens),
+      if nonascii_byte?(source) and any_unicode_name?(tokens),
         do: Enum.concat(warnings, confusable_lint(tokens)),
         else: warnings
 
@@ -189,6 +192,26 @@ defmodule Toxic2.Lexer do
   end
 
   @identifier_name_kinds [:identifier, :kw_identifier, :alias, :atom]
+
+  # `:binary.match/2` against a compiled Boyer–Moore pattern of every high byte (0x80–0xFF) is a
+  # C-implemented scan (~17× faster than an Elixir byte recursion), making the pure-ASCII fast
+  # reject for the confusable lint effectively free. The pattern is a reference (not a literal), so
+  # it's compiled once and cached in `:persistent_term` (O(1) reads; a single one-time `put`).
+  defp nonascii_byte?(source), do: :binary.match(source, high_byte_pattern()) != :nomatch
+
+  defp high_byte_pattern do
+    key = {__MODULE__, :high_byte_pattern}
+
+    case :persistent_term.get(key, nil) do
+      nil ->
+        pattern = :binary.compile_pattern(Enum.map(128..255, &<<&1>>))
+        :persistent_term.put(key, pattern)
+        pattern
+
+      pattern ->
+        pattern
+    end
+  end
 
   defp any_unicode_name?(tokens) do
     Enum.any?(tokens, fn
