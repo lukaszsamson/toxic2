@@ -272,14 +272,13 @@ defmodule Toxic2.Lexer do
 
   defp any_unicode_name?(tokens) do
     Enum.any?(tokens, fn
-      {kind, _, _, _, _, v} when kind in @identifier_name_kinds and is_binary(v) -> not ascii?(v)
-      _ -> false
+      {kind, _, _, _, _, v} when kind in @identifier_name_kinds and is_binary(v) ->
+        nonascii_byte?(v)
+
+      _ ->
+        false
     end)
   end
-
-  defp ascii?(<<c, rest::binary>>) when c < 128, do: ascii?(rest)
-  defp ascii?(<<>>), do: true
-  defp ascii?(_), do: false
 
   defp confusable_lint(tokens), do: Toxic2.String.Tokenizer.Security.lint(tokens)
 
