@@ -580,11 +580,36 @@ defmodule Toxic2.Parser do
 
   # `a[b]` access when `[` is adjacent to the primary (spaced `a [b]` is a no-parens call, phase 8).
   defp access?(t, lhs, i) do
-    tk(t, i) == :"[" and adjacent_after?(cst_span(t, lhs), Tokens.span(t, i))
+    tk(t, i) == :"[" and cst_ends_at_token?(t, lhs, i)
   end
 
   defp adjacent_after?({_, _, el, ec}, {sl, sc, _, _}), do: el == sl and ec == sc
   defp adjacent_after?(_, _), do: false
+
+  # True iff `cst` ends exactly where token `i` begins (no gap). Reads positions with `elem` so
+  # neither side builds a transient span 4-tuple — this runs in `postfix` for every `(`/`[`.
+  defp cst_ends_at_token?(t, cst, i) do
+    case Tokens.token(t, i) do
+      :eof -> false
+      tok -> cst_ends_at?(t, cst, elem(tok, 1), elem(tok, 2))
+    end
+  end
+
+  defp cst_ends_at?(t, cst, sl, sc) do
+    case CST.tag(cst) do
+      :token ->
+        tok = Tokens.token(t, CST.token_index(cst))
+        elem(tok, 3) == sl and elem(tok, 4) == sc
+
+      :node ->
+        {_, _, el, ec} = CST.span(cst)
+        el == sl and ec == sc
+
+      :missing ->
+        {_, _, el, ec} = anchor_span(t, CST.anchor_index(cst))
+        el == sl and ec == sc
+    end
+  end
 
   # `a[b]`. A keyword-list index (`a[k: 1, j: 2]`) is the index `[k: 1, j: 2]`: parse the bracket
   # as a list sequence and use that list node as the single index.
@@ -643,7 +668,7 @@ defmodule Toxic2.Parser do
   # `foo()(`); never deeper, and never an alias / access / container / literal callee.
   defp paren_call?(t, lhs, i, pdepth) do
     tk(t, i) == :"(" and paren_callee?(t, lhs, pdepth) and
-      adjacent_after?(cst_span(t, lhs), Tokens.span(t, i))
+      cst_ends_at_token?(t, lhs, i)
   end
 
   defp paren_callee?(t, lhs, 0),
@@ -783,8 +808,7 @@ defmodule Toxic2.Parser do
   # `a."foo"` (quoted function name). An adjacent `(` makes it a call with args, else a 0-arg
   # remote call — same `:remote_call` node, but the name child is a `:string`/`:charlist` node.
   defp remote_quoted_call(t, after_q, lhs, qname, ctx, diags, nid, fuel) do
-    if tk(t, after_q) == :"(" and
-         adjacent_after?(cst_span(t, qname), Tokens.span(t, after_q)) do
+    if tk(t, after_q) == :"(" and cst_ends_at_token?(t, qname, after_q) do
       {args, k, diags, nid, fuel} = parse_seq(t, after_q + 1, :")", :call, diags, nid, fuel)
       span = merge_ct(t, lhs, k - 1)
       node = CST.node(:remote_call, span, [lhs, qname | args], :matched, nil)
