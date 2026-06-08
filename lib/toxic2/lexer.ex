@@ -213,6 +213,22 @@ defmodule Toxic2.Lexer do
     end
   end
 
+  # Significant bytes for the heredoc indentation pre-scan at depth 0: a newline ends the physical
+  # line, a `\` may be a line continuation, and `#{` opens interpolation. Compile-once cached.
+  defp heredoc_sig_pattern do
+    key = {__MODULE__, :heredoc_sig_pattern}
+
+    case :persistent_term.get(key, nil) do
+      nil ->
+        pattern = :binary.compile_pattern(["\n", "\\", "\#{"])
+        :persistent_term.put(key, pattern)
+        pattern
+
+      pattern ->
+        pattern
+    end
+  end
+
   # Bytes that could carry a comment bidi/break lint: VT/FF/CR (`0x0B..0x0D`, the only sub-ASCII
   # break chars) plus every high byte (`0x80..0xFF`) — NEL/LS/PS and the bidi controls are all
   # multi-byte UTF-8, so each has a high byte. A comment slice matching none of these is provably
@@ -1742,6 +1758,19 @@ defmodule Toxic2.Lexer do
   defp skip_to_eol(<<?#, ?{, rest::binary>>, depth), do: skip_to_eol(rest, depth + 1)
   defp skip_to_eol(<<?{, rest::binary>>, depth) when depth > 0, do: skip_to_eol(rest, depth + 1)
   defp skip_to_eol(<<?}, rest::binary>>, depth) when depth > 0, do: skip_to_eol(rest, depth - 1)
+
+  # Depth-0 fast path: outside interpolation the only bytes that matter are `\n` / `\` / `#{`, so
+  # jump straight to the next one with a C-level `:binary.match` instead of byte-recursing the whole
+  # line. The 2-byte `#{` needle means lone `#`s (common in markdown heredocs) are skipped for free.
+  # The matched byte is re-dispatched through the specific clauses above. (depth > 0 — inside `#{…}`,
+  # where `{`/`}` also matter — stays on the byte path below; interpolation bodies are short.)
+  defp skip_to_eol(<<c, _::binary>> = bin, 0) when c != ?\n and c != ?\\ and c != ?# do
+    case :binary.match(bin, heredoc_sig_pattern()) do
+      :nomatch -> :eof
+      {pos, _} -> skip_to_eol(rest_at(bin, pos), 0)
+    end
+  end
+
   defp skip_to_eol(<<_c, rest::binary>>, depth), do: skip_to_eol(rest, depth)
 
   defp frag_of(:string_end), do: :string_fragment
