@@ -1377,7 +1377,7 @@ defmodule Toxic2.Lexer do
   defp read_sigil(<<c::utf8, rest::binary>>, line, col, buf, fs, acc, w, st, {close, _} = sm) do
     if c == close do
       acc = flush_fragment(buf, fs, line, col, acc, :string_fragment)
-      {mlen, after_mods} = take_while(rest, 0, &mod_char?/1)
+      {mlen, after_mods} = take_mods(rest, 0)
       mods = binary_part(rest, 0, mlen)
       acc = [{:sigil_end, line, col, line, col + 1 + mlen, mods} | acc]
       lex(after_mods, line, col + 1 + mlen, acc, w, st)
@@ -1668,7 +1668,7 @@ defmodule Toxic2.Lexer do
 
   # The closer is `\s*<delim>x3` at the start of a line; consume it and emit the end token.
   defp heredoc_close(rest, line, buf, fs, acc, w, st, {_d, _m, _i, _strip, ek}) do
-    {ws, rest2} = take_while(rest, 0, &(&1 in [?\s, ?\t]))
+    {ws, rest2} = take_hspace(rest, 0)
     <<_::binary-size(3), rest3::binary>> = rest2
     col = 1 + ws
     acc = flush_fragment(buf, fs, line, col, acc, frag_of(ek))
@@ -1679,7 +1679,7 @@ defmodule Toxic2.Lexer do
 
   # Only a sigil heredoc takes trailing modifier letters after the closing `"""`.
   defp heredoc_mods(:sigil_end, rest) do
-    {mlen, after_mods} = take_while(rest, 0, &mod_char?/1)
+    {mlen, after_mods} = take_mods(rest, 0)
     {mlen, after_mods, binary_part(rest, 0, mlen)}
   end
 
@@ -1687,7 +1687,7 @@ defmodule Toxic2.Lexer do
 
   # A line is the terminator when, after its indentation, it begins with the delimiter*3.
   defp heredoc_terminator?(line_rest, d) do
-    {_ws, after_ws} = take_while(line_rest, 0, &(&1 in [?\s, ?\t]))
+    {_ws, after_ws} = take_hspace(line_rest, 0)
     heredoc_delim3?(after_ws, d)
   end
 
@@ -1719,7 +1719,7 @@ defmodule Toxic2.Lexer do
   # body for the closing delimiter's indentation (`strip`), and begin. The opener token is already
   # on `acc`; `col` is just past the opening `"""`.
   defp heredoc_body(rest, line, col, acc, w, st, {delim, mode, interp?, end_kind} = spec) do
-    {ows, after_ws} = take_while(rest, 0, &(&1 in [?\s, ?\t]))
+    {ows, after_ws} = take_hspace(rest, 0)
 
     case after_ws do
       <<?\r, ?\n, body::binary>> ->
@@ -1751,7 +1751,7 @@ defmodule Toxic2.Lexer do
   # `pat` is the compiled `heredoc_sig_pattern/0` (the `\n`/`\`/`#{` needle), fetched ONCE by the
   # caller and threaded through so the per-line scan never re-reads it from `:persistent_term`.
   defp heredoc_indent(bin, delim, depth, pat) do
-    {ws, after_ws} = take_while(bin, 0, &(&1 in [?\s, ?\t]))
+    {ws, after_ws} = take_hspace(bin, 0)
 
     cond do
       depth == 0 and heredoc_delim3?(after_ws, delim) -> ws
@@ -1877,6 +1877,14 @@ defmodule Toxic2.Lexer do
   end
 
   defp take_while(<<>>, n, _pred), do: {n, <<>>}
+
+  # Specialized `take_while`s for the two hot fixed predicates — a direct inline guard avoids the
+  # per-byte captured-fun call. Both return `{count, rest}` like `take_while/3`.
+  defp take_hspace(<<c, rest::binary>>, n) when c in [?\s, ?\t], do: take_hspace(rest, n + 1)
+  defp take_hspace(bin, n), do: {n, bin}
+
+  defp take_mods(<<c, rest::binary>>, n) when mod_char?(c), do: take_mods(rest, n + 1)
+  defp take_mods(bin, n), do: {n, bin}
 
   # Length of the maximal `[digit | _]` run (`pred` is digit-only; `_` is allowed here and
   # validated separately by `valid_underscores?/2`).
