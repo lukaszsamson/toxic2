@@ -302,13 +302,21 @@ defmodule Toxic2.Lower do
   # A real node result → attach its source range + token_metadata keys. A bare literal result from a
   # literal-bearing kind → run the literal encoder (keys flow into the encoder meta). Anything else
   # (e.g. a synthetic `nil`) passes through untouched.
-  defp finalize_node(kind, {form, meta, args}, cst, view, opts, acc, nid) when is_list(meta) do
-    {form, ranged_meta, args} = put_node_range({form, meta, args}, cst, opts)
+  defp finalize_node(kind, {_form, meta, _args} = ast, cst, view, opts, acc, nid)
+       when is_list(meta) do
+    # Default fast path: with neither range nor token_metadata, put_node_range/tm_node_keys/tm_anchor
+    # all no-op (range off → unchanged, tm off → [] keys, anchor → meta unchanged), so the whole
+    # decoration reduces to the node itself. Skip the four helper calls + empty-list concat per node.
+    if opts.range or opts.token_metadata do
+      {form, ranged_meta, args} = put_node_range(ast, cst, opts)
 
-    meta =
-      tm_anchor(form, Enum.concat(tm_node_keys(kind, cst, view, opts), ranged_meta), cst, opts)
+      meta =
+        tm_anchor(form, Enum.concat(tm_node_keys(kind, cst, view, opts), ranged_meta), cst, opts)
 
-    {{form, meta, args}, acc, nid}
+      {{form, meta, args}, acc, nid}
+    else
+      {ast, acc, nid}
+    end
   end
 
   defp finalize_node(kind, ast, cst, view, opts, acc, nid) when kind in @literal_node_kinds do
