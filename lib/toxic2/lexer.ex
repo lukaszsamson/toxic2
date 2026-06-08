@@ -162,6 +162,18 @@ defmodule Toxic2.Lexer do
   defguardp is_upper_start(c) when c in ?A..?Z
   defguardp is_word(c) when c in ?a..?z or c in ?A..?Z or c in ?0..?9 or c == ?_
 
+  # Bidirectional formatting controls (Elixir's `?bidi` macro): rejected in comments and strings
+  # because they can visually reorder source against its logical meaning (a security hazard).
+  # A `defguardp` (not a `defp`): every call site is boolean body/guard position, so this expands
+  # inline (`in` → `andalso`/comparison chain) with no function call. Never used as a capture.
+  defguardp bidi?(c)
+            when c in [0x202A, 0x202B, 0x202C, 0x202D, 0x202E, 0x2066, 0x2067, 0x2068, 0x2069]
+
+  # Unsupported line-break characters (Elixir's `?break` macro, 1.20): VT, FF, CR, NEL, LS, PS.
+  # Rejected (an ERROR) in comments and strings/sigils/heredocs — they'd be invisible line breaks.
+  # A bare CR (0x0D) is only valid as part of a CRLF, which every call site handles BEFORE this check.
+  defguardp break?(c) when c in [0x000B, 0x000C, 0x000D, 0x0085, 0x2028, 0x2029]
+
   @doc """
   Tokenize `source` into `{tokens, notices}`, both in **source order**.
 
@@ -1381,16 +1393,6 @@ defmodule Toxic2.Lexer do
     do: sigil_name(rest, n + 1)
 
   defp sigil_name(_bin, n), do: n
-
-  # Bidirectional formatting controls (Elixir's `?bidi` macro): rejected in comments and strings
-  # because they can visually reorder source against its logical meaning (a security hazard).
-  defp bidi?(c),
-    do: c in [0x202A, 0x202B, 0x202C, 0x202D, 0x202E, 0x2066, 0x2067, 0x2068, 0x2069]
-
-  # Unsupported line-break characters (Elixir's `?break` macro, 1.20): VT, FF, CR, NEL, LS, PS.
-  # Rejected (an ERROR) in comments and strings/sigils/heredocs — they'd be invisible line breaks.
-  # A bare CR (0x0D) is only valid as part of a CRLF, which every call site handles BEFORE this check.
-  defp break?(c), do: c in [0x000B, 0x000C, 0x000D, 0x0085, 0x2028, 0x2029]
 
   # Scan a (to-be-dropped) comment for a bidi/break control; emit a lexer error at the first one.
   defp comment_bidi_check(bin, line, col, acc) do
