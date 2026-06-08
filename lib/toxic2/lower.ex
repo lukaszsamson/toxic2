@@ -2188,16 +2188,18 @@ defmodule Toxic2.Lower do
     end
   end
 
-  # Thread the accumulator while lowering a list of children.
-  defp lower_each(children, view, opts, acc, nid) do
-    {rev, acc, nid} =
-      Enum.reduce(children, {[], acc, nid}, fn child, {asts, a, n} ->
-        {ast, a, n} = lower(child, view, opts, a, n)
-        {[ast | asts], a, n}
-      end)
+  # Thread the accumulator while lowering a list of children. Direct recursion rather than an
+  # Enum.reduce closure (no per-element apply / closure frame) — this is the central child-list
+  # walker, called from lists, tuples, maps, clauses, args, blocks, …
+  defp lower_each(children, view, opts, acc, nid),
+    do: lower_each(children, view, opts, acc, nid, [])
 
-    {:lists.reverse(rev), acc, nid}
+  defp lower_each([child | rest], view, opts, acc, nid, asts) do
+    {ast, acc, nid} = lower(child, view, opts, acc, nid)
+    lower_each(rest, view, opts, acc, nid, [ast | asts])
   end
+
+  defp lower_each([], _view, _opts, acc, nid, asts), do: {:lists.reverse(asts), acc, nid}
 
   # --- error nodes (invalid CST; never raises) ---------------------------
 
