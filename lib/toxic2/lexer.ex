@@ -174,6 +174,15 @@ defmodule Toxic2.Lexer do
   # A bare CR (0x0D) is only valid as part of a CRLF, which every call site handles BEFORE this check.
   defguardp break?(c) when c in [0x000B, 0x000C, 0x000D, 0x0085, 0x2028, 0x2029]
 
+  # Radix digit / sigil-modifier char classes. `defguardp` (defined here, ahead of every use) so the
+  # membership test inlines in guard/body position; they double as the `&dec?/1` etc. captures fed to
+  # `run_len`/`take_while` (a defguard generates a real capturable function alongside the macro).
+  defguardp dec?(c) when c in ?0..?9
+  defguardp hex?(c) when c in ?0..?9 or c in ?a..?f or c in ?A..?F
+  defguardp oct?(c) when c in ?0..?7
+  defguardp bin?(c) when c in [?0, ?1]
+  defguardp mod_char?(c) when c in ?a..?z or c in ?A..?Z or c in ?0..?9
+
   @doc """
   Tokenize `source` into `{tokens, notices}`, both in **source order**.
 
@@ -1385,8 +1394,6 @@ defmodule Toxic2.Lexer do
   defp read_sigil(<<byte, rest::binary>>, line, col, buf, fs, acc, w, st, sm),
     do: read_sigil(rest, line, col + 1, [<<byte>> | buf], fs, acc, w, st, sm)
 
-  defp mod_char?(c), do: c in ?a..?z or c in ?A..?Z or c in ?0..?9
-
   # A sigil name is the run of letters/digits after `~` (single lowercase, or one-or-more
   # uppercase — the oracle judges validity; we just measure the run). Returns its length.
   defp sigil_name(<<c, rest::binary>>, n) when c in ?a..?z or c in ?A..?Z or c in ?0..?9,
@@ -1944,11 +1951,6 @@ defmodule Toxic2.Lexer do
   defp radix(b) when b in [?x, ?X], do: {16, &hex?/1}
   defp radix(b) when b in [?o, ?O], do: {8, &oct?/1}
   defp radix(b) when b in [?b, ?B], do: {2, &bin?/1}
-
-  defp dec?(c), do: c in ?0..?9
-  defp hex?(c), do: c in ?0..?9 or c in ?a..?f or c in ?A..?F
-  defp oct?(c), do: c in ?0..?7
-  defp bin?(c), do: c in [?0, ?1]
 
   defp delim_kind(?(), do: :"("
   defp delim_kind(?)), do: :")"
