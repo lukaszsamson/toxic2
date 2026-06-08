@@ -1923,7 +1923,14 @@ defmodule Toxic2.Lexer do
     cont(rest_at(bin, len), {:error, line, col, line, col + len, err}, acc, w, st)
   end
 
-  defp strip_underscores(bin), do: :binary.replace(bin, "_", "", [:global])
+  # Most numeric literals have no `_`; skip the (allocating, pattern-compiling) global replace for
+  # them with a cheap `:binary.match` reject.
+  defp strip_underscores(bin) do
+    case :binary.match(bin, "_") do
+      :nomatch -> bin
+      _ -> :binary.replace(bin, "_", "", [:global])
+    end
+  end
 
   defp skip_spaces_tabs(<<c, rest::binary>>) when c in [?\s, ?\t], do: skip_spaces_tabs(rest)
   defp skip_spaces_tabs(bin), do: bin
