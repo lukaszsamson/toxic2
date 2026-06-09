@@ -27,6 +27,9 @@ defmodule Toxic2.CST do
 
   import Bitwise
 
+  # `flags/1` runs once per child of every node built (via `inherit/2`); inline it there.
+  @compile {:inline, flags: 1, set_if: 3, category_bit: 1}
+
   # Bit positions (kept as literals so the attributes need no Bitwise at definition time).
   @flag_has_error 1
   @flag_synthetic 2
@@ -176,9 +179,12 @@ defmodule Toxic2.CST do
 
   defp flag?(cst, bit), do: (flags(cst) &&& bit) != 0
 
-  defp inherit(base, children) do
-    Enum.reduce(children, base, fn child, acc -> bor(acc, flags(child) &&& @inheritable) end)
-  end
+  # Direct recursion, not Enum.reduce — this runs once per child of EVERY node built, and the
+  # closure + per-child fun call were ~8% of parse-stage time under eprof.
+  defp inherit(base, [child | rest]),
+    do: inherit(bor(base, flags(child) &&& @inheritable), rest)
+
+  defp inherit(base, []), do: base
 
   defp set_if(flags, true, bit), do: bor(flags, bit)
   defp set_if(flags, false, _bit), do: flags

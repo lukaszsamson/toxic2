@@ -71,6 +71,35 @@ defmodule Toxic2.Parser do
 
   defp t_eof?({_toks, size, _cont}, i), do: i >= size
 
+  # Parser-LOCAL CST reads + the two hottest tiny remote helpers (`Tokens.span/2` was ~97k calls,
+  # `CST.token/1` ~79k — both trivial bodies). Constructors that do real work (`CST.node`,
+  # `CST.missing`) stay remote.
+  @compile {:inline, tspan: 2, ctoken: 1, ctag: 1, ckind: 1, cchildren: 1, ctoki: 1, cspan: 1}
+
+  defp tspan(t, i) do
+    case tt(t, i) do
+      :eof -> nil
+      tok -> {elem(tok, 1), elem(tok, 2), elem(tok, 3), elem(tok, 4)}
+    end
+  end
+
+  defp ctoken(index), do: {:token, index, 0, []}
+
+  defp ctag(cst), do: elem(cst, 0)
+
+  defp ckind({:node, kind, _sp, _ch, _f, _d}), do: kind
+  defp ckind({:missing, expected, _ai, _f, _d}), do: expected
+  defp ckind({:token, _i, _f, _d}), do: :token
+
+  defp cchildren({:node, _k, _sp, ch, _f, _d}), do: ch
+  defp cchildren(_leaf), do: []
+
+  defp ctoki({:token, i, _f, _d}), do: i
+  defp ctoki(_cst), do: nil
+
+  defp cspan({:node, _k, sp, _ch, _f, _d}), do: sp
+  defp cspan(_leaf), do: nil
+
   @fuel_base 1_000
 
   @atomic_kinds [:int, :flt, :char, :atom, :literal, :identifier, :capture_int]
@@ -325,10 +354,10 @@ defmodule Toxic2.Parser do
   # or a single argument that is itself a no-parens expr (`g a, b` → no_parens_one_ambig). A plain
   # single-arg call (`f a`) is a `matched_expr`, which is fine.
   defp no_parens_expr?(arg) do
-    kind = CST.tag(arg) == :node and CST.node_kind(arg)
+    kind = ctag(arg) == :node and ckind(arg)
 
     if kind in [:np_call, :remote_call] and CST.category(arg) == :no_parens do
-      args = np_call_args(kind, CST.children(arg))
+      args = np_call_args(kind, cchildren(arg))
 
       # a trailing run of keyword pairs is ONE argument (`f a: 1, b: 2` is `call_args_no_parens_kw`,
       # a single kw-list arg), so it is NOT `no_parens_many`; only ≥2 positional groups are.
@@ -354,7 +383,7 @@ defmodule Toxic2.Parser do
   defp maybe_ambiguous_pipe(t, i, rhs, diags, nid) do
     if tk(t, i) == :arrow_op and np_call?(rhs) do
       {_id, diags, nid} =
-        Diagnostics.emit(diags, nid, :parser, :warning, :ambiguous_pipe, Tokens.span(t, i), %{})
+        Diagnostics.emit(diags, nid, :parser, :warning, :ambiguous_pipe, tspan(t, i), %{})
 
       {diags, nid}
     else
@@ -363,10 +392,10 @@ defmodule Toxic2.Parser do
   end
 
   defp np_call?(node) do
-    kind = CST.tag(node) == :node and CST.node_kind(node)
+    kind = ctag(node) == :node and ckind(node)
 
     kind in [:np_call, :remote_call] and CST.category(node) == :no_parens and
-      np_call_args(kind, CST.children(node)) != []
+      np_call_args(kind, cchildren(node)) != []
   end
 
   # `foo do end <- bar baz, x` — an expression ending in a `do…end` block, followed by an operator
@@ -382,7 +411,7 @@ defmodule Toxic2.Parser do
           :parser,
           :warning,
           :no_parens_after_do_op,
-          Tokens.span(t, i),
+          tspan(t, i),
           %{}
         )
 
@@ -410,7 +439,7 @@ defmodule Toxic2.Parser do
   # the node, next index, and whether it was a keyword pair (for keyword-last enforcement).
   defp parse_np_arg(t, i, diags, nid, fuel) do
     if tk(t, i) == :kw_identifier do
-      key = CST.token(i)
+      key = ctoken(i)
       # A newline is allowed after `key:` before the value (`[a:\n1]`, `f(a:\n1)`).
       {val, j, diags, nid, fuel} =
         parse_expr(t, skip_eols(t, i + 1), 0, :no_parens_arg, diags, nid, fuel - 1)
@@ -443,7 +472,7 @@ defmodule Toxic2.Parser do
   # string/charlist/heredoc is unambiguous, so it may be ADJACENT — `foo"bar"` => `foo("bar")`,
   # `Mix.shell().info"""…"""` => the heredoc is the argument.
   defp np_arg_start?(t, lhs, i) do
-    case {cst_span(t, lhs), Tokens.span(t, i)} do
+    case {cst_span(t, lhs), tspan(t, i)} do
       {{_, _, el, ec}, {sl, sc, _, _}} when el == sl and ec <= sc ->
         case tk(t, i) do
           k when k in [:string_start, :charlist_start] -> true
@@ -596,13 +625,13 @@ defmodule Toxic2.Parser do
   end
 
   defp cst_ends_at?(t, cst, sl, sc) do
-    case CST.tag(cst) do
+    case ctag(cst) do
       :token ->
-        tok = Tokens.token(t, CST.token_index(cst))
+        tok = Tokens.token(t, ctoki(cst))
         elem(tok, 3) == sl and elem(tok, 4) == sc
 
       :node ->
-        {_, _, el, ec} = CST.span(cst)
+        {_, _, el, ec} = cspan(cst)
         el == sl and ec == sc
 
       :missing ->
@@ -672,10 +701,10 @@ defmodule Toxic2.Parser do
   end
 
   defp paren_callee?(t, lhs, 0),
-    do: CST.tag(lhs) == :token and tk(t, CST.token_index(lhs)) == :identifier
+    do: ctag(lhs) == :token and tk(t, ctoki(lhs)) == :identifier
 
   defp paren_callee?(_t, lhs, 1),
-    do: CST.tag(lhs) == :node and CST.node_kind(lhs) in [:call, :remote_call, :anon_call]
+    do: ctag(lhs) == :node and ckind(lhs) in [:call, :remote_call, :anon_call]
 
   defp paren_callee?(_t, _lhs, _pdepth), do: false
 
@@ -686,13 +715,13 @@ defmodule Toxic2.Parser do
 
     case tk(t, j) do
       :alias ->
-        segs = if alias_node?(lhs), do: CST.children(lhs), else: [lhs]
+        segs = if alias_node?(lhs), do: cchildren(lhs), else: [lhs]
 
         node =
           CST.node(
             :alias,
             merge_ct(t, lhs, j),
-            Enum.concat(segs, [CST.token(j)]),
+            Enum.concat(segs, [ctoken(j)]),
             :matched,
             nil
           )
@@ -774,7 +803,7 @@ defmodule Toxic2.Parser do
   end
 
   defp remote_call(t, name_i, lhs, ctx, diags, nid, fuel) do
-    name = CST.token(name_i)
+    name = ctoken(name_i)
 
     if tk(t, name_i + 1) == :"(" and Tokens.adjacent?(t, name_i, name_i + 1) do
       {args, k, diags, nid, fuel} = parse_seq(t, name_i + 2, :")", :call, diags, nid, fuel)
@@ -820,7 +849,7 @@ defmodule Toxic2.Parser do
     end
   end
 
-  defp alias_node?(cst), do: CST.tag(cst) == :node and CST.node_kind(cst) == :alias
+  defp alias_node?(cst), do: ctag(cst) == :node and ckind(cst) == :alias
 
   defp led(_t, i, lhs, _min_bp, _ctx, diags, nid, fuel) when fuel <= 0,
     do: {lhs, i, diags, nid, fuel}
@@ -899,7 +928,7 @@ defmodule Toxic2.Parser do
   defp led_infix(t, i, lhs, min_bp, ctx, diags, nid, fuel) do
     case Precedence.infix(tk(t, i)) do
       {prec, assoc} when prec >= min_bp ->
-        op_leaf = CST.token(i)
+        op_leaf = ctoken(i)
         next_min = if assoc == :left, do: prec + 1, else: prec
         rhs_start = skip_eols(t, i + 1)
 
@@ -1001,11 +1030,11 @@ defmodule Toxic2.Parser do
 
     cond do
       kind in @atomic_kinds ->
-        {CST.token(i), i + 1, diags, nid, fuel}
+        {ctoken(i), i + 1, diags, nid, fuel}
 
       # An alias is a 1-segment alias node; `.Alias` postfixes extend its segments.
       kind == :alias ->
-        {CST.node(:alias, tok_span(t, i), [CST.token(i)], :matched, nil), i + 1, diags, nid, fuel}
+        {CST.node(:alias, tok_span(t, i), [ctoken(i)], :matched, nil), i + 1, diags, nid, fuel}
 
       kind == :error ->
         {id, diags, nid} = emit_lex_error(t, i, diags, nid)
@@ -1016,8 +1045,7 @@ defmodule Toxic2.Parser do
       # `/arity` is an ordinary division in the led loop. The `/` guard keeps this from changing
       # any other use of these operators.
       kind in @op_ref_kinds and op_ref_slash?(t, i + 1) ->
-        {CST.node(:op_ref, tok_span(t, i), [CST.token(i)], :matched, nil), i + 1, diags, nid,
-         fuel}
+        {CST.node(:op_ref, tok_span(t, i), [ctoken(i)], :matched, nil), i + 1, diags, nid, fuel}
 
       # `..` / `...` with no left operand: `..` is nullary only (`{:.., [], []}`); `...` is nullary
       # (`{:..., [], []}`) or unary when an operand follows (`...x` => `{:..., [], [x]}`).
@@ -1076,7 +1104,7 @@ defmodule Toxic2.Parser do
   # trailing modifiers) — lowering reads name + modifiers from those leaves.
   defp parse_sigil(t, start_i, diags, nid, fuel) do
     {children, j, diags, nid, fuel} =
-      sigil_parts(t, start_i + 1, [CST.token(start_i)], diags, nid, fuel)
+      sigil_parts(t, start_i + 1, [ctoken(start_i)], diags, nid, fuel)
 
     span = merge_tt(t, start_i, j - 1)
     {CST.node(:sigil, span, children, :matched, nil), j, diags, nid, fuel}
@@ -1090,7 +1118,7 @@ defmodule Toxic2.Parser do
   end
 
   defp sigil_part(:string_fragment, t, i, acc, diags, nid, fuel),
-    do: sigil_parts(t, i + 1, [CST.token(i) | acc], diags, nid, fuel)
+    do: sigil_parts(t, i + 1, [ctoken(i) | acc], diags, nid, fuel)
 
   defp sigil_part(:begin_interpolation, t, i, acc, diags, nid, fuel) do
     {interp, j, diags, nid, fuel} = parse_interp(t, i, diags, nid, fuel)
@@ -1098,7 +1126,7 @@ defmodule Toxic2.Parser do
   end
 
   defp sigil_part(:sigil_end, _t, i, acc, diags, nid, fuel),
-    do: {:lists.reverse([CST.token(i) | acc]), i + 1, diags, nid, fuel}
+    do: {:lists.reverse([ctoken(i) | acc]), i + 1, diags, nid, fuel}
 
   defp sigil_part(:error, t, i, acc, diags, nid, fuel) do
     {id, diags, nid} = emit_lex_error(t, i, diags, nid)
@@ -1128,7 +1156,7 @@ defmodule Toxic2.Parser do
 
   defp quoted_part(frag, t, i, acc, diags, nid, fuel)
        when frag in [:string_fragment, :charlist_fragment],
-       do: quoted_parts(t, i + 1, [CST.token(i) | acc], diags, nid, fuel)
+       do: quoted_parts(t, i + 1, [ctoken(i) | acc], diags, nid, fuel)
 
   defp quoted_part(:begin_interpolation, t, i, acc, diags, nid, fuel) do
     {interp, j, diags, nid, fuel} = parse_interp(t, i, diags, nid, fuel)
@@ -1295,7 +1323,7 @@ defmodule Toxic2.Parser do
   # `1 ->` with no expression after the `->` (`case x do 1 -> end`, `fn -> end`) — Elixir warns an
   # expression is always required on the right side of `->`. The body is an empty `:stab_body`.
   defp maybe_empty_stab_warn(t, arrow_i, body, diags, nid) do
-    if CST.tag(body) == :node and CST.node_kind(body) == :stab_body and CST.children(body) == [] do
+    if ctag(body) == :node and ckind(body) == :stab_body and cchildren(body) == [] do
       {_id, diags, nid} =
         Diagnostics.emit(
           diags,
@@ -1431,7 +1459,7 @@ defmodule Toxic2.Parser do
   # `x 1, 2, 3` is ONE pattern (`x(1, 2, 3)`), and a keyword value may be one too (`a: b c, d`).
   defp head_pattern(t, i, diags, nid, fuel) do
     if tk(t, i) == :kw_identifier do
-      key = CST.token(i)
+      key = ctoken(i)
 
       {val, j, diags, nid, fuel} =
         parse_expr(t, skip_eols(t, i + 1), 0, :no_parens, diags, nid, fuel - 1)
@@ -1580,7 +1608,7 @@ defmodule Toxic2.Parser do
   end
 
   defp parse_sections(t, i, acc, diags, nid, fuel) do
-    label = CST.token(i)
+    label = ctoken(i)
     {body, j, diags, nid, fuel} = parse_section_body(t, i + 1, diags, nid, fuel)
 
     section =
@@ -1853,7 +1881,7 @@ defmodule Toxic2.Parser do
       {:lists.reverse(acc), i + 1, diags, nid, fuel}
     else
       {entry, j, diags, nid, fuel} = parse_map_entry(t, i, diags, nid, fuel)
-      is_kw = CST.node_kind(entry) == :kw_pair
+      is_kw = ckind(entry) == :kw_pair
       {diags, nid} = check_kw_last(seen_kw, is_kw, t, entry, diags, nid)
       map_rest(t, j, [entry | acc], seen_kw or is_kw, diags, nid, fuel)
     end
@@ -1861,7 +1889,7 @@ defmodule Toxic2.Parser do
 
   defp parse_map_entry(t, i, diags, nid, fuel) do
     if tk(t, i) == :kw_identifier do
-      key = CST.token(i)
+      key = ctoken(i)
 
       {val, j, diags, nid, fuel} =
         parse_expr(t, skip_eols(t, i + 1), 0, :matched, diags, nid, fuel - 1)
@@ -1927,7 +1955,7 @@ defmodule Toxic2.Parser do
 
   defp check_container_lead(_kind, _t, _elems, diags, nid), do: {diags, nid}
 
-  defp kw_pair_node?(cst), do: CST.tag(cst) == :node and CST.node_kind(cst) == :kw_pair
+  defp kw_pair_node?(cst), do: ctag(cst) == :node and ckind(cst) == :kw_pair
 
   # Comma-separated elements up to `close`. `mode` (`:list | :tuple | :bitstring | :call`) controls
   # the permissive-grammar edges: a trailing comma is allowed everywhere except calls; keyword
@@ -2024,7 +2052,7 @@ defmodule Toxic2.Parser do
     ctx = if mode == :call, do: :no_parens, else: :matched
 
     if tk(t, i) == :kw_identifier do
-      key = CST.token(i)
+      key = ctoken(i)
 
       # A keyword VALUE is a single `matched_expr` (`f(a: g b)` => `g(b)`), NOT a `:no_parens`
       # call that grabs the outer commas — `f(a: g b, c)` is rejected (keyword-not-last).
@@ -2056,7 +2084,7 @@ defmodule Toxic2.Parser do
   defp check_np_kw_last(val, t, j, diags, nid) do
     # A no-parens-call value ending in a `do … end` block is unambiguous, so it may be followed by
     # more keywords (`f(a: case x do … end, b: 1)`); only a bare no-parens call is keyword-last.
-    if CST.tag(val) == :node and CST.node_kind(val) == :np_call and not has_do_block?(val) and
+    if ctag(val) == :node and ckind(val) == :np_call and not has_do_block?(val) and
          tk(t, skip_eols(t, j)) == :"," do
       {_id, diags, nid} =
         Diagnostics.emit(
@@ -2177,7 +2205,7 @@ defmodule Toxic2.Parser do
   # (`...a + b` => `...(a + b)`); otherwise — and always for `..` — it's nullary (`{:.., [], []}`).
   @ellipsis_operand_bp 90
   defp parse_dotdot(t, i, kind, ctx, diags, nid, fuel) do
-    op_leaf = CST.token(i)
+    op_leaf = ctoken(i)
     operand_start = skip_eols(t, i + 1)
     op_ctx = if ctx in [:no_parens, :no_parens_arg], do: ctx, else: :matched
 
@@ -2204,7 +2232,7 @@ defmodule Toxic2.Parser do
   end
 
   defp parse_unary(t, i, prefix_bp, ctx, diags, nid, fuel) do
-    op_leaf = CST.token(i)
+    op_leaf = ctoken(i)
     operand_start = skip_eols(t, i + 1)
     # In a no-parens context the operand may itself be a multi-arg no-parens call: `@foo 1, 2`,
     # `-foo 1, 2`, `not bar :a, :b`. Inside brackets/parens it stays a single-arg `matched_expr`.
@@ -2427,15 +2455,15 @@ defmodule Toxic2.Parser do
   # --- span resolution ---------------------------------------------------
 
   defp cst_span(t, cst) do
-    case CST.tag(cst) do
-      :node -> CST.span(cst)
-      :token -> Tokens.span(t, CST.token_index(cst))
+    case ctag(cst) do
+      :node -> cspan(cst)
+      :token -> tspan(t, ctoki(cst))
       :missing -> anchor_span(t, CST.anchor_index(cst))
     end
   end
 
   defp anchor_span(t, ai) do
-    case Tokens.span(t, ai) do
+    case tspan(t, ai) do
       nil -> eof_span(t)
       {sl, sc, _el, _ec} -> {sl, sc, sl, sc}
     end
@@ -2490,7 +2518,7 @@ defmodule Toxic2.Parser do
   defp merge_tc(t, i, {:token, j, _f, _d}), do: merge_tt(t, i, j)
   defp merge_tc(t, i, b), do: merge(tok_span(t, i), cst_span(t, b))
 
-  defp tok_span(t, i), do: Tokens.span(t, i) || eof_span(t)
+  defp tok_span(t, i), do: tspan(t, i) || eof_span(t)
 
   defp eof_span(t) do
     case Tokens.size(t) do
@@ -2498,7 +2526,7 @@ defmodule Toxic2.Parser do
         {1, 1, 1, 1}
 
       n ->
-        {_, _, el, ec} = Tokens.span(t, n - 1)
+        {_, _, el, ec} = tspan(t, n - 1)
         {el, ec, el, ec}
     end
   end

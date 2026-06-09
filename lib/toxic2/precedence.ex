@@ -54,11 +54,24 @@ defmodule Toxic2.Precedence do
   # builds lowers to `{:&, _, [operand]}`; `&N` is the atomic `:capture_int` leaf.
   @prefix %{unary_op: 300, at_op: 320, dual_op: 300, capture_op: 90}
 
+  # Both lookups are generated atom-dispatch clauses (the `{prec, assoc}` tuples become shared
+  # literals) instead of `Map.get` — the Pratt loop probes them on every led/nud step, and the two
+  # `Map.get`s were ~4.5% of all parser-stage calls under eprof. The maps stay the single source
+  # of truth (they also drive the precedence pin tests).
+
   @doc "Infix `{precedence, associativity}` for a family, or `nil` if it is not a led operator."
   @spec infix(atom()) :: {pos_integer(), assoc()} | nil
-  def infix(family), do: Map.get(@infix, family)
+  for {family, pa} <- @infix do
+    def infix(unquote(family)), do: unquote(Macro.escape(pa))
+  end
+
+  def infix(_family), do: nil
 
   @doc "Operand binding power for a prefix family, or `nil` if it is not a nud operator."
   @spec prefix(atom()) :: pos_integer() | nil
-  def prefix(family), do: Map.get(@prefix, family)
+  for {family, bp} <- @prefix do
+    def prefix(unquote(family)), do: unquote(bp)
+  end
+
+  def prefix(_family), do: nil
 end
