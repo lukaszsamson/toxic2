@@ -22,6 +22,44 @@ defmodule Toxic2.Lower do
   # Narrow inlining of tiny LOCAL meta builders on the hot per-node path (A/B-measured).
   @compile {:inline, tmeta: 2, op_atom: 2, op_meta: 2, span_meta: 1}
 
+  # Lower-LOCAL token-view and CST reads (the perf-pass-6 parser pattern): `Tokens.kind/value/
+  # token` and `CST.tag/token_index/node_kind/children/span` are cross-module — a callee-module
+  # `@compile :inline` can't reach them, and together they were ~13% of lower-stage calls under
+  # eprof. These read the view/CST tuples directly and inline into the walkers.
+  @compile {:inline, tk: 2, tv: 2, tt: 2, ctag: 1, ctoki: 1, ckind: 1, cchildren: 1, cspan: 1}
+  @compile {:inline, range_enabled?: 1, maybe_token_range: 4, with_range: 3, kw_pair?: 1}
+
+  defp tk({toks, size, _cont}, i) when i >= 0 and i < size, do: elem(elem(toks, i), 0)
+  defp tk(_t, _i), do: :eof
+
+  defp tv({toks, size, _cont}, i) when i >= 0 and i < size, do: elem(elem(toks, i), 5)
+  defp tv(_t, _i), do: nil
+
+  defp tt({toks, size, _cont}, i) when i >= 0 and i < size, do: elem(toks, i)
+  defp tt(_t, _i), do: :eof
+
+  defp tspan(t, i) do
+    case tt(t, i) do
+      :eof -> nil
+      tok -> {elem(tok, 1), elem(tok, 2), elem(tok, 3), elem(tok, 4)}
+    end
+  end
+
+  defp ctag(cst), do: elem(cst, 0)
+
+  defp ctoki({:token, i, _f, _d}), do: i
+  defp ctoki(_cst), do: nil
+
+  defp ckind({:node, kind, _sp, _ch, _f, _d}), do: kind
+  defp ckind({:missing, expected, _ai, _f, _d}), do: expected
+  defp ckind({:token, _i, _f, _d}), do: :token
+
+  defp cchildren({:node, _k, _sp, ch, _f, _d}), do: ch
+  defp cchildren(_leaf), do: []
+
+  defp cspan({:node, _k, sp, _ch, _f, _d}), do: sp
+  defp cspan(_leaf), do: nil
+
   @type ast :: Macro.t()
 
   @doc """
@@ -67,9 +105,27 @@ defmodule Toxic2.Lower do
   # Split into lines for codepoint-column scanning. A CRLF file leaves a trailing `\r` on each line;
   # strip it so an end-of-line scan sees the line end where the `\r\n` begins (matching Elixir, which
   # treats `\r\n` as the newline). The actual column numbers come from the lexer, not from here.
+  # The trim is gated on the SOURCE containing a `\r` at all (one C-level scan): for an LF-only file
+  # — the common case — the per-line `String.trim_trailing` pass was ~8% of the whole lower stage
+  # (eprof: `String.replace_trailing/6` + `binary:copy/2` per line). `chomp_cr/1` keeps the exact
+  # trim_trailing semantics (strips ALL trailing `\r`s) via a direct byte check, no String machinery.
   defp source_lines(source) do
-    source |> String.split("\n") |> Enum.map(&String.trim_trailing(&1, "\r")) |> List.to_tuple()
+    lines = String.split(source, "\n")
+
+    case :binary.match(source, "\r") do
+      :nomatch -> List.to_tuple(lines)
+      _ -> lines |> Enum.map(&chomp_cr/1) |> List.to_tuple()
+    end
   end
+
+  defp chomp_cr(line) when byte_size(line) > 0 do
+    case :binary.last(line) do
+      ?\r -> chomp_cr(binary_part(line, 0, byte_size(line) - 1))
+      _ -> line
+    end
+  end
+
+  defp chomp_cr(line), do: line
 
   # Raw source text spanning `{sl,sc}`..`{el,ec}` (codepoint columns, end-exclusive), or `nil`.
   defp src_slice(%{source_lines: lines}, {sl, sc}, {el, ec}) when is_tuple(lines) and sl == el,
@@ -195,7 +251,7 @@ defmodule Toxic2.Lower do
   end
 
   defp lower(cst, view, opts, acc, nid) do
-    case CST.tag(cst) do
+    case ctag(cst) do
       :token -> lower_token(cst, view, opts, acc, nid)
       :missing -> {error_ast(cst, view), acc, nid}
       :node -> lower_node(cst, view, opts, acc, nid)
@@ -203,12 +259,12 @@ defmodule Toxic2.Lower do
   end
 
   defp lower_token(cst, view, opts, acc, nid) do
-    idx = CST.token_index(cst)
-    val = Tokens.value(view, idx)
+    idx = ctoki(cst)
+    val = tv(view, idx)
     # Leaf nodes are fresh (no passthrough), so the token's own span IS the range.
     meta = tmeta(view, idx) |> maybe_token_range(view, idx, opts)
 
-    case Tokens.kind(view, idx) do
+    case tk(view, idx) do
       :int -> lit(val, view, idx, opts, acc, nid, tm_token(view, idx, opts))
       :flt -> lit(val, view, idx, opts, acc, nid, tm_token(view, idx, opts))
       :char -> lit(val, view, idx, opts, acc, nid, tm_token(view, idx, opts))
@@ -242,7 +298,7 @@ defmodule Toxic2.Lower do
         {value, acc, nid}
 
       enc ->
-        span = Tokens.span(view, idx)
+        span = tspan(view, idx)
         run_encoder_meta(enc, value, Enum.concat(extra, literal_meta(span, opts)), span, acc, nid)
     end
   end
@@ -284,7 +340,7 @@ defmodule Toxic2.Lower do
 
   # Token spans are only materialized when ranges are on (keeps the default lowering allocation-lean).
   defp maybe_token_range(meta, view, idx, opts) do
-    if range_enabled?(opts), do: with_range(meta, Tokens.span(view, idx), opts), else: meta
+    if range_enabled?(opts), do: with_range(meta, tspan(view, idx), opts), else: meta
   end
 
   # Node kinds that lower to a bare LITERAL value (not a `{form, meta, args}` node) when they hold
@@ -294,8 +350,8 @@ defmodule Toxic2.Lower do
 
   # One trivial clause per node kind (keeps each clause's cyclomatic complexity at 1).
   defp lower_node(cst, view, opts, acc, nid) do
-    kind = CST.node_kind(cst)
-    {ast, acc, nid} = lower_kind(kind, CST.children(cst), cst, view, opts, acc, nid)
+    kind = ckind(cst)
+    {ast, acc, nid} = lower_kind(kind, cchildren(cst), cst, view, opts, acc, nid)
     finalize_node(kind, ast, cst, view, opts, acc, nid)
   end
 
@@ -337,7 +393,7 @@ defmodule Toxic2.Lower do
         {ast, acc, nid}
 
       enc ->
-        span = CST.span(cst)
+        span = cspan(cst)
         meta = Enum.concat(tm_node_keys(kind, cst, view, opts), literal_meta(span, opts))
         run_encoder_meta(enc, ast, meta, span, acc, nid)
     end
@@ -362,7 +418,7 @@ defmodule Toxic2.Lower do
   # The argument BEGINS with a space-separated unary `+`/`-` — either directly (`foo -1`) or as the
   # leftmost operand of a wider expression (`@spec -float :: float`, where the arg is `… :: …`).
   defp leading_unary_pm?({:node, :unary_op, _sp, [op_leaf | _], _f, _d}, view),
-    do: CST.tag(op_leaf) == :token and Tokens.value(view, CST.token_index(op_leaf)) in [:+, :-]
+    do: ctag(op_leaf) == :token and tv(view, ctoki(op_leaf)) in [:+, :-]
 
   defp leading_unary_pm?({:node, :binary_op, _sp, [left | _], _f, _d}, view),
     do: leading_unary_pm?(left, view)
@@ -427,7 +483,7 @@ defmodule Toxic2.Lower do
   # A map opens with `%{` (2) when written `%{…}`, but only `{` (1) as a struct's inner map
   # (`%Foo{…}`, where the `%` sits on the struct node), so measure the leading `%` from the source.
   defp open_scan_pos(kind, cst, _view, opts) when kind in [:map, :map_update] do
-    case CST.span(cst) do
+    case cspan(cst) do
       {sl, sc, _el, _ec} ->
         len = if src_slice(opts, {sl, sc}, {sl, sc + 1}) == "%", do: 2, else: 1
         {sl, sc + len}
@@ -438,7 +494,7 @@ defmodule Toxic2.Lower do
   end
 
   defp open_scan_pos(kind, cst, _view, _opts) do
-    case CST.span(cst) do
+    case cspan(cst) do
       {sl, sc, _el, _ec} -> {sl, sc + open_delim_len(kind)}
       _ -> nil
     end
@@ -450,7 +506,7 @@ defmodule Toxic2.Lower do
   # The position just past the `(` following child `idx` (the callee / member name) — or `nil` when
   # the next char is not `(` (a paren-less call, which has no open-delimiter newlines).
   defp after_open_paren(cst, idx, view, opts) do
-    with child when not is_nil(child) <- CST.children(cst) |> Enum.at(idx),
+    with child when not is_nil(child) <- cchildren(cst) |> Enum.at(idx),
          {_, _, el, ec} <- child_span(child, view),
          "(" <- src_slice(opts, {el, ec}, {el, ec + 1}) do
       {el, ec + 1}
@@ -462,7 +518,7 @@ defmodule Toxic2.Lower do
   # `foo.(…)` / `Foo.{…}` — the open delimiter is the char one past the base's `.` (two past the base
   # end). Returns the position just inside it, or `nil` if the expected delimiter isn't there.
   defp after_dot_delim(cst, delim, view, opts) do
-    with child when not is_nil(child) <- CST.children(cst) |> Enum.at(0),
+    with child when not is_nil(child) <- cchildren(cst) |> Enum.at(0),
          {_, _, el, ec} <- child_span(child, view),
          ^delim <- src_slice(opts, {el, ec + 1}, {el, ec + 2}) do
       {el, ec + 2}
@@ -478,7 +534,7 @@ defmodule Toxic2.Lower do
 
   defp tm_anchor(_form, meta, cst, opts) do
     if tm?(opts) and not Keyword.has_key?(meta, :line) do
-      case CST.span(cst) do
+      case cspan(cst) do
         {sl, sc, _el, _ec} -> Enum.concat(meta, line: sl, column: sc)
         _ -> meta
       end
@@ -517,7 +573,7 @@ defmodule Toxic2.Lower do
   end
 
   defp stab_head_patterns(args_node) do
-    case CST.children(args_node) do
+    case cchildren(args_node) do
       [{:node, :stab_when, _sp, when_ch, _f, _d}] -> Enum.drop(when_ch, -1)
       children -> children
     end
@@ -544,7 +600,7 @@ defmodule Toxic2.Lower do
   # Where to begin scanning for the clause `->`: after the last pattern (so its text can't contain a
   # false `->`); for an empty head (`fn -> …`) there is no pattern, so start at the head's span start.
   defp arrow_scan_start(args_node, view) do
-    case CST.children(args_node) do
+    case cchildren(args_node) do
       [] ->
         with({sl, sc, _, _} <- child_span(args_node, view), do: {sl, sc}, else: (_ -> nil))
 
@@ -591,7 +647,7 @@ defmodule Toxic2.Lower do
   # span start for strings/charlists, after the leading `:` for quoted atoms, and after `~` + the
   # sigil name for sigils. A heredoc opens with the quote tripled (`"""` / `'''`).
   defp delimiter_keys(kind, cst, opts) when kind in [:string, :charlist, :quoted_atom, :sigil] do
-    case CST.span(cst) do
+    case cspan(cst) do
       {sl, sc, _el, ec} ->
         head = src_slice(opts, {sl, sc}, {sl, sc + 40})
 
@@ -637,7 +693,7 @@ defmodule Toxic2.Lower do
   # `token:` — the raw source text of a numeric / char literal (preserves `0x1F`, `1_000`, `?a`).
   defp tm_token(view, idx, opts) do
     if tm?(opts) do
-      {sl, sc, el, ec} = Tokens.span(view, idx)
+      {sl, sc, el, ec} = tspan(view, idx)
 
       case src_slice(opts, {sl, sc}, {el, ec}) do
         t when is_binary(t) -> [token: t]
@@ -654,7 +710,7 @@ defmodule Toxic2.Lower do
   # `:call`; `Mod.fun(x)` vs `a.b`, both `:remote_call`), so confirm the span ends at `)` against the
   # source — a paren-less remote call instead gets `no_parens: true`.
   defp closing_keys(kind, cst, view, opts) do
-    case {kind, CST.span(cst)} do
+    case {kind, cspan(cst)} do
       {k, {_sl, _sc, el, ec}} when k in [:list, :tuple, :map, :map_update, :dot_tuple] ->
         [closing: [line: el, column: ec - 1]]
 
@@ -697,8 +753,8 @@ defmodule Toxic2.Lower do
   # in the source from the call start up to the do-block's `do`.
   defp close_paren_before_do(cst, opts) do
     with {:node, :do_block, {dsl, dsc, _, _}, _, _, _} <-
-           Enum.find(CST.children(cst), &match?({:node, :do_block, _, _, _, _}, &1)),
-         {sl, sc, _el, _ec} <- CST.span(cst) do
+           Enum.find(cchildren(cst), &match?({:node, :do_block, _, _, _, _}, &1)),
+         {sl, sc, _el, _ec} <- cspan(cst) do
       last_paren(opts, sl, sc, dsl, dsc)
     else
       _ -> []
@@ -730,10 +786,10 @@ defmodule Toxic2.Lower do
   # input the block may be unterminated (recovered missing `end`), which would yield an impossible
   # position (e.g. column 0); emit each key only when the source actually has the keyword there.
   # A remote call with exactly `[base, member]` children — no argument and no do-block, i.e. `a.b`.
-  defp remote_zero_arity?(cst), do: match?([_base, _member], CST.children(cst))
+  defp remote_zero_arity?(cst), do: match?([_base, _member], cchildren(cst))
 
   defp doend_keys(cst, opts) do
-    case Enum.find(CST.children(cst), &match?({:node, :do_block, _, _, _, _}, &1)) do
+    case Enum.find(cchildren(cst), &match?({:node, :do_block, _, _, _, _}, &1)) do
       {:node, :do_block, {sl, sc, el, ec}, _ch, _f, _d} ->
         Enum.concat(kw_at(opts, sl, sc, "do", :do), kw_at(opts, el, ec - 3, "end", :end))
 
@@ -753,7 +809,7 @@ defmodule Toxic2.Lower do
   # child's own (tighter) range must win.
   defp put_node_range({form, meta, args}, cst, opts) when is_list(meta) do
     if range_enabled?(opts) and not Keyword.has_key?(meta, :range) do
-      {form, with_range(meta, CST.span(cst), opts), args}
+      {form, with_range(meta, cspan(cst), opts), args}
     else
       {form, meta, args}
     end
@@ -888,7 +944,7 @@ defmodule Toxic2.Lower do
   # `:"..."` / `:'...'` — no interpolation lowers to the atom (atom policy); with interpolation to
   # `:erlang.binary_to_atom(<<...>>, :utf8)`.
   defp lower_kind(:quoted_atom, [inner], cst, view, opts, acc, nid) do
-    {parts, acc, nid} = quoted_parts_ast(CST.children(inner), view, opts, acc, nid)
+    {parts, acc, nid} = quoted_parts_ast(cchildren(inner), view, opts, acc, nid)
     build_quoted_atom(parts, inner, cst, false, view, opts, acc, nid)
   end
 
@@ -924,7 +980,7 @@ defmodule Toxic2.Lower do
   end
 
   defp lower_quoted_part(child, view, opts, parts, acc, nid) do
-    case CST.tag(child) do
+    case ctag(child) do
       :token -> lower_fragment_part(child, view, parts, acc, nid)
       :node -> lower_interp_part(child, view, opts, parts, acc, nid)
       _ -> {parts, acc, nid}
@@ -932,17 +988,17 @@ defmodule Toxic2.Lower do
   end
 
   defp lower_fragment_part(child, view, parts, acc, nid) do
-    if Tokens.kind(view, CST.token_index(child)) in [:string_fragment, :charlist_fragment] do
-      {[{:frag, Tokens.value(view, CST.token_index(child))} | parts], acc, nid}
+    if tk(view, ctoki(child)) in [:string_fragment, :charlist_fragment] do
+      {[{:frag, tv(view, ctoki(child))} | parts], acc, nid}
     else
       {parts, acc, nid}
     end
   end
 
   defp lower_interp_part(child, view, opts, parts, acc, nid) do
-    if CST.node_kind(child) == :interp do
-      {ast, acc, nid} = lower_block(CST.children(child), view, opts, acc, nid)
-      {[{:interp, ast, CST.span(child)} | parts], acc, nid}
+    if ckind(child) == :interp do
+      {ast, acc, nid} = lower_block(cchildren(child), view, opts, acc, nid)
+      {[{:interp, ast, cspan(child)} | parts], acc, nid}
     else
       {parts, acc, nid}
     end
@@ -1068,7 +1124,7 @@ defmodule Toxic2.Lower do
     end
   end
 
-  defp atom_span(inner, _view), do: CST.span(inner) || {1, 1, 1, 1}
+  defp atom_span(inner, _view), do: cspan(inner) || {1, 1, 1, 1}
 
   defp string_segment({:frag, bin}, _opts), do: bin
 
@@ -1104,7 +1160,7 @@ defmodule Toxic2.Lower do
   # like a string's (the sigil macro does any further unescaping at expansion); the name atom
   # respects the atom policy. children = [start_leaf | parts... | end_leaf].
   defp lower_sigil([start_leaf | rest], cst, view, opts, acc, nid) do
-    name = Tokens.value(view, CST.token_index(start_leaf))
+    name = tv(view, ctoki(start_leaf))
     {part_children, mods} = sigil_split(rest, view)
     {parts, acc, nid} = quoted_parts_ast(part_children, view, opts, acc, nid)
 
@@ -1125,7 +1181,7 @@ defmodule Toxic2.Lower do
   # carries `indentation:` there (the closing-delimiter column − 1 = span end − 4).
   defp sigil_inner_meta(cst, mods, opts) do
     if tm?(opts) do
-      case CST.span(cst) do
+      case cspan(cst) do
         {sl, sc, _el, ec} ->
           head = src_slice(opts, {sl, sc}, {sl, sc + 40})
 
@@ -1155,8 +1211,8 @@ defmodule Toxic2.Lower do
 
     case last do
       {:token, idx, _f, _d} ->
-        if Tokens.kind(view, idx) == :sigil_end,
-          do: {:lists.reverse(rev), Tokens.value(view, idx) || ""},
+        if tk(view, idx) == :sigil_end,
+          do: {:lists.reverse(rev), tv(view, idx) || ""},
           else: {children, ""}
 
       _ ->
@@ -1219,7 +1275,7 @@ defmodule Toxic2.Lower do
   # A paren is a statement block: empty => empty block, one => the expr (transparent), many =>
   # `__block__`. A trailing recovered `:missing` (no `)`) is skipped — its diagnostic is emitted.
   defp lower_paren(children, cst, view, opts, acc, nid) do
-    children = Enum.reject(children, &(CST.tag(&1) == :missing))
+    children = Enum.reject(children, &(ctag(&1) == :missing))
 
     # A paren of stab clauses (`(a -> b; c -> d)`) lowers to the bare clause LIST `[{:->, …}, …]`,
     # not a statement block.
@@ -1237,13 +1293,13 @@ defmodule Toxic2.Lower do
   # NOT warn, so check the source between the delimiters for a `;`. Scoped to paren EXPRESSIONS:
   # stab-clause-head `()` (`fn () -> …`) is lowered elsewhere, not through here.
   defp maybe_empty_paren_warn({:__block__, _meta, []}, cst, opts, acc, nid) do
-    {sl, sc, el, ec} = CST.span(cst)
+    {sl, sc, el, ec} = cspan(cst)
 
     if String.contains?(src_slice(opts, {sl, sc + 1}, {el, ec}) || "", ";") do
       {acc, nid}
     else
       {_id, acc, nid} =
-        Diagnostics.emit(acc, nid, :parser, :warning, :empty_paren, CST.span(cst), %{})
+        Diagnostics.emit(acc, nid, :parser, :warning, :empty_paren, cspan(cst), %{})
 
       {acc, nid}
     end
@@ -1257,7 +1313,7 @@ defmodule Toxic2.Lower do
   # where `source_lines` is available; otherwise the empty block stays bare, matching `()` no-tm).
   defp add_parens_meta({:__block__, _meta, []}, [], cst, opts) do
     with true <- tm?(opts),
-         {sl, sc, el, ec} <- CST.span(cst) do
+         {sl, sc, el, ec} <- cspan(cst) do
       closing = [line: el, column: ec - 1]
 
       if String.contains?(src_slice(opts, {sl, sc + 1}, {el, ec - 1}) || "", ";"),
@@ -1301,7 +1357,7 @@ defmodule Toxic2.Lower do
   # includes encoder-wrapped literals (`({a, b})`) and a paren around a multi-statement block.
   defp add_parens_meta({f, meta, a}, [_single], cst, opts) do
     if tm?(opts) do
-      case CST.span(cst) do
+      case cspan(cst) do
         {sl, sc, el, ec} ->
           {f, [{:parens, [closing: [line: el, column: ec - 1], line: sl, column: sc]} | meta], a}
 
@@ -1316,7 +1372,7 @@ defmodule Toxic2.Lower do
   defp add_parens_meta(ast, _children, _cst, _opts), do: ast
 
   defp parens_block(meta, stmts, cst, opts) do
-    case tm?(opts) && CST.span(cst) do
+    case tm?(opts) && cspan(cst) do
       {sl, sc, el, ec} ->
         anchor = [closing: [line: el, column: ec - 1], line: sl, column: sc]
         {:__block__, Enum.concat(anchor, meta), stmts}
@@ -1326,7 +1382,7 @@ defmodule Toxic2.Lower do
     end
   end
 
-  defp stab_node?(cst), do: CST.tag(cst) == :node and CST.node_kind(cst) == :stab
+  defp stab_node?(cst), do: ctag(cst) == :node and ckind(cst) == :stab
 
   # A parenthesised boolean negation is wrapped in a `__block__` — `(not x)` => `{:__block__, [],
   # [{:not, [], [x]}]}`, likewise `(! x)` — preserving the parenthesisation the `not in`
@@ -1415,10 +1471,10 @@ defmodule Toxic2.Lower do
          acc,
          nid
        ) do
-    neg = Tokens.value(view, CST.token_index(neg_leaf))
+    neg = tv(view, ctoki(neg_leaf))
     {o, acc, nid} = lower(operand, view, opts, acc, nid)
     {r, acc, nid} = lower(rhs, view, opts, acc, nid)
-    span = Tokens.span(view, CST.token_index(op_leaf)) || {1, 1, 1, 1}
+    span = tspan(view, ctoki(op_leaf)) || {1, 1, 1, 1}
 
     {_id, acc, nid} =
       Diagnostics.emit(acc, nid, :lowerer, :warning, :deprecated_not_in, span, %{})
@@ -1434,7 +1490,7 @@ defmodule Toxic2.Lower do
   # `not(a in b)` / `!(a in b)` (`not` binds looser than `in` here). Parenthesising the operand
   # (`(not a) in b`) gives a `:paren` lhs, which is not matched, so it keeps its literal meaning.
   defp negation_unary?({:node, :unary_op, _sp, [op_leaf, _operand], _f, _d}, view),
-    do: Tokens.value(view, CST.token_index(op_leaf)) in [:not, :!]
+    do: tv(view, ctoki(op_leaf)) in [:not, :!]
 
   defp negation_unary?(_lhs, _view), do: false
 
@@ -1464,13 +1520,13 @@ defmodule Toxic2.Lower do
   # `f(args)` => `{fun_atom, meta, lowered_args}`. The callee name respects the atom policy.
   defp lower_call([callee | arg_children], view, opts, acc, nid) do
     {args, acc, nid} = lower_call_args(arg_children, view, opts, acc, nid)
-    lower_callee(CST.tag(callee), callee, args, view, opts, acc, nid)
+    lower_callee(ctag(callee), callee, args, view, opts, acc, nid)
   end
 
   # A bare identifier callee is a named call `{name, meta, args}` (atom via the atom policy).
   defp lower_callee(:token, callee, args, view, opts, acc, nid) do
-    idx = CST.token_index(callee)
-    name = Tokens.value(view, idx)
+    idx = ctoki(callee)
+    name = tv(view, idx)
 
     case to_atom(name, opts) do
       {:ok, fun} ->
@@ -1517,7 +1573,7 @@ defmodule Toxic2.Lower do
   defp lower_alias([first | rest], view, opts, acc, nid) do
     meta = error_meta(first, view)
 
-    if CST.tag(first) == :token and Tokens.kind(view, CST.token_index(first)) == :alias do
+    if ctag(first) == :token and tk(view, ctoki(first)) == :alias do
       build_alias([first | rest], meta, view, opts, acc, nid)
     else
       {base_ast, acc, nid} = lower(first, view, opts, acc, nid)
@@ -1560,7 +1616,7 @@ defmodule Toxic2.Lower do
   defp with_alias_last(meta, _last_leaf, _view, %{token_metadata: false}), do: meta
 
   defp with_alias_last(meta, {:token, idx, _f, _d}, view, _opts) do
-    {sl, sc, _el, _ec} = Tokens.span(view, idx)
+    {sl, sc, _el, _ec} = tspan(view, idx)
     [{:last, [line: sl, column: sc]} | meta]
   end
 
@@ -1570,7 +1626,7 @@ defmodule Toxic2.Lower do
   # `existing_atoms_only`, or invalid UTF-8) short-circuits to `{:error, that_leaf}`.
   defp seg_atoms(leaves, view, opts) do
     Enum.reduce_while(leaves, {:ok, []}, fn leaf, {:ok, atoms} ->
-      case to_atom(Tokens.value(view, CST.token_index(leaf)), opts) do
+      case to_atom(tv(view, ctoki(leaf)), opts) do
         {:ok, atom} -> {:cont, {:ok, [atom | atoms]}}
         :error -> {:halt, {:error, leaf}}
       end
@@ -1582,7 +1638,7 @@ defmodule Toxic2.Lower do
   end
 
   defp alias_seg_error(leaf, view, acc, nid),
-    do: nonexistent_atom(leaf, view, Tokens.value(view, CST.token_index(leaf)), acc, nid)
+    do: nonexistent_atom(leaf, view, tv(view, ctoki(leaf)), acc, nid)
 
   # `:foo.Bar` / `nil.Bar` — a bare ATOM literal cannot be followed by an alias (Elixir rejects it;
   # to keep the atom in its name, it must be quoted). Non-atom bases (`__MODULE__.X`, `x.X`, `@x.X`)
@@ -1602,7 +1658,7 @@ defmodule Toxic2.Lower do
     {base_ast, acc, nid} = lower(base, view, opts, acc, nid)
     {args, acc, nid} = lower_call_args(arg_children, view, opts, acc, nid)
     dotmeta = remote_dot_meta(base, view, opts)
-    remote_name(CST.tag(name_leaf), name_leaf, base_ast, args, dotmeta, view, opts, acc, nid)
+    remote_name(ctag(name_leaf), name_leaf, base_ast, args, dotmeta, view, opts, acc, nid)
   end
 
   # Under `token_metadata: true` the `.` operator anchors at the dot itself (between the base and the
@@ -1629,10 +1685,10 @@ defmodule Toxic2.Lower do
   end
 
   defp remote_name(:token, name_leaf, base_ast, args, dotmeta, view, opts, acc, nid) do
-    idx = CST.token_index(name_leaf)
+    idx = ctoki(name_leaf)
     meta = tmeta(view, idx)
 
-    case member_atom(Tokens.kind(view, idx), Tokens.value(view, idx), opts) do
+    case member_atom(tk(view, idx), tv(view, idx), opts) do
       {:ok, name} -> {{{:., dotmeta || meta, [base_ast, name]}, meta, args}, acc, nid}
       :error -> name_error(name_leaf, view, acc, nid)
     end
@@ -1646,7 +1702,7 @@ defmodule Toxic2.Lower do
   # `a."foo"` — the function name is a quoted literal. No interpolation allowed (Elixir rejects
   # `a."f#{x}"`): atomize the concatenated fragments; on interpolation, error + best-effort.
   defp remote_name(:node, name_node, base_ast, args, dotmeta, view, opts, acc, nid) do
-    {parts, acc, nid} = quoted_parts_ast(CST.children(name_node), view, opts, acc, nid)
+    {parts, acc, nid} = quoted_parts_ast(cchildren(name_node), view, opts, acc, nid)
 
     if Enum.any?(parts, &match?({:interp, _, _}, &1)) do
       {id, acc, nid} =
@@ -1714,7 +1770,7 @@ defmodule Toxic2.Lower do
     dot = remote_dot_meta(base, view, opts) || base_meta
 
     closing =
-      case CST.span(cst) do
+      case cspan(cst) do
         {_sl, _sc, el, ec} -> [closing: [line: el, column: ec - 1]]
         _ -> []
       end
@@ -1723,7 +1779,7 @@ defmodule Toxic2.Lower do
   end
 
   defp name_error(name_leaf, view, acc, nid) do
-    idx = CST.token_index(name_leaf)
+    idx = ctoki(name_leaf)
 
     {id, acc, nid} =
       Diagnostics.emit(
@@ -1734,7 +1790,7 @@ defmodule Toxic2.Lower do
         :nonexistent_atom,
         name_span(name_leaf, view),
         %{
-          name: Tokens.value(view, idx)
+          name: tv(view, idx)
         }
       )
 
@@ -1745,7 +1801,7 @@ defmodule Toxic2.Lower do
   defp lower_kw_pair([key, val], view, opts, acc, nid) do
     {acc, nid} = maybe_nested_no_parens_warn(val, view, acc, nid)
     {v, acc, nid} = lower(val, view, opts, acc, nid)
-    kw_key(CST.tag(key), key, v, view, opts, acc, nid)
+    kw_key(ctag(key), key, v, view, opts, acc, nid)
   end
 
   # `foo a: bar b` / `f(a: bar b)` — a keyword whose VALUE is a no-parens call is ambiguous (do the
@@ -1775,10 +1831,10 @@ defmodule Toxic2.Lower do
   # ONE argument, so a kw-only call (`defstruct a: 1, b: 2`, the value of `do: …`) is NOT multi-arg
   # — and a plain single-arg call (`bar b`) is fine.
   defp no_parens_call_cst?(node) do
-    kind = CST.tag(node) == :node and CST.node_kind(node)
+    kind = ctag(node) == :node and ckind(node)
 
     if kind in [:np_call, :remote_call] and CST.category(node) == :no_parens do
-      args = np_call_args_cst(kind, CST.children(node))
+      args = np_call_args_cst(kind, cchildren(node))
       {kws, positional} = Enum.split_with(args, &kw_pair_cst?/1)
       groups = length(positional) + if kws == [], do: 0, else: 1
 
@@ -1796,14 +1852,14 @@ defmodule Toxic2.Lower do
   defp np_call_args_cst(:remote_call, [_base, _name | args]), do: args
   defp np_call_args_cst(_kind, _children), do: []
 
-  defp kw_pair_cst?(node), do: CST.tag(node) == :node and CST.node_kind(node) == :kw_pair
+  defp kw_pair_cst?(node), do: ctag(node) == :node and ckind(node) == :kw_pair
 
   defp kw_key(:token, key_leaf, v, view, opts, acc, nid) do
-    idx = CST.token_index(key_leaf)
+    idx = ctoki(key_leaf)
 
-    case to_atom(Tokens.value(view, idx), opts) do
+    case to_atom(tv(view, idx), opts) do
       :error ->
-        {err, acc, nid} = nonexistent_atom(key_leaf, view, Tokens.value(view, idx), acc, nid)
+        {err, acc, nid} = nonexistent_atom(key_leaf, view, tv(view, idx), acc, nid)
         {{err, v}, acc, nid}
 
       {:ok, atom} ->
@@ -1814,7 +1870,7 @@ defmodule Toxic2.Lower do
           enc ->
             # A keyword key is a literal atom; Elixir tags its meta `format: :keyword` and the
             # encoded key turns the `k: v` shorthand into an explicit `{encoded_key, v}` pair.
-            span = Tokens.span(view, idx)
+            span = tspan(view, idx)
             meta = [{:format, :keyword} | literal_meta(span, opts)]
             {key_ast, acc, nid} = run_encoder_meta(enc, atom, meta, span, acc, nid)
             {{key_ast, v}, acc, nid}
@@ -1825,7 +1881,7 @@ defmodule Toxic2.Lower do
   # A quoted kw key (`"foo": v`) atomizes like a quoted atom: no interpolation => the atom; with
   # interpolation => the `binary_to_atom` construction (so the pair is `{key_expr, v}`).
   defp kw_key(:node, key_node, v, view, opts, acc, nid) do
-    {parts, acc, nid} = quoted_parts_ast(CST.children(key_node), view, opts, acc, nid)
+    {parts, acc, nid} = quoted_parts_ast(cchildren(key_node), view, opts, acc, nid)
     {key_ast, acc, nid} = build_quoted_atom(parts, key_node, key_node, true, view, opts, acc, nid)
     {key_ast, acc, nid} = encode_quoted_kw_key(key_ast, key_node, opts, acc, nid)
     {{key_ast, v}, acc, nid}
@@ -1839,7 +1895,7 @@ defmodule Toxic2.Lower do
         {atom, acc, nid}
 
       enc ->
-        span = CST.span(key_node)
+        span = cspan(key_node)
         meta = [{:format, :keyword} | literal_meta(span, opts)]
 
         run_encoder_meta(
@@ -1867,22 +1923,23 @@ defmodule Toxic2.Lower do
   defp quoted_key_delimiter(_span, _opts), do: []
 
   # Call arguments: a trailing run of keyword pairs is collected into one keyword-list arg
-  # (`f(1, a: 2)` => `[1, [a: 2]]`); regular args lower normally.
+  # (`f(1, a: 2)` => `[1, [a: 2]]`); regular args lower normally. Most arg lists have NO keyword
+  # tail — checking the LAST child first keeps that case free of the reverse → split_while →
+  # reverse round-trip (two full list copies + a closure per call).
+  defp lower_args([], _view, _opts, acc, nid), do: {[], acc, nid}
+
   defp lower_args(children, view, opts, acc, nid) do
-    {kw_rev, regular_rev} = Enum.split_while(:lists.reverse(children), &kw_pair?/1)
-    {reg, acc, nid} = lower_each(:lists.reverse(regular_rev), view, opts, acc, nid)
-
-    case :lists.reverse(kw_rev) do
-      [] ->
-        {reg, acc, nid}
-
-      kw ->
-        {kw_list, acc, nid} = lower_each(kw, view, opts, acc, nid)
-        {Enum.concat(reg, [kw_list]), acc, nid}
+    if kw_pair?(:lists.last(children)) do
+      {kw_rev, regular_rev} = Enum.split_while(:lists.reverse(children), &kw_pair?/1)
+      {reg, acc, nid} = lower_each(:lists.reverse(regular_rev), view, opts, acc, nid)
+      {kw_list, acc, nid} = lower_each(:lists.reverse(kw_rev), view, opts, acc, nid)
+      {Enum.concat(reg, [kw_list]), acc, nid}
+    else
+      lower_each(children, view, opts, acc, nid)
     end
   end
 
-  defp kw_pair?(cst), do: CST.tag(cst) == :node and CST.node_kind(cst) == :kw_pair
+  defp kw_pair?(cst), do: ctag(cst) == :node and ckind(cst) == :kw_pair
 
   # Call args, where a trailing `:do_block` child becomes the final `[do: ..., else: ...]` arg.
   defp lower_call_args(children, view, opts, acc, nid) do
@@ -1899,18 +1956,25 @@ defmodule Toxic2.Lower do
     end
   end
 
+  # Check the LAST child first (alloc-free walk): the no-do_block case returns `children` as-is
+  # with no reverse; the do_block case rebuilds all-but-last forward (one pass, not two reverses).
+  defp pop_do_block([]), do: {[], nil}
+
   defp pop_do_block(children) do
-    case :lists.reverse(children) do
-      [{:node, :do_block, _sp, _ch, _f, _d} = db | rev] -> {:lists.reverse(rev), db}
+    case :lists.last(children) do
+      {:node, :do_block, _sp, _ch, _f, _d} = db -> {drop_last(children), db}
       _ -> {children, nil}
     end
   end
+
+  defp drop_last([_last]), do: []
+  defp drop_last([c | rest]), do: [c | drop_last(rest)]
 
   # `do ... else ... end` => keyword list `[do: body, else: body, ...]`. A trailing `:missing`
   # (recovered missing `end`) is skipped — its diagnostic was already emitted by the parser.
   defp lower_do_block(db, view, opts, acc, nid) do
     {pairs, acc, nid} =
-      Enum.reduce(CST.children(db), {[], acc, nid}, fn
+      Enum.reduce(cchildren(db), {[], acc, nid}, fn
         {:node, :do_section, _sp, _ch, _f, _d} = section, {ps, a, n} ->
           {pair, a, n} = lower_section(section, view, opts, a, n)
           {[pair | ps], a, n}
@@ -1935,10 +1999,10 @@ defmodule Toxic2.Lower do
   # `[line, column]` of `do`, and a single-expression body carries `parens: [line, column]`. Other
   # sections (`else`/`catch`/…) pass `[]`. Token-metadata only; non-tm meta is normalized away.
   defp section_block_meta(label_leaf, view, opts) do
-    idx = CST.token_index(label_leaf)
+    idx = ctoki(label_leaf)
 
-    if tm?(opts) and Tokens.kind(view, idx) == :do do
-      {l, c, _, _} = Tokens.span(view, idx)
+    if tm?(opts) and tk(view, idx) == :do do
+      {l, c, _, _} = tspan(view, idx)
       [line: l, column: c]
     else
       []
@@ -1948,15 +2012,15 @@ defmodule Toxic2.Lower do
   # The `do:`/`else:`/`rescue:`/… key of a do-block. It is a literal atom too, so under a literal
   # encoder it gets encoded (plain `line:`/`column:` meta — Elixir does NOT tag these `:keyword`).
   defp section_label(label_leaf, view, opts, acc, nid) do
-    idx = CST.token_index(label_leaf)
-    atom = if Tokens.kind(view, idx) == :do, do: :do, else: Tokens.value(view, idx)
+    idx = ctoki(label_leaf)
+    atom = if tk(view, idx) == :do, do: :do, else: tv(view, idx)
 
     case opts.literal_encoder do
       nil ->
         {atom, acc, nid}
 
       enc ->
-        span = Tokens.span(view, idx)
+        span = tspan(view, idx)
         run_encoder_meta(enc, atom, literal_meta(span, opts), span, acc, nid)
     end
   end
@@ -2015,8 +2079,8 @@ defmodule Toxic2.Lower do
   end
 
   # The span of a CST child, whether a node (`CST.span/1`) or a bare token leaf (via the view).
-  defp child_span({:token, idx, _f, _d}, view), do: Tokens.span(view, idx)
-  defp child_span(child, _view), do: CST.span(child)
+  defp child_span({:token, idx, _f, _d}, view), do: tspan(view, idx)
+  defp child_span(child, _view), do: cspan(child)
 
   # `foo[bar]` => `{{:., dotmeta, [Access, :get]}, [], [foo, bar]}`. Under `token_metadata: true` the
   # dot meta carries `from_brackets: true` + `closing:` (the `]` = node-span end − 1) and anchors at
@@ -2025,7 +2089,7 @@ defmodule Toxic2.Lower do
 
   defp access_dot_meta(base, cst, view, _opts) do
     with {_, _, bel, bec} <- child_span(base, view),
-         {_, _, el, ec} <- CST.span(cst) do
+         {_, _, el, ec} <- cspan(cst) do
       [from_brackets: true, closing: [line: el, column: ec - 1], line: bel, column: bec]
     else
       _ -> []
@@ -2091,7 +2155,7 @@ defmodule Toxic2.Lower do
   end
 
   defp lower_stab_args(args_node, view, opts, acc, nid) do
-    case CST.children(args_node) do
+    case cchildren(args_node) do
       [{:node, :stab_when, _sp, when_ch, _f, _d}] ->
         {pats, [guard]} = Enum.split(when_ch, length(when_ch) - 1)
 
@@ -2114,7 +2178,7 @@ defmodule Toxic2.Lower do
 
   # Stab clause body -> nil (empty), the expression (one), or a `__block__` (many).
   defp lower_stab_body(body_node, view, opts, acc, nid) do
-    case CST.children(body_node) do
+    case cchildren(body_node) do
       [] ->
         {nil, acc, nid}
 
@@ -2207,25 +2271,25 @@ defmodule Toxic2.Lower do
     do: {:__error__, error_meta(cst, view), %{diag_ids: CST.diag_ids(cst)}}
 
   defp error_meta(cst, view) do
-    case CST.tag(cst) do
-      :node -> span_meta(CST.span(cst))
-      :token -> tmeta(view, CST.token_index(cst))
+    case ctag(cst) do
+      :node -> span_meta(cspan(cst))
+      :token -> tmeta(view, ctoki(cst))
       :missing -> tmeta(view, CST.anchor_index(cst))
     end
   end
 
   # --- helpers -----------------------------------------------------------
 
-  defp op_atom(op_leaf, view), do: Tokens.value(view, CST.token_index(op_leaf))
-  defp op_meta(op_leaf, view), do: tmeta(view, CST.token_index(op_leaf))
+  defp op_atom(op_leaf, view), do: tv(view, ctoki(op_leaf))
+  defp op_meta(op_leaf, view), do: tmeta(view, ctoki(op_leaf))
 
-  defp name_span(cst, view), do: Tokens.span(view, CST.token_index(cst)) || {1, 1, 1, 1}
+  defp name_span(cst, view), do: tspan(view, ctoki(cst)) || {1, 1, 1, 1}
 
   # Read the start line/col straight off the token tuple. Going through `Tokens.span/2` allocated a
   # throwaway `{sl,sc,el,ec}` per node just to drop `el,ec` — tprof flagged it as ~quarter of all
   # `Token.span` calls in lowering.
   defp tmeta(view, idx) do
-    case Tokens.token(view, idx) do
+    case tt(view, idx) do
       {_kind, sl, sc, _el, _ec, _v} -> [line: sl, column: sc]
       :eof -> []
     end
