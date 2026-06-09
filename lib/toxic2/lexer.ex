@@ -46,7 +46,7 @@ defmodule Toxic2.Lexer do
   # Narrow inlining of tiny, hot, LOCAL helpers (cross-module calls are unaffected). Recursive
   # scanners (`lex/6`, `word_len/2`, `read_name/1`, `consume_eols/4`, `plain_run_len/4`) are
   # deliberately excluded — inlining them risks code growth / worse i-cache. A/B-measured.
-  @compile {:inline, rest_at: 2, kw_suffix: 1, kw_colon?: 1}
+  @compile {:inline, rest_at: 2, kw_suffix: 1, kw_colon_at?: 2, cont: 5}
 
   @type token :: Toxic2.Token.t()
   # An id-less lexer warning notice; numbered into a `Diagnostic` at the parse boundary.
@@ -174,13 +174,8 @@ defmodule Toxic2.Lexer do
   # A bare CR (0x0D) is only valid as part of a CRLF, which every call site handles BEFORE this check.
   defguardp break?(c) when c in [0x000B, 0x000C, 0x000D, 0x0085, 0x2028, 0x2029]
 
-  # Radix digit / sigil-modifier char classes. `defguardp` (defined here, ahead of every use) so the
-  # membership test inlines in guard/body position; they double as the `&dec?/1` etc. captures fed to
-  # `run_len`/`take_while` (a defguard generates a real capturable function alongside the macro).
-  defguardp dec?(c) when c in ?0..?9
-  defguardp hex?(c) when c in ?0..?9 or c in ?a..?f or c in ?A..?F
-  defguardp oct?(c) when c in ?0..?7
-  defguardp bin?(c) when c in [?0, ?1]
+  # Sigil-modifier char class. `defguardp` (defined here, ahead of every use) so the membership
+  # test inlines in guard/body position (the radix digit classes live in `digit_run/4`'s guards).
   defguardp mod_char?(c) when c in ?a..?z or c in ?A..?Z or c in ?0..?9
 
   @doc """
@@ -414,16 +409,17 @@ defmodule Toxic2.Lexer do
   end
 
   # --- numbers: 0x / 0o / 0b ---------------------------------------------
-  defp lex(<<?0, b, _::binary>> = bin, line, col, acc, w, st)
+  # `digit_run/4` fuses the old run_len + valid_underscores? double pass (each a captured-fun call
+  # per byte, plus a validation-only `binary_part` slice) into ONE direct-guard pass per radix.
+  defp lex(<<?0, b, rest::binary>> = bin, line, col, acc, w, st)
        when b in [?x, ?X, ?o, ?O, ?b, ?B] do
-    {base, pred} = radix(b)
-    {rlen, _rest} = run_len(rest_at(bin, 2), pred)
-    digits = binary_part(bin, 2, rlen)
+    {class, base} = radix(b)
+    {rlen, ok, after_digits} = digit_run(rest, class, 0, :start)
 
-    if rlen > 0 and valid_underscores?(digits, pred) do
+    if ok do
       total = 2 + rlen
-      value = digits |> strip_underscores() |> String.to_integer(base)
-      cont(rest_at(bin, total), {:int, line, col, line, col + total, value}, acc, w, st)
+      value = bin |> binary_part(2, rlen) |> strip_underscores() |> String.to_integer(base)
+      cont(after_digits, {:int, line, col, line, col + total, value}, acc, w, st)
     else
       num_error(bin, 2 + rlen, line, col, acc, w, st)
     end
@@ -431,14 +427,12 @@ defmodule Toxic2.Lexer do
 
   # --- numbers: decimal int / float --------------------------------------
   defp lex(<<c, _::binary>> = bin, line, col, acc, w, st) when is_digit(c) do
-    {ilen, after_int} = run_len(bin, &dec?/1)
-    int_ok = valid_underscores?(binary_part(bin, 0, ilen), &dec?/1)
+    {ilen, int_ok, after_int} = digit_run(bin, ?9, 0, :start)
 
     case after_int do
       <<?., d, _::binary>> when is_digit(d) ->
-        {flen, _} = run_len(rest_at(bin, ilen + 1), &dec?/1)
-        frac_ok = valid_underscores?(binary_part(bin, ilen + 1, flen), &dec?/1)
-        {elen, exp_ok} = scan_exp(rest_at(bin, ilen + 1 + flen))
+        {flen, frac_ok, after_frac} = digit_run(rest_at(after_int, 1), ?9, 0, :start)
+        {elen, exp_ok} = scan_exp(after_frac)
         total = ilen + 1 + flen + elen
 
         # `String.to_float/1` raises on overflow (`1.0e309` → infinity); stay total and diagnose it.
@@ -452,7 +446,7 @@ defmodule Toxic2.Lexer do
       _ ->
         if int_ok do
           value = bin |> binary_part(0, ilen) |> strip_underscores() |> String.to_integer()
-          cont(rest_at(bin, ilen), {:int, line, col, line, col + ilen, value}, acc, w, st)
+          cont(after_int, {:int, line, col, line, col + ilen, value}, acc, w, st)
         else
           num_error(bin, ilen, line, col, acc, w, st)
         end
@@ -677,7 +671,7 @@ defmodule Toxic2.Lexer do
 
       # a table operator directly followed by a keyword colon is an operator keyword key (`+: 1`),
       # EXCEPT `//` (the ternary step op) which is never an atom/keyword (`a // b: c` is `a // (b: c)`).
-      kind != :ternary_op and kw_colon?(rest_at(bin, len)) ->
+      kind != :ternary_op and kw_colon_at?(bin, len) ->
         emit_op_kw(bin, len, line, col, acc, w, st)
 
       true ->
@@ -716,8 +710,8 @@ defmodule Toxic2.Lexer do
 
   defp too_many_same_char_notice(_bin, _line, _col, w), do: w
 
-  defp atom_op_kw_len(<<"<<>>", rest::binary>>), do: if(kw_colon?(rest), do: 4)
-  defp atom_op_kw_len(<<"..//", rest::binary>>), do: if(kw_colon?(rest), do: 4)
+  defp atom_op_kw_len(<<"<<>>", _::binary>> = bin), do: if(kw_colon_at?(bin, 4), do: 4)
+  defp atom_op_kw_len(<<"..//", _::binary>> = bin), do: if(kw_colon_at?(bin, 4), do: 4)
   defp atom_op_kw_len(_), do: nil
 
   # --- unicode identifier/atom tokenization (vendored Toxic2.String.Tokenizer) -----------------
@@ -837,7 +831,9 @@ defmodule Toxic2.Lexer do
         nil
 
       len ->
-        if binary_part(bin, 0, len) != "::" and kw_colon?(rest_at(bin, len)), do: len, else: nil
+        # the `::` reject is a prefix match (only op_atom_len's dedicated clause yields it at 2);
+        # both checks are alloc-free — no `binary_part`/`rest_at` slice per candidate.
+        if kw_colon_at?(bin, len) and not match?(<<"::", _::binary>>, bin), do: len, else: nil
     end
   end
 
@@ -848,11 +844,21 @@ defmodule Toxic2.Lexer do
 
   # A keyword-key colon is `:` followed by a clear separator (whitespace / closer / EOF).
   # `:` followed by a name char starts an `:atom` operand instead — `&:foo`, `+:erlang` (a capture).
-  defp kw_colon?(<<?:, c, _::binary>>),
-    do: c in [?\s, ?\t, ?\n, ?\r, ?\f, ?\v, ?], ?}, ?), ?,, ?;]
+  # Checked AT an offset with a `_::binary-size(len)` skip-match: the compiler advances the match
+  # context without building the sub-binary a `kw_colon?(rest_at(bin, len))` peek used to allocate
+  # on EVERY operator token just to inspect one or two bytes.
+  defp kw_colon_at?(bin, len) do
+    case bin do
+      <<_::binary-size(^len), ?:, c, _::binary>> ->
+        c in [?\s, ?\t, ?\n, ?\r, ?\f, ?\v, ?], ?}, ?), ?,, ?;]
 
-  defp kw_colon?(<<?:>>), do: true
-  defp kw_colon?(_), do: false
+      <<_::binary-size(^len), ?:>> ->
+        true
+
+      _ ->
+        false
+    end
+  end
 
   defp lex_operator(bin, line, col, acc, w, st) do
     case match_op(bin) do
@@ -1266,8 +1272,16 @@ defmodule Toxic2.Lexer do
   defp esc(<<?\r, ?\n, rest::binary>>), do: {<<>>, rest, :newline, nil}
   defp esc(<<?\n, rest::binary>>), do: {<<>>, rest, :newline, nil}
 
-  defp esc(<<e::utf8, rest::binary>>),
-    do: {<<Map.get(@char_escapes, e, e)::utf8>>, rest, :sameline, nil}
+  # The fixed escapes (`\n`, `\t`, `\\`, `\"`, …) as generated clauses returning LITERAL binaries —
+  # module constants, shared, zero allocation per escape. The old `<<Map.get(@char_escapes, e, e)
+  # ::utf8>>` body paid a UTF-8 decode + a map lookup + a fresh heap binary per escape, and escapes
+  # break the plain-run fast path, so escape-dense strings concentrate exactly here.
+  for {e, v} <- @char_escapes do
+    defp esc(<<unquote(e), rest::binary>>), do: {unquote(<<v>>), rest, :sameline, nil}
+  end
+
+  # Any other codepoint after `\` is kept as itself (no escape processing).
+  defp esc(<<e::utf8, rest::binary>>), do: {<<e::utf8>>, rest, :sameline, nil}
 
   # Tolerant (totality): `\` before an invalid UTF-8 byte keeps that byte literally (never raise).
   defp esc(<<byte, rest::binary>>), do: {<<byte>>, rest, :sameline, nil}
@@ -1892,42 +1906,43 @@ defmodule Toxic2.Lexer do
   defp take_mods(<<c, rest::binary>>, n) when mod_char?(c), do: take_mods(rest, n + 1)
   defp take_mods(bin, n), do: {n, bin}
 
-  # Length of the maximal `[digit | _]` run (`pred` is digit-only; `_` is allowed here and
-  # validated separately by `valid_underscores?/2`).
-  defp run_len(bin, pred, n \\ 0)
+  # One-pass digit-run scan: the maximal `[digit | _]` run length AND Elixir's underscore rule
+  # (`_` only *between* digits — no leading/trailing/doubled `_`, non-empty run) fused into a
+  # single direct-guard pass returning `{len, ok?, rest}`. Replaces the old run_len +
+  # valid_underscores? double pass (each a captured-fun call per byte, plus a validation-only
+  # `binary_part` slice per number). `class` is `:hex` or the highest digit byte (`?9`/`?7`/`?1`
+  # for dec/oct/bin — all contiguous from `?0`). On a misplaced `_` the run is still consumed in
+  # full (the error token spans it), just marked invalid.
+  defp digit_run(<<c, rest::binary>>, class, n, _prev)
+       when is_integer(class) and c >= ?0 and c <= class,
+       do: digit_run(rest, class, n + 1, :digit)
 
-  defp run_len(<<c, rest::binary>> = bin, pred, n) do
-    if pred.(c) or c == ?_, do: run_len(rest, pred, n + 1), else: {n, bin}
-  end
+  defp digit_run(<<c, rest::binary>>, :hex, n, _prev) when is_hex(c),
+    do: digit_run(rest, :hex, n + 1, :digit)
 
-  defp run_len(<<>>, _pred, n), do: {n, <<>>}
+  defp digit_run(<<?_, rest::binary>>, class, n, :digit), do: digit_run(rest, class, n + 1, :us)
+  defp digit_run(<<?_, rest::binary>>, class, n, _prev), do: bad_digit_run(rest, class, n + 1)
+  defp digit_run(bin, _class, n, prev), do: {n, prev == :digit, bin}
 
-  # Elixir's underscore rule: `_` only *between* digits — no leading/trailing/doubled `_`, and
-  # the run must be non-empty. Prevents both crashes (empty → `String.to_integer`) and silently
-  # accepting `1_`, `1__2`, `0x_F`, `1.2_`.
-  defp valid_underscores?(<<>>, _pred), do: false
-  defp valid_underscores?(slice, pred), do: valid_us(slice, pred, :start)
+  defp bad_digit_run(<<c, rest::binary>>, class, n)
+       when is_integer(class) and ((c >= ?0 and c <= class) or c == ?_),
+       do: bad_digit_run(rest, class, n + 1)
 
-  defp valid_us(<<>>, _pred, prev), do: prev == :digit
+  defp bad_digit_run(<<c, rest::binary>>, :hex, n) when is_hex(c) or c == ?_,
+    do: bad_digit_run(rest, :hex, n + 1)
 
-  defp valid_us(<<c, rest::binary>>, pred, prev) do
-    cond do
-      pred.(c) -> valid_us(rest, pred, :digit)
-      c == ?_ and prev == :digit -> valid_us(rest, pred, :us)
-      true -> false
-    end
-  end
+  defp bad_digit_run(bin, _class, n), do: {n, false, bin}
 
   # Exponent suffix `e[+-]?digits`: returns `{consumed_length, underscores_valid?}`.
   defp scan_exp(<<e, s, d, _::binary>> = bin)
        when e in [?e, ?E] and s in [?+, ?-] and is_digit(d) do
-    {dlen, _} = run_len(rest_at(bin, 2), &dec?/1)
-    {2 + dlen, valid_underscores?(binary_part(bin, 2, dlen), &dec?/1)}
+    {dlen, ok, _rest} = digit_run(rest_at(bin, 2), ?9, 0, :start)
+    {2 + dlen, ok}
   end
 
   defp scan_exp(<<e, d, _::binary>> = bin) when e in [?e, ?E] and is_digit(d) do
-    {dlen, _} = run_len(rest_at(bin, 1), &dec?/1)
-    {1 + dlen, valid_underscores?(binary_part(bin, 1, dlen), &dec?/1)}
+    {dlen, ok, _rest} = digit_run(rest_at(bin, 1), ?9, 0, :start)
+    {1 + dlen, ok}
   end
 
   defp scan_exp(_bin), do: {0, true}
@@ -1937,14 +1952,16 @@ defmodule Toxic2.Lexer do
     cont(rest_at(bin, len), {:error, line, col, line, col + len, err}, acc, w, st)
   end
 
-  # Most numeric literals have no `_`; skip the (allocating, pattern-compiling) global replace for
-  # them with a cheap `:binary.match` reject.
+  # Most numeric literals have no `_`; skip the (allocating) global replace for them. The reject is
+  # a plain byte recursion, NOT `:binary.match` — number slices are 2–10 bytes, where the BM scan's
+  # per-call setup (~0.7µs under eprof) costs more than walking every byte in the match context.
   defp strip_underscores(bin) do
-    case :binary.match(bin, "_") do
-      :nomatch -> bin
-      _ -> :binary.replace(bin, "_", "", [:global])
-    end
+    if has_underscore?(bin), do: :binary.replace(bin, "_", "", [:global]), else: bin
   end
+
+  defp has_underscore?(<<?_, _::binary>>), do: true
+  defp has_underscore?(<<_, rest::binary>>), do: has_underscore?(rest)
+  defp has_underscore?(<<>>), do: false
 
   defp skip_spaces_tabs(<<c, rest::binary>>) when c in [?\s, ?\t], do: skip_spaces_tabs(rest)
   defp skip_spaces_tabs(bin), do: bin
@@ -1977,9 +1994,10 @@ defmodule Toxic2.Lexer do
     ArgumentError -> :error
   end
 
-  defp radix(b) when b in [?x, ?X], do: {16, &hex?/1}
-  defp radix(b) when b in [?o, ?O], do: {8, &oct?/1}
-  defp radix(b) when b in [?b, ?B], do: {2, &bin?/1}
+  # `{digit_run class, base}` — the class is `:hex` or the highest digit byte of the radix.
+  defp radix(b) when b in [?x, ?X], do: {:hex, 16}
+  defp radix(b) when b in [?o, ?O], do: {?7, 8}
+  defp radix(b) when b in [?b, ?B], do: {?1, 2}
 
   defp delim_kind(?(), do: :"("
   defp delim_kind(?)), do: :")"
