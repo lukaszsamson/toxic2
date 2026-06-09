@@ -1004,6 +1004,10 @@ defmodule Toxic2.Lower do
     end
   end
 
+  # Single-fragment fast path (the dominant literal shape, `"foo"`): the fragment binary IS the
+  # value — skip the interp scan and the map + iodata flatten (which would copy it).
+  defp build_string([{:frag, bin}], _opts, acc, nid), do: {bin, acc, nid}
+
   defp build_string(parts, opts, acc, nid) do
     if Enum.any?(parts, &match?({:interp, _, _}, &1)) do
       {{:<<>>, [], Enum.map(parts, &string_segment(&1, opts))}, acc, nid}
@@ -1012,22 +1016,29 @@ defmodule Toxic2.Lower do
     end
   end
 
+  defp build_charlist([{:frag, bin}], cst, view, _opts, acc, nid),
+    do: finish_charlist(bin, cst, view, acc, nid)
+
   defp build_charlist(parts, cst, view, opts, acc, nid) do
     if Enum.any?(parts, &match?({:interp, _, _}, &1)) do
       {{{:., [], [List, :to_charlist]}, [], [Enum.map(parts, &charlist_segment(&1, opts))]}, acc,
        nid}
     else
       bin = parts |> Enum.map(fn {:frag, b} -> b end) |> IO.iodata_to_binary()
-      # A charlist's content is decoded as UTF-8 codepoints, so a non-UTF-8 byte (e.g. `'\xFF'`,
-      # which yields the raw byte rather than codepoint U+00FF) is an error — unlike a string, where
-      # `<<255>>` is a valid binary. The tolerant `[255]` charlist is still produced.
-      {acc, nid} =
-        if String.valid?(bin),
-          do: {acc, nid},
-          else: invalid_charlist_encoding(cst, view, acc, nid)
-
-      {safe_to_charlist(bin), acc, nid}
+      finish_charlist(bin, cst, view, acc, nid)
     end
+  end
+
+  # A charlist's content is decoded as UTF-8 codepoints, so a non-UTF-8 byte (e.g. `'\xFF'`,
+  # which yields the raw byte rather than codepoint U+00FF) is an error — unlike a string, where
+  # `<<255>>` is a valid binary. The tolerant `[255]` charlist is still produced.
+  defp finish_charlist(bin, cst, view, acc, nid) do
+    {acc, nid} =
+      if String.valid?(bin),
+        do: {acc, nid},
+        else: invalid_charlist_encoding(cst, view, acc, nid)
+
+    {safe_to_charlist(bin), acc, nid}
   end
 
   defp invalid_charlist_encoding(cst, view, acc, nid) do
@@ -1044,6 +1055,9 @@ defmodule Toxic2.Lower do
 
     {acc, nid}
   end
+
+  defp build_quoted_atom([{:frag, bin}], inner, _anchor, _kw?, view, opts, acc, nid),
+    do: atomize_quoted(bin, inner, opts, view, acc, nid)
 
   defp build_quoted_atom(parts, inner, anchor, kw?, view, opts, acc, nid) do
     if Enum.any?(parts, &match?({:interp, _, _}, &1)) do

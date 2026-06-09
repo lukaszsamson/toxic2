@@ -25,7 +25,9 @@ defmodule Toxic2.Tokens do
 
   alias Toxic2.Token
 
-  @opaque t :: {tokens :: tuple(), size :: non_neg_integer(), cont :: MapSet.t(non_neg_integer())}
+  @opaque t ::
+            {tokens :: tuple(), size :: non_neg_integer(),
+             cont :: MapSet.t(non_neg_integer()) | nil}
 
   @doc """
   Build the parser's read-only token view from the lexer's source-ordered list. `List.to_tuple/1`
@@ -35,13 +37,14 @@ defmodule Toxic2.Tokens do
   """
   @spec from_list([Token.t()]) :: t()
   def from_list(tokens) when is_list(tokens) do
-    # Fast path (no `:cont` markers — almost always): a single `List.to_tuple/1` BIF, empty set.
-    # The marker partition (an O(n) Elixir reduce) only runs when a marker is actually present.
+    # Fast path (no `:cont` markers — almost always): a single `List.to_tuple/1` BIF, and `nil`
+    # for "no continuations" (not an empty MapSet — saves the per-file allocation and gives
+    # `cont_before?/2` a constant-false clause). The marker partition only runs when one is present.
     if has_cont?(tokens) do
       partition_cont(tokens)
     else
       toks = List.to_tuple(tokens)
-      {toks, tuple_size(toks), MapSet.new()}
+      {toks, tuple_size(toks), nil}
     end
   end
 
@@ -62,6 +65,7 @@ defmodule Toxic2.Tokens do
 
   @doc "`true` iff token `i` is immediately preceded by a space-preceded `\\`-newline continuation."
   @spec cont_before?(t(), integer()) :: boolean()
+  def cont_before?({_toks, _size, nil}, _i), do: false
   def cont_before?({_toks, _size, cont}, i), do: MapSet.member?(cont, i)
 
   @doc """

@@ -398,7 +398,7 @@ defmodule Toxic2.Lexer do
       )
 
   defp lex(<<??, ?\\, e, rest::binary>>, line, col, acc, w, st) do
-    value = Map.get(@char_escapes, e, e)
+    value = char_escape_value(e)
     w = char_escape_notice(e, line, col, 3, w)
     cont(rest, {:char, line, col, line, col + 3, value}, acc, w, st)
   end
@@ -920,6 +920,14 @@ defmodule Toxic2.Lexer do
   # Char-literal codepoints Elixir suggests writing with a named escape (`? `→`?\s`, raw tab, …):
   # null/alert/bs/tab/lf/vt/ff/cr/esc/space/del. Applies to `?<c>` and `?\<c>` alike.
   @named_escape_chars [0, 7, 8, 9, 10, 11, 12, 13, 27, 32, 127]
+
+  # `?\<c>` value: the fixed escapes as generated clauses (mirrors `esc/1`), any other char is
+  # itself.
+  for {e, v} <- @char_escapes do
+    defp char_escape_value(unquote(e)), do: unquote(v)
+  end
+
+  defp char_escape_value(e), do: e
 
   # `?\X` warnings: `X` a special char that has a named escape (`?\<space>`) → use `?\s`; or `X` an
   # ASCII letter that ISN'T a recognised escape (`?\q`, `?\x`) → use `?X`. Digits/punctuation don't.
@@ -1822,6 +1830,11 @@ defmodule Toxic2.Lexer do
 
   # A fragment token is emitted only for a non-empty run, spanning `fs`..(el, ec).
   defp flush_fragment([], _fs, _el, _ec, acc, _kind), do: acc
+
+  # Single-chunk fast path: after the plain-run bulk slicing, most fragments are exactly one
+  # binary — use it directly, skipping the reverse + iodata flatten (which would copy it).
+  defp flush_fragment([value], {fl, fc}, el, ec, acc, kind) when is_binary(value),
+    do: [{kind, fl, fc, el, ec, value} | acc]
 
   defp flush_fragment(buf, {fl, fc}, el, ec, acc, kind) do
     value = IO.iodata_to_binary(:lists.reverse(buf))
