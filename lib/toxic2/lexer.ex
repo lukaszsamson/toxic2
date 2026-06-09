@@ -1326,9 +1326,16 @@ defmodule Toxic2.Lexer do
     read_sigil(rest, line, col + 2, [<<c::utf8>> | buf], fs, acc, w, st, sm)
   end
 
-  # any other `\x` is kept verbatim (no parse-time unescape for sigils).
-  defp read_sigil(<<?\\, c, rest::binary>>, line, col, buf, fs, acc, w, st, sm),
-    do: read_sigil(rest, line, col + 2, [<<c::utf8>>, <<?\\>> | buf], fs, acc, w, st, sm)
+  # any other `\x` is kept verbatim (no parse-time unescape for sigils). The escaped char is a
+  # full CODEPOINT (`~s/\é/` keeps `é`'s bytes as-is — re-encoding its lead byte with `::utf8`
+  # would corrupt the content); a `\` before an invalid UTF-8 byte keeps that byte verbatim.
+  defp read_sigil(<<?\\, c::utf8, rest::binary>>, line, col, buf, fs, acc, w, st, sm)
+       when c != ?\n and c != ?\r,
+       do: read_sigil(rest, line, col + 2, [<<c::utf8>>, <<?\\>> | buf], fs, acc, w, st, sm)
+
+  defp read_sigil(<<?\\, b, rest::binary>>, line, col, buf, fs, acc, w, st, sm)
+       when b != ?\n and b != ?\r,
+       do: read_sigil(rest, line, col + 2, [<<b>>, <<?\\>> | buf], fs, acc, w, st, sm)
 
   # interpolation, lowercase sigils only.
   defp read_sigil(<<?#, ?{, rest::binary>>, line, col, buf, fs, acc, w, st, {_close, true} = sm) do

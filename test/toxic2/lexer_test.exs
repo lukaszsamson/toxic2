@@ -502,6 +502,37 @@ defmodule Toxic2.LexerTest do
              ]
     end
 
+    test "a sigil `\\` escape keeps a non-ASCII codepoint's bytes verbatim (no re-encoding)" do
+      # `~s/\é/` => content `\é` — the escaped char is a full codepoint, kept as-is (the old
+      # byte-wise clause re-encoded é's lead byte 0xC3 as UTF-8, corrupting it to 0xC3 0x83).
+      assert shapes("~s/\\é/") == [
+               {:sigil_start, "s"},
+               {:string_fragment, "\\é"},
+               {:sigil_end, ""}
+             ]
+
+      assert shapes("~s'\\λx'") == [
+               {:sigil_start, "s"},
+               {:string_fragment, "\\λx"},
+               {:sigil_end, ""}
+             ]
+
+      # `\` before an invalid UTF-8 byte keeps the byte verbatim (tolerant)
+      assert [{:sigil_start, "s"}, {:string_fragment, <<?a, ?\\, 0xFF, ?b>>}, {:sigil_end, ""}] =
+               shapes("~s/a\\" <> <<0xFF>> <> "b/")
+    end
+
+    test "a sigil `\\`-newline keeps both chars and still advances the line counter" do
+      # content matches the oracle (`a\<LF>b`), and `foo` on line 2 gets the right position
+      assert [
+               {:sigil_start, 1, 1, _, _, "s"},
+               {:string_fragment, 1, 4, 2, 2, "a\\\nb"},
+               {:sigil_end, 2, 2, 2, 3, ""},
+               {:eol, _, _, _, _, _},
+               {:identifier, 3, 1, 3, 4, "foo"}
+             ] = tokens("~s/a\\\nb/\nfoo")
+    end
+
     test "heredocs strip the closing delimiter's indentation (lexically)" do
       assert shapes("\"\"\"\n  a\n  b\n  \"\"\"") == [
                {:string_start, nil},
