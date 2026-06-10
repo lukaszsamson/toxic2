@@ -928,7 +928,7 @@ defmodule Toxic2.Lower do
 
   defp lower_kind(:stab, [args_node, body_node], _cst, view, opts, acc, nid) do
     {args, acc, nid} = lower_stab_args(args_node, view, opts, acc, nid)
-    {body, acc, nid} = lower_stab_body(body_node, view, opts, acc, nid)
+    {body, acc, nid} = lower_stab_body(body_node, args_node, view, opts, acc, nid)
     {{:->, stab_arrow_meta(args_node, body_node, view, opts), [args, body]}, acc, nid}
   end
 
@@ -1021,11 +1021,23 @@ defmodule Toxic2.Lower do
 
   defp build_charlist(parts, cst, view, opts, acc, nid) do
     if Enum.any?(parts, &match?({:interp, _, _}, &1)) do
-      {{{:., [], [List, :to_charlist]}, [], [Enum.map(parts, &charlist_segment(&1, opts))]}, acc,
-       nid}
+      # The interpolated-charlist dot node `{:., _, [List, :to_charlist]}` anchors at the opening
+      # quote (charlist span start), set UNCONDITIONALLY (matching `build_list_string` upstream,
+      # which uses `meta_from_location` even without token_metadata).
+      dot_meta = charlist_dot_meta(cst)
+
+      {{{:., dot_meta, [List, :to_charlist]}, [], [Enum.map(parts, &charlist_segment(&1, opts))]},
+       acc, nid}
     else
       bin = parts |> Enum.map(fn {:frag, b} -> b end) |> IO.iodata_to_binary()
       finish_charlist(bin, cst, view, acc, nid)
+    end
+  end
+
+  defp charlist_dot_meta(cst) do
+    case cspan(cst) do
+      {sl, sc, _el, _ec} -> [line: sl, column: sc]
+      _ -> []
     end
   end
 
@@ -1450,10 +1462,11 @@ defmodule Toxic2.Lower do
 
     case l do
       # Valid only as the range step: `a..b//c` (lhs a 2-element range, incl. through parens). The
-      # `..//` anchors where the range's `..` does (Elixir reuses that position) — take only the
-      # line/column anchor, not the lhs `range:`, so `..//` still gets its own (wider) range.
+      # `..//` reuses the range's `..` node meta (Elixir's `build_op` reuses it), so it inherits the
+      # `parens:` annotation of a parenthesised `..` (`(1..2)//3`). Drop only the lhs `range:`, so
+      # `..//` still gets its own (wider) range.
       {:.., m, [a, b]} ->
-        {{:..//, Keyword.take(m, [:line, :column]), [a, b, r]}, acc, nid}
+        {{:..//, Keyword.delete(m, :range), [a, b, r]}, acc, nid}
 
       # `//` is NOT a general binary operator — Elixir rejects `a // b`, `a..b//c//d`,
       # `a..(b // c)`. Toxic2 is tolerant: emit an error and keep a best-effort `//` node (P1/P5).
@@ -1510,7 +1523,18 @@ defmodule Toxic2.Lower do
 
   defp lower_unary([op_leaf, operand], view, opts, acc, nid) do
     {o, acc, nid} = lower(operand, view, opts, acc, nid)
-    {{op_atom(op_leaf, view), op_meta(op_leaf, view), [o]}, acc, nid}
+
+    case op_atom(op_leaf, view) do
+      # `//operand` captures `Kernel.//2` (division). Mirrors `build_unary_op('//')` in the yrl: the
+      # nested `{:/, [c+1], [{:/, [c], nil}, operand]}` — outer `/` anchors one column past the `//`
+      # token, inner `/` at the token column (line shared).
+      :"//" ->
+        m = op_meta(op_leaf, view)
+        {{:/, bump_column(m), [{:/, m, nil}, o]}, acc, nid}
+
+      atom ->
+        {{atom, op_meta(op_leaf, view), [o]}, acc, nid}
+    end
   end
 
   # Nullary `..` / `...` (no operand): `{:.., [], []}` / `{:..., [], []}`.
@@ -1682,15 +1706,11 @@ defmodule Toxic2.Lower do
   defp remote_dot_meta(base, view, opts) do
     case child_span(base, view) do
       {_sl, _sc, bel, bec} ->
-        case src_slice(opts, {bel, bec}, {bel, bec + 20}) do
-          s when is_binary(s) ->
-            case :binary.match(s, ".") do
-              {off, _} -> [line: bel, column: bec + off]
-              :nomatch -> nil
-            end
-
-          _ ->
-            nil
+        # Scan forward from the base's end for the `.` — multi-line, so a dot that starts a new line
+        # (`a\n.b`) anchors at the DOT (line 2, col 1), matching Elixir, rather than at the member.
+        case scan_op(opts, bel, bec, ".", src_line_count(opts)) do
+          [line: dl, column: dc] -> [line: dl, column: dc]
+          _ -> nil
         end
 
       _ ->
@@ -1782,14 +1802,20 @@ defmodule Toxic2.Lower do
 
   defp anon_call_metas(base, cst, base_meta, view, opts) do
     dot = remote_dot_meta(base, view, opts) || base_meta
+    {dot, Enum.concat(anon_call_closing(cst, opts), dot)}
+  end
 
-    closing =
+  # `closing:` = the `)` of the arg list. With a trailing do-block (`f.(1) do end`) the node span runs
+  # past `end`, so locate the `)` BEFORE the `do` instead of the span's last char.
+  defp anon_call_closing(cst, opts) do
+    if Enum.any?(cchildren(cst), &match?({:node, :do_block, _, _, _, _}, &1)) do
+      close_paren_before_do(cst, opts)
+    else
       case cspan(cst) do
         {_sl, _sc, el, ec} -> [closing: [line: el, column: ec - 1]]
         _ -> []
       end
-
-    {dot, Enum.concat(closing, dot)}
+    end
   end
 
   defp name_error(name_leaf, view, acc, nid) do
@@ -2087,10 +2113,29 @@ defmodule Toxic2.Lower do
   # `a[b]` => `{{:., m, [Access, :get]}, m, [base, index]}`.
   defp lower_access([base, idx | _missing], cst, view, opts, acc, nid) do
     {b, acc, nid} = lower(base, view, opts, acc, nid)
-    {k, acc, nid} = lower(idx, view, opts, acc, nid)
+    {k, acc, nid} = lower_bracket_arg(idx, view, opts, acc, nid)
     dm = access_dot_meta(base, cst, view, opts)
     {{{:., dm, [Access, :get]}, dm, [b, k]}, acc, nid}
   end
+
+  # `build_access_arg` (yrl) passes a `kw_data` bracket arg RAW — it does NOT wrap the keyword list
+  # in `handle_literal`, so the keyword list is unencoded (each key/value is still encoded, but the
+  # outer list is not). A non-kw bracket arg (`a[[1]]`) IS a list literal and stays encoded.
+  defp lower_bracket_arg(idx, view, opts, acc, nid) do
+    if kw_data_list?(idx) do
+      lower_each(cchildren(idx), view, opts, acc, nid)
+    else
+      lower(idx, view, opts, acc, nid)
+    end
+  end
+
+  # A bracket `kw_data` arg is a `:list` node whose children are ALL keyword pairs (the `[ ]` are the
+  # bracket-access delimiters, not a list literal). An empty list or any non-kw element means it is a
+  # real list literal (`a[[]]`, `a[[1]]`) and must keep the encoding.
+  defp kw_data_list?({:node, :list, _sp, [_ | _] = children, _f, _d}),
+    do: Enum.all?(children, &match?({:node, :kw_pair, _, _, _, _}, &1))
+
+  defp kw_data_list?(_idx), do: false
 
   # The span of a CST child, whether a node (`CST.span/1`) or a bare token leaf (via the view).
   defp child_span({:token, idx, _f, _d}, view), do: tspan(view, idx)
@@ -2169,6 +2214,18 @@ defmodule Toxic2.Lower do
   end
 
   defp lower_stab_args(args_node, view, opts, acc, nid) do
+    {args, acc, nid} = do_lower_stab_args(args_node, view, opts, acc, nid)
+    {unwrap_splice_head(args), acc, nid}
+  end
+
+  # `unwrap_splice` (yrl): a stab head whose sole arg is a `__block__` wrapping a lone splice — the
+  # parenthesised form `((unquote_splicing(x)) -> …)` — is unwrapped back to the bare splice (the
+  # `__block__` wrapper from the inner paren is stripped). `(unquote_splicing(x) -> …)` never grows
+  # the wrapper in the first place, so it is unaffected.
+  defp unwrap_splice_head([{:__block__, _, [{:unquote_splicing, _, _} = splice]}]), do: [splice]
+  defp unwrap_splice_head(args), do: args
+
+  defp do_lower_stab_args(args_node, view, opts, acc, nid) do
     case cchildren(args_node) do
       [{:node, :stab_when, _sp, when_ch, _f, _d}] ->
         {pats, [guard]} = Enum.split(when_ch, length(when_ch) - 1)
@@ -2191,10 +2248,13 @@ defmodule Toxic2.Lower do
   end
 
   # Stab clause body -> nil (empty), the expression (one), or a `__block__` (many).
-  defp lower_stab_body(body_node, view, opts, acc, nid) do
+  defp lower_stab_body(body_node, args_node, view, opts, acc, nid) do
     case cchildren(body_node) do
       [] ->
-        {nil, acc, nid}
+        # An empty stab body (`fn -> end`) is the implicit `nil` clause body — `handle_literal(nil,
+        # StabToken)` upstream, i.e. encoded via the literal_encoder with the `->` token's position
+        # (when an encoder is set; bare `nil` otherwise).
+        encode_implicit_nil(args_node, body_node, view, opts, acc, nid)
 
       [one] ->
         {ast, acc, nid} = lower(one, view, opts, acc, nid)
@@ -2202,6 +2262,33 @@ defmodule Toxic2.Lower do
 
       many ->
         wrap_block(lower_stmts(many, view, opts, acc, nid))
+    end
+  end
+
+  # The implicit `nil` body of an empty stab clause is encoded through the literal_encoder (if any),
+  # anchored at the `->` token — matching `handle_literal(nil, StabToken)` upstream. With no encoder
+  # it stays bare `nil`.
+  defp encode_implicit_nil(args_node, body_node, view, opts, acc, nid) do
+    case opts.literal_encoder do
+      nil ->
+        {nil, acc, nid}
+
+      enc ->
+        meta = arrow_anchor(args_node, body_node, view, opts)
+        run_encoder_meta(enc, nil, meta, nil, acc, nid)
+    end
+  end
+
+  # The `->` token's `[line:, column:]` (for anchoring the implicit-nil body). Reuses the same
+  # source scan as `stab_arrow_meta`, but is needed even without token_metadata (the literal_encoder
+  # runs in default mode too).
+  defp arrow_anchor(args_node, body_node, view, opts) do
+    with {line, col} <- arrow_scan_start(args_node, view),
+         last <- with({bsl, _, _, _} <- child_span(body_node, view), do: bsl, else: (_ -> line)),
+         [line: _, column: _] = arrow <- scan_op(opts, line, col, "->", last) do
+      arrow
+    else
+      _ -> []
     end
   end
 
@@ -2257,10 +2344,11 @@ defmodule Toxic2.Lower do
   defp put_assoc(k, _key, _view, _opts), do: k
 
   defp assoc_pos(key, view, opts) do
+    # Scan forward from the key's end for `=>` — multi-line, so an `=>` on a later line than the key
+    # (`%{:a\n=> 1}`) still records `assoc:` at the `=>` position (matching Elixir).
     with {_sl, _sc, kel, kec} <- child_span(key, view),
-         head when is_binary(head) <- src_slice(opts, {kel, kec}, {kel, kec + 40}),
-         {off, _} <- :binary.match(head, "=>") do
-      [line: kel, column: kec + off]
+         [line: _, column: _] = pos <- scan_op(opts, kel, kec, "=>", src_line_count(opts)) do
+      pos
     else
       _ -> nil
     end
@@ -2296,6 +2384,15 @@ defmodule Toxic2.Lower do
 
   defp op_atom(op_leaf, view), do: tv(view, ctoki(op_leaf))
   defp op_meta(op_leaf, view), do: tmeta(view, ctoki(op_leaf))
+
+  # `[line: l, column: c]` => `[line: l, column: c + 1]` (the `//` capture's outer `/` anchor). A
+  # column-less meta (columns disabled) is returned unchanged.
+  defp bump_column(meta) do
+    Enum.map(meta, fn
+      {:column, c} -> {:column, c + 1}
+      kv -> kv
+    end)
+  end
 
   defp name_span(cst, view), do: tspan(view, ctoki(cst)) || {1, 1, 1, 1}
 

@@ -289,6 +289,58 @@ end|)
     end
   end
 
+  describe "GRAMMAR_GAPS §4 (token_metadata / literal_encoder fidelity)" do
+    test "4.1 fn -> end implicit nil body is literal-encoded at the -> position" do
+      assert_parity("fn -> end")
+      assert_parity("fn x -> end")
+    end
+
+    test "4.1 fn -> end with a literal_encoder but NO token_metadata encodes the nil body" do
+      # The implicit nil body is `handle_literal(nil, ->)` upstream, so it is encoded even in
+      # default mode when an encoder is set. (Toxic2 always carries column; the structural shape and
+      # the encoded-nil wrapper are what matters here.)
+      {ast, _} = Toxic2.parse_to_ast("fn -> end", literal_encoder: @encoder)
+
+      assert {:fn, [], [{:->, [], [[], {:__block__, [line: 1, column: 4], [nil]}]}]} = ast
+    end
+
+    test "4.2 bracket-access kw args are passed RAW (not over-encoded)" do
+      assert_parity("a[b: 1]")
+      assert_parity("x[a: 1, b: 2]")
+      # A non-kw list bracket arg IS a list literal and stays encoded.
+      assert_parity("a[[1]]")
+      assert_parity("a[[]]")
+    end
+
+    test "4.3 (1..2)//3 inherits parens: from the parenthesised .." do
+      assert_parity("(1..2)//3")
+      assert_parity("1..2//3")
+    end
+
+    test "4.4 f.(1) do end closing: is the ) of the arg list" do
+      assert_parity("f.(1) do end")
+      assert_parity("f.(1)")
+      assert_parity("f.() do end")
+    end
+
+    test "4.5 interpolated charlist dot node carries the opening quote position" do
+      assert_parity("'a" <> "\#{" <> "x}b'")
+      assert_parity("'" <> "\#{" <> "y}'")
+    end
+
+    test "4.6 a\\n.b anchors the dot at the . when it starts a line" do
+      assert_parity("a\n.b")
+      assert_parity("a.\nb")
+      assert_parity("a\n. b")
+      assert_parity("a . b")
+    end
+
+    test "4.7 %{:a\\n=> 1} keeps assoc: when an eol precedes =>" do
+      assert_parity("%{:a\n=> 1}")
+      assert_parity("%{x\n=> y}")
+    end
+  end
+
   describe "real-world snippets (full meta parity)" do
     @snippets [
       "defmodule Foo do\n  @moduledoc \"hi\"\n  def bar(x), do: x + 1\nend",

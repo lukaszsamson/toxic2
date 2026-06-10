@@ -508,9 +508,11 @@ defmodule Toxic2.Parser do
   defp np_arg_kind?(t, i, :unary_op), do: not not_in?(t, i)
   defp np_arg_kind?(_t, _i, k), do: np_first_kind?(k)
 
+  # `not in` is only fused when both words are on the same line — upstream's tokenizer rewrites
+  # `not` + `in` to a single `in_op` only without an intervening newline; `a not\nin b` is a syntax
+  # error (recovered tolerantly downstream).
   defp not_in?(t, i) do
-    tk(t, i) == :unary_op and tv(t, i) == :not and
-      tk(t, skip_eols(t, i + 1)) == :in_op
+    tk(t, i) == :unary_op and tv(t, i) == :not and tk(t, i + 1) == :in_op
   end
 
   defp np_first_kind?(kind) do
@@ -999,8 +1001,11 @@ defmodule Toxic2.Parser do
     {CST.node(:kw_list, list_span(t, pairs), pairs, :matched, nil), k, diags, nid, fuel}
   end
 
-  # Operator families that may name a function reference (`op/arity`). `->`, `=>`, `..`, `...` and
-  # the structural `.` are excluded (`->/2` etc. are not captures).
+  # Operator families that may name a function reference (`op/arity`). `->`, `=>` and the structural
+  # `.` are excluded (`->/2` etc. are not captures). `..`/`...` (`range_op`/`ellipsis_op`) ARE valid
+  # here: Elixir's tokenizer re-emits an operator followed by `/arity` in capture position as an
+  # identifier, so `&../2` yields the identifier-shaped `{:.., _, nil}` (args nil), exactly as the
+  # other op refs lower (`op_ref` => `{op_atom, meta, nil}`).
   @op_ref_kinds [
     :dual_op,
     :mult_op,
@@ -1019,7 +1024,9 @@ defmodule Toxic2.Parser do
     :type_op,
     :match_op,
     :in_match_op,
-    :ternary_op
+    :ternary_op,
+    :range_op,
+    :ellipsis_op
   ]
 
   defp op_ref_slash?(t, i), do: tk(t, i) == :mult_op and tv(t, i) == :/
@@ -1731,8 +1738,12 @@ defmodule Toxic2.Parser do
   end
 
   defp parse_struct(t, pct, diags, nid, fuel) do
-    {name, j, diags, nid, fuel} =
+    {name, j0, diags, nid, fuel} =
       parse_expr(t, pct + 1, @struct_name_bp, :matched, diags, nid, fuel - 1)
+
+    # `map -> '%' map_base_expr eol map_args` admits an eol between the base and `{` (the lexer
+    # collapses consecutive newlines into one eol token, so `%Foo\n{}` and `%Foo\n\n{}` both work).
+    j = if tk(t, j0) == :eol and tk(t, skip_eols(t, j0)) == :"{", do: skip_eols(t, j0), else: j0
 
     if tk(t, j) == :"{" do
       {map, k, diags, nid, fuel} = parse_map_body(t, j, j, diags, nid, fuel)
@@ -1866,10 +1877,48 @@ defmodule Toxic2.Parser do
         {:lists.reverse(acc), i2 + 1, diags, nid, fuel}
 
       tk(t, i2) == :"," ->
+        {diags, nid} = check_map_entry_np_comma(t, hd(acc), i2, diags, nid)
         map_entries(t, skip_eols(t, i2 + 1), acc, seen_kw, diags, nid, fuel)
 
       true ->
         map_unterminated(t, i2, acc, diags, nid, fuel)
+    end
+  end
+
+  # `assoc_expr` admits only matched/unmatched exprs — a no-parens MANY call (`g b, c`) in an assoc
+  # key or value (or a bare entry) position is rejected (`%{f(a) => g b, c}`, `%{g b, c}`). The
+  # signal is the entry's value being a bare no-parens call immediately followed by `,` (it would
+  # otherwise absorb the comma into a `no_parens_many`). Mirrors `check_np_comma` for containers.
+  defp check_map_entry_np_comma(t, entry, comma_i, diags, nid) do
+    val = map_entry_value(entry)
+
+    if val != nil and CST.category(val) == :no_parens and not has_do_block?(val) do
+      {_id, diags, nid} =
+        Diagnostics.emit(
+          diags,
+          nid,
+          :parser,
+          :error,
+          :ambiguous_no_parens,
+          tok_span(t, comma_i),
+          %{}
+        )
+
+      {diags, nid}
+    else
+      {diags, nid}
+    end
+  end
+
+  # The node whose trailing no-parens call would illegally swallow the following comma: an assoc's
+  # value (2nd child), or a bare expression entry itself. A `kw_pair` value is parsed `:matched`
+  # (keyword-last is enforced separately), so it is exempt.
+  defp map_entry_value(entry) do
+    case entry do
+      {:node, :assoc, _sp, [_key, val], _f, _d} -> val
+      {:node, :kw_pair, _sp, _ch, _f, _d} -> nil
+      {:node, _kind, _sp, _ch, _f, _d} = node -> node
+      _ -> nil
     end
   end
 

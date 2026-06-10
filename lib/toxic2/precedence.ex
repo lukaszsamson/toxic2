@@ -52,7 +52,9 @@ defmodule Toxic2.Precedence do
   # down to precedence 90, so `& &1 + &2` => `&(&1 + &2)` and `&foo/1 |> g` => `&(foo/1 |> g)`,
   # while `|` (70) / `::` (60) / `when` (50) bind looser and are NOT captured. The `:unary_op` it
   # builds lowers to `{:&, _, [operand]}`; `&N` is the atomic `:capture_int` leaf.
-  @prefix %{unary_op: 300, at_op: 320, dual_op: 300, capture_op: 90}
+  # `ternary_op` (`//`) is a Nonassoc-300 PREFIX in the yrl (`unary_op_eol -> ternary_op`): this is
+  # the documented capture of `Kernel.//2`, `&//2` => `{:/, [c+1], [{:/, [c], nil}, operand]}`.
+  @prefix %{unary_op: 300, at_op: 320, dual_op: 300, capture_op: 90, ternary_op: 300}
 
   # Both lookups are generated atom-dispatch clauses (the `{prec, assoc}` tuples become shared
   # literals) instead of `Map.get` — the Pratt loop probes them on every led/nud step, and the two

@@ -148,4 +148,174 @@ defmodule Toxic2.YrlEdgeCasesTest do
       assert_accepted("{1, a: 2}")
     end
   end
+
+  defp ast(src) do
+    {ast, _diags} = Toxic2.parse_to_ast(src)
+    ast
+  end
+
+  describe "capture of the `/` operator (GRAMMAR_GAPS §1.1, build_unary_op '//')" do
+    # `unary_op_eol -> ternary_op`: `//operand` is the documented capture of `Kernel.//2`. The yrl's
+    # `build_unary_op('//')` builds the nested `{:/, [c+1], [{:/, [c], nil}, operand]}` (outer `/`
+    # one column past the `//` token, inner at the token column).
+    test "&//2 captures division" do
+      assert_accepted("&//2")
+
+      assert ast("&//2") ==
+               {:&, [line: 1, column: 1],
+                [{:/, [line: 1, column: 3], [{:/, [line: 1, column: 2], nil}, 2]}]}
+    end
+
+    test "standalone //2 (no &) yields the same nested shape" do
+      assert_accepted("//2")
+
+      assert ast("//2") ==
+               {:/, [line: 1, column: 2], [{:/, [line: 1, column: 1], nil}, 2]}
+    end
+  end
+
+  describe "operator-as-identifier in capture (GRAMMAR_GAPS §2.1)" do
+    # In capture position an operator followed by `/arity` re-emits as an identifier, so `&../2`
+    # builds `{:.., _, nil}` (args nil, NOT the nullary-op `[]`). Same for `...`. The space form
+    # `& ../2` is also nil upstream.
+    test "&../2 yields identifier-style {:.., _, nil}" do
+      assert_accepted("&../2")
+
+      assert ast("&../2") ==
+               {:&, [line: 1, column: 1],
+                [{:/, [line: 1, column: 4], [{:.., [line: 1, column: 2], nil}, 2]}]}
+    end
+
+    test "&.../2 yields identifier-style {:..., _, nil}" do
+      assert_accepted("&.../2")
+
+      assert ast("&.../2") ==
+               {:&, [line: 1, column: 1],
+                [{:/, [line: 1, column: 5], [{:..., [line: 1, column: 2], nil}, 2]}]}
+    end
+
+    test "& ../2 (space form) also yields nil args" do
+      assert_accepted("& ../2")
+
+      assert ast("& ../2") ==
+               {:&, [line: 1, column: 1],
+                [{:/, [line: 1, column: 5], [{:.., [line: 1, column: 3], nil}, 2]}]}
+    end
+
+    test "standalone .. / ... stay nullary-op {:.., _, []} (unchanged)" do
+      assert ast("..") == {:.., [line: 1, column: 1], []}
+      assert ast("(..)") == {:.., [line: 1, column: 2], []}
+      assert ast("...") == {:..., [line: 1, column: 1], []}
+    end
+  end
+
+  describe "eol between struct base and body (GRAMMAR_GAPS §1.2)" do
+    # `map -> '%' map_base_expr eol map_args` admits an eol (the lexer collapses consecutive newlines
+    # into one eol token, so one or more blank lines both parse).
+    # Default (no-meta-parity) mode: container nodes (`%`, `%{}`) carry empty meta; only the alias
+    # keeps its anchor. token_metadata fidelity for these is covered by `token_metadata_test.exs`.
+    test "%Foo\\n{} is a valid empty struct" do
+      assert_accepted("%Foo\n{}")
+
+      assert ast("%Foo\n{}") ==
+               {:%, [], [{:__aliases__, [line: 1, column: 2], [:Foo]}, {:%{}, [], []}]}
+    end
+
+    test "%Foo\\n\\n{} (two newlines collapse to one eol) is also valid" do
+      assert_accepted("%Foo\n\n{}")
+
+      assert ast("%Foo\n\n{}") ==
+               {:%, [], [{:__aliases__, [line: 1, column: 2], [:Foo]}, {:%{}, [], []}]}
+    end
+  end
+
+  describe "unwrap_splice through parens in stab heads (GRAMMAR_GAPS §2.2)" do
+    # `stab_parens_many` applies `unwrap_splice` to the head args: a sole arg of shape
+    # `{:__block__, _, [{:unquote_splicing, _, _}]}` (the `__block__` the inner paren wraps a lone
+    # splice in) is stripped back to the bare splice. The single-paren form never grows the wrapper.
+    test "((unquote_splicing([1, 2])) -> :ok) unwraps the __block__ around the splice" do
+      assert_accepted("((unquote_splicing([1, 2])) -> :ok)")
+
+      assert ast("((unquote_splicing([1, 2])) -> :ok)") ==
+               [{:->, [], [[{:unquote_splicing, [line: 1, column: 3], [[1, 2]]}], :ok]}]
+    end
+
+    test "single-paren (unquote_splicing([1, 2]) -> :ok) stays unwrapped (no regression)" do
+      assert_accepted("(unquote_splicing([1, 2]) -> :ok)")
+
+      assert ast("(unquote_splicing([1, 2]) -> :ok)") ==
+               [{:->, [], [[{:unquote_splicing, [line: 1, column: 2], [[1, 2]]}], :ok]}]
+    end
+
+    test "fn unquote_splicing([a]) -> 1 end stays correct" do
+      assert_accepted("fn unquote_splicing([a]) -> 1 end")
+
+      assert ast("fn unquote_splicing([a]) -> 1 end") ==
+               {:fn, [],
+                [
+                  {:->, [],
+                   [
+                     [
+                       {:unquote_splicing, [line: 1, column: 4],
+                        [[{:a, [line: 1, column: 22], nil}]]}
+                     ],
+                     1
+                   ]}
+                ]}
+    end
+  end
+
+  describe "not in must not split across lines (GRAMMAR_GAPS §3.1)" do
+    # Upstream fuses `not` + `in` into a single `in_op` only when both words are on the same line;
+    # across an eol it is a syntax error. Toxic2 stops fusing and recovers tolerantly.
+    test "a not\\nin b is rejected with an :unexpected_token error on the stray `in`" do
+      assert_rejected("a not\nin b")
+
+      # Pin phase + severity + code: recovery flags the now-bare `in` operator at line 2 col 1.
+      [d | _] = parser_errors("a not\nin b")
+      assert Diagnostic.phase(d) == :parser
+      assert Diagnostic.severity(d) == :error
+      assert Diagnostic.code(d) == :unexpected_token
+      assert Diagnostic.span(d) == {2, 1, 2, 3}
+      assert Diagnostic.details(d) == %{kind: :in_op}
+    end
+
+    test "a not in b (same line) still fuses (no regression)" do
+      assert_accepted("a not in b")
+
+      # `not`/`in` keyword anchors are only filled in token_metadata mode; default mode is no-meta.
+      assert ast("a not in b") ==
+               {:not, [],
+                [
+                  {:in, [], [{:a, [line: 1, column: 1], nil}, {:b, [line: 1, column: 10], nil}]}
+                ]}
+    end
+  end
+
+  describe "no-parens-many call as map assoc key/value (GRAMMAR_GAPS §3.2)" do
+    # `assoc_expr` admits only matched/unmatched exprs — a no-parens MANY call (`g b, c`) in an
+    # assoc key/value (or a bare entry) position is `error_no_parens_many_strict`.
+    test "%{f(a) => g b, c} (no-parens-many in assoc value) is rejected" do
+      assert_rejected("%{f(a) => g b, c}")
+    end
+
+    test "%{g b, c => 1} (no-parens-many in assoc key) is rejected" do
+      assert_rejected("%{g b, c => 1}")
+    end
+
+    test "%{g b, c} (no-parens-many as a bare entry) is rejected" do
+      assert_rejected("%{g b, c}")
+    end
+
+    test "%{m | k => g b, c} (no-parens-many in update assoc value) is rejected" do
+      assert_rejected("%{m | k => g b, c}")
+    end
+
+    test "valid maps with a no-parens call NOT followed by a comma stay accepted" do
+      assert_accepted("%{f(a) => g b}")
+      assert_accepted("%{1 => 2, 3}")
+      assert_accepted("%{a => b, c => d}")
+      assert_accepted("%{x, y}")
+    end
+  end
 end
