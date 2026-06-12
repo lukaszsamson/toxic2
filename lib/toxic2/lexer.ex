@@ -1884,21 +1884,24 @@ defmodule Toxic2.Lexer do
 
   # --- end-of-line coalescing --------------------------------------------
 
-  defp do_eol(bin, sl, sc, acc, w, st) do
-    {rest, el, ec, count} = consume_eols(bin, sl, sc, 0)
-    lex(rest, el, ec, [{:eol, sl, sc, el, ec, count} | acc], w, st)
-  end
+  # The terminal clause emits the `:eol` token and re-enters `lex/6` directly (instead of
+  # returning a `{rest, line, col, count}` 4-tuple to `do_eol` — one throwaway tuple per eol run,
+  # and eol runs are one of the commonest events in real code). `sl`/`sc` ride along as the token's
+  # start position.
+  defp do_eol(bin, sl, sc, acc, w, st), do: consume_eols(bin, sl, sc, 0, sl, sc, acc, w, st)
 
-  defp consume_eols(<<"\r\n", rest::binary>>, line, _col, count),
-    do: consume_eols(rest, line + 1, 1, count + 1)
+  defp consume_eols(<<"\r\n", rest::binary>>, line, _col, count, sl, sc, acc, w, st),
+    do: consume_eols(rest, line + 1, 1, count + 1, sl, sc, acc, w, st)
 
-  defp consume_eols(<<"\n", rest::binary>>, line, _col, count),
-    do: consume_eols(rest, line + 1, 1, count + 1)
+  defp consume_eols(<<"\n", rest::binary>>, line, _col, count, sl, sc, acc, w, st),
+    do: consume_eols(rest, line + 1, 1, count + 1, sl, sc, acc, w, st)
 
-  defp consume_eols(<<c, rest::binary>>, line, col, count) when c in [?\s, ?\t],
-    do: consume_eols(rest, line, col + 1, count)
+  defp consume_eols(<<c, rest::binary>>, line, col, count, sl, sc, acc, w, st)
+       when c in [?\s, ?\t],
+       do: consume_eols(rest, line, col + 1, count, sl, sc, acc, w, st)
 
-  defp consume_eols(rest, line, col, count), do: {rest, line, col, count}
+  defp consume_eols(rest, line, col, count, sl, sc, acc, w, st),
+    do: lex(rest, line, col, [{:eol, sl, sc, line, col, count} | acc], w, st)
 
   # --- scanners ----------------------------------------------------------
 
