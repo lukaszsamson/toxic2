@@ -154,11 +154,30 @@ defmodule Toxic2.Lower do
   # an unclosed/empty delimiter (e.g. a bare `(` at EOF); there is no source to slice
   defp src_slice(%{source_lines: _lines}, {sl, _sc}, {el, _ec}) when sl == el, do: nil
 
+  # Multi-line (rare — heredoc / cross-line `token:` text): the first line FROM column `sc` to its
+  # end, the whole inner lines, and the last line UP TO column `ec`. Same `col_byte` + `binary_part`
+  # treatment as the single-line clause (no `String.slice`/`String.length` grapheme walk); the inner
+  # lines are already sub-binaries. The `Enum.join` materialises the one result binary (inherent).
   defp src_slice(%{source_lines: lines}, {sl, sc}, {el, ec})
        when is_tuple(lines) and el > sl and ec >= 1 do
-    head = elem(lines, sl - 1) |> String.slice(sc - 1, String.length(elem(lines, sl - 1)))
+    head_line = elem(lines, sl - 1)
+
+    head =
+      case col_byte(head_line, sc) do
+        :past -> ""
+        o -> binary_part(head_line, o, byte_size(head_line) - o)
+      end
+
+    tail_line = elem(lines, el - 1)
+
+    tend =
+      case col_byte(tail_line, ec) do
+        :past -> byte_size(tail_line)
+        o -> o
+      end
+
+    tail = binary_part(tail_line, 0, tend)
     mids = for l <- (sl + 1)..(el - 1)//1, do: elem(lines, l - 1)
-    tail = elem(lines, el - 1) |> String.slice(0, ec - 1)
     Enum.join(Enum.concat([[head], mids, [tail]]), "\n")
   end
 
