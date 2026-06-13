@@ -189,9 +189,27 @@ defmodule Toxic2.Lexer do
   parse boundary (`Diagnostics.number/2`).
   """
   @spec tokenize(binary(), keyword()) :: {[token()], [warning()]}
-  def tokenize(source, _opts \\ []) when is_binary(source) do
-    {rev_tokens, rev_warnings} = lex(source, 1, 1, [], [], [])
+  def tokenize(source, opts \\ []) when is_binary(source) do
+    {tokens, warnings, _comments} = tokenize_with_comments(source, opts)
+    {tokens, warnings}
+  end
+
+  @doc """
+  Like `tokenize/2` but also returns the source-ordered list of comments collected by the lexer.
+
+  Each comment is `{:comment, line, column, text, previous_eol_count, next_eol_count}` (1-based
+  position of the `#`; `text` includes the leading `#`, excludes the trailing newline). Mirrors the
+  data `Code.string_to_quoted_with_comments/2` collects via `:preserve_comments`.
+  """
+  @spec tokenize_with_comments(binary(), keyword()) :: {[token()], [warning()], [tuple()]}
+  def tokenize_with_comments(source, _opts \\ []) when is_binary(source) do
+    {rev_tokens, rev_notices} = lex(source, 1, 1, [], [], [])
     tokens = :lists.reverse(rev_tokens)
+
+    # comments ride the `w` channel alongside lexer warnings; partition them back out
+    {rev_comments, rev_warnings} =
+      Enum.split_with(rev_notices, &match?({:comment, _, _, _, _, _}, &1))
+
     warnings = :lists.reverse(rev_warnings)
 
     # UTS-39 confusable-identifier lint: a whole-file pass, run only when a non-ASCII IDENTIFIER is
@@ -204,7 +222,7 @@ defmodule Toxic2.Lexer do
         do: Enum.concat(warnings, confusable_lint(tokens)),
         else: warnings
 
-    {tokens, warnings}
+    {tokens, warnings, :lists.reverse(rev_comments)}
   end
 
   @identifier_name_kinds [:identifier, :kw_identifier, :alias, :atom]
@@ -321,7 +339,24 @@ defmodule Toxic2.Lexer do
         do: comment_bidi_check(rest, line, col + 1, acc),
         else: acc
 
-    lex(rest_at(rest, drop_len), line, col + 1 + drop_len, acc, w, st)
+    after_comment = rest_at(rest, drop_len)
+
+    # the comment text excludes the trailing newline; a CRLF leaves a `\r` just before the `\n` which
+    # is also excluded (matching Code, whose `tokenize_comment` stops before `\r\n`).
+    text_len =
+      if drop_len > 0 and binary_part(rest, drop_len - 1, 1) == "\r",
+        do: drop_len - 1,
+        else: drop_len
+
+    # comments are dropped from the token stream (the parser never sees them); they ride the
+    # out-of-band `w` channel as `{:comment, line, col, text, previous_eol_count, next_eol_count}`
+    # and `tokenize/2` partitions them back out (see `tokenize_with_comments/2`). `previous_eol_count`
+    # mirrors Elixir: the preceding `:eol` run's newline count, or 1 at the start of input, else 0.
+    comment =
+      {:comment, line, col, "#" <> binary_part(rest, 0, text_len),
+       comment_previous_eol_count(acc), next_eol_count(after_comment, 0)}
+
+    lex(after_comment, line, col + 1 + drop_len, acc, [comment | w], st)
   end
 
   # --- line continuation: a `\` right before a newline joins the lines (no :eol emitted) ----
@@ -1881,6 +1916,20 @@ defmodule Toxic2.Lexer do
   defp atom_word_len(rest, n), do: {n, rest}
 
   defp rest_at(bin, len), do: binary_part(bin, len, byte_size(bin) - len)
+
+  # comment `previous_eol_count` (mirrors Code): the preceding `:eol` run's newline count, 1 at the
+  # start of input, else 0.
+  defp comment_previous_eol_count([{:eol, _, _, _, _, count} | _]), do: count
+  defp comment_previous_eol_count([]), do: 1
+  defp comment_previous_eol_count(_), do: 0
+
+  # comment `next_eol_count` (mirrors Code's `next_eol_count/2`): skip spaces/tabs, count newlines,
+  # stop at the next token.
+  defp next_eol_count(<<?\s, rest::binary>>, count), do: next_eol_count(rest, count)
+  defp next_eol_count(<<?\t, rest::binary>>, count), do: next_eol_count(rest, count)
+  defp next_eol_count(<<?\r, ?\n, rest::binary>>, count), do: next_eol_count(rest, count + 1)
+  defp next_eol_count(<<?\n, rest::binary>>, count), do: next_eol_count(rest, count + 1)
+  defp next_eol_count(_rest, count), do: count
 
   # --- end-of-line coalescing --------------------------------------------
 

@@ -185,7 +185,10 @@ defmodule Toxic2.Parser do
             kind: k
           })
 
-        {skip_to_eoe(t, i + 1), diags, nid}
+        # Don't discard the leftover tokens — leave the cursor in place so the caller's collect
+        # loop re-parses them as the next statement (`1 2` recovers as two statements). The
+        # leftover may carry meaning (an IDE cursor marker, a half-typed expression).
+        {i, diags, nid}
     end
   end
 
@@ -1543,15 +1546,9 @@ defmodule Toxic2.Parser do
             kind: tk(t, i)
           })
 
-        {skip_to_body_boundary(t, i + 1), diags, nid}
-    end
-  end
-
-  defp skip_to_body_boundary(t, i) do
-    if at_section_end?(t, i) or tk(t, i) in [:eol, :";"] do
-      i
-    else
-      skip_to_body_boundary(t, i + 1)
+        # As in `end_statement`: keep the leftover tokens so the body collect loop re-parses
+        # them as the next statement instead of silently dropping them.
+        {i, diags, nid}
     end
   end
 

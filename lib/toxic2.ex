@@ -65,4 +65,26 @@ defmodule Toxic2 do
 
     {ast, Toxic2.Diagnostics.merge_sorted([lex_diags, parser_diags, lowerer_diags])}
   end
+
+  @doc """
+  Like `parse_to_ast/2` but also returns the source's comments — `{ast, diagnostics, comments}`.
+
+  Each comment is a map `%{line:, column:, previous_eol_count:, next_eol_count:, text:}` matching
+  `Code.string_to_quoted_with_comments/2` (1-based positions; `text` includes the leading `#`).
+  Comments are collected by the lexer and never reach the parser, so the `ast`/`diagnostics` are
+  identical to `parse_to_ast/2`. Accepts the same options as `parse_to_ast/2`.
+  """
+  @spec string_to_quoted_with_comments(binary(), keyword()) ::
+          {Macro.t(), [Toxic2.Diagnostic.t()], [map()]}
+  def string_to_quoted_with_comments(source, opts \\ []) when is_binary(source) do
+    {view, lex_notices, comments} = Toxic2.Tokens.from_source_with_comments(source, opts)
+    {cst, parser_diags} = Toxic2.Parser.parse_tokens(view)
+
+    {lex_diags, nid} =
+      Toxic2.Diagnostics.number(lex_notices, Toxic2.Diagnostics.next_id(parser_diags))
+
+    {ast, lowerer_diags} = Toxic2.Lower.to_ast(cst, view, source, opts, nid)
+
+    {ast, Toxic2.Diagnostics.merge_sorted([lex_diags, parser_diags, lowerer_diags]), comments}
+  end
 end

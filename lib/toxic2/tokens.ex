@@ -81,6 +81,44 @@ defmodule Toxic2.Tokens do
     {from_list(tokens), notices}
   end
 
+  @doc """
+  Like `from_source/2` but also returns the source-ordered comment list as `Code`-style maps
+  (`%{line:, column:, previous_eol_count:, next_eol_count:, text:}`). Mirrors
+  `Code.string_to_quoted_with_comments/2`.
+  """
+  @spec from_source_with_comments(binary(), keyword()) :: {t(), [tuple()], [map()]}
+  def from_source_with_comments(source, opts \\ []) when is_binary(source) do
+    {tokens, notices, raw_comments} = Toxic2.Lexer.tokenize_with_comments(source, opts)
+    {from_list(tokens), notices, to_comment_maps(raw_comments)}
+  end
+
+  # Convert the lexer's raw comment tuples into Code-compatible maps. `previous_eol_count` is the
+  # minimum of the raw newline count before the comment and the distance to the previous comment
+  # (matching `Code`'s `min(previous_eol_count(tokens), last_comment_distance(comments, line))`).
+  defp to_comment_maps(raw_comments) do
+    {maps, _previous_line} =
+      Enum.map_reduce(raw_comments, nil, fn
+        {:comment, line, column, text, previous_eol_count, next_eol_count}, previous_line ->
+          previous_eol_count =
+            case previous_line do
+              nil -> previous_eol_count
+              previous_line -> min(previous_eol_count, line - previous_line)
+            end
+
+          map = %{
+            line: line,
+            column: column,
+            previous_eol_count: previous_eol_count,
+            next_eol_count: next_eol_count,
+            text: text
+          }
+
+          {map, line}
+      end)
+
+    maps
+  end
+
   @doc "Number of tokens in the view."
   @spec size(t()) :: non_neg_integer()
   def size({_toks, size, _cont}), do: size

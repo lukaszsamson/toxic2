@@ -128,8 +128,13 @@ defmodule Toxic2.Lower do
   defp chomp_cr(line), do: line
 
   # Raw source text spanning `{sl,sc}`..`{el,ec}` (codepoint columns, end-exclusive), or `nil`.
-  defp src_slice(%{source_lines: lines}, {sl, sc}, {el, ec}) when is_tuple(lines) and sl == el,
-    do: String.slice(elem(lines, sl - 1), sc - 1, ec - sc)
+  defp src_slice(%{source_lines: lines}, {sl, sc}, {el, ec})
+       when is_tuple(lines) and sl == el and ec >= sc,
+       do: String.slice(elem(lines, sl - 1), sc - 1, ec - sc)
+
+  # a degenerate span (`ec < sc`) can arise from an unclosed/empty delimiter
+  # (e.g. a bare `(` at EOF); there is no source to slice
+  defp src_slice(%{source_lines: _lines}, {sl, _sc}, {el, _ec}) when sl == el, do: nil
 
   defp src_slice(%{source_lines: lines}, {sl, sc}, {el, ec}) when is_tuple(lines) do
     head = elem(lines, sl - 1) |> String.slice(sc - 1, String.length(elem(lines, sl - 1)))
