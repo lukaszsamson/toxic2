@@ -186,23 +186,23 @@ defmodule Toxic2.Lower do
         finalize_eoe(nls, semi, pos)
 
       text ->
-        seg = String.slice(text, col - 1, max(String.length(text) - (col - 1), 0))
-        {ws, rest} = split_leading_ws(seg)
-        tok_col = col + ws
-
-        cond do
-          # End of line, or a comment: cross this line's `\n`. A comment RESETS the run (Elixir
-          # counts only the newlines after the last comment), so we carry 0 across a comment line.
-          rest == "" ->
+        # First significant char at/after column `col`, found by ONE in-place codepoint walk —
+        # no `String.slice`/`String.length` and no `split_leading_ws` tail binary (those were the
+        # top token_metadata allocator). `tok_col` is the codepoint column of that char.
+        case line_probe(text, col) do
+          # End of line: cross this line's `\n`.
+          {:eol, tok_col} ->
             cross_newline(opts, line, nls, semi, pos || {line, tok_col})
 
-          match?("#" <> _, rest) ->
+          # A comment RESETS the run (Elixir counts only the newlines after the last comment), so
+          # we carry 0 across a comment line.
+          {:hash, tok_col} ->
             cross_newline(opts, line, 0, semi, pos || {line, tok_col})
 
-          match?(";" <> _, rest) ->
+          {:semi, tok_col} ->
             scan_eoe(opts, line, tok_col + 1, nls, true, pos || {line, tok_col})
 
-          true ->
+          {:other, _tok_col} ->
             finalize_eoe(nls, semi, pos)
         end
     end
@@ -222,12 +222,34 @@ defmodule Toxic2.Lower do
 
   defp finalize_eoe(_nls, _semi, _pos), do: []
 
-  defp split_leading_ws(<<c, rest::binary>>) when c in [?\s, ?\t] do
-    {n, tail} = split_leading_ws(rest)
-    {n + 1, tail}
-  end
+  # Walk `text` from codepoint column `col`: skip the leading `col - 1` codepoints to reach the
+  # start column (`n > 0` phase), skip any space/tab (`n == 0` phase, advancing the column), then
+  # classify the first significant char. Returns `{:eol | :hash | :semi | :other, tok_col}` — ONLY
+  # scalars cross the boundary, never a sub-binary.
+  #
+  # EVERY clause begins with a binary match (no bare-variable head), so the BEAM threads ONE match
+  # context through the whole walk with zero per-step allocation (`bin_opt_info`-verified). A bare
+  # `(bin, 0, col)` termination clause silently defeats this — it makes the byte scan materialize a
+  # fresh sub-binary on every codepoint, which on real columns (~10 deep) was a 16× allocation
+  # blow-up over the `String.slice` this replaced. The single-byte (ASCII) clauses are the hot path;
+  # the `utf8` clause keeps the SKIP phase counting one column per codepoint on non-ASCII lines
+  # (matching the lexer's span columns). At `n == 0` we return on the first non-ws byte, so the
+  # classify phase needs no `utf8` clause (any non-ws lead byte is `:other`).
+  defp line_probe(text, col), do: line_walk(text, col - 1, col)
 
-  defp split_leading_ws(rest), do: {0, rest}
+  defp line_walk(<<c, rest::binary>>, n, col) when n > 0 and c < 128,
+    do: line_walk(rest, n - 1, col)
+
+  defp line_walk(<<_::utf8, rest::binary>>, n, col) when n > 0, do: line_walk(rest, n - 1, col)
+  defp line_walk(<<_, rest::binary>>, n, col) when n > 0, do: line_walk(rest, n - 1, col)
+
+  defp line_walk(<<c, rest::binary>>, 0, col) when c == ?\s or c == ?\t,
+    do: line_walk(rest, 0, col + 1)
+
+  defp line_walk(<<?#, _::binary>>, 0, col), do: {:hash, col}
+  defp line_walk(<<?;, _::binary>>, 0, col), do: {:semi, col}
+  defp line_walk(<<>>, _n, col), do: {:eol, col}
+  defp line_walk(<<_, _::binary>>, 0, col), do: {:other, col}
 
   # Count the newlines in the source from `{line, col}` up to the next real token, with the same
   # comment-reset rule as `end_of_expression` (a comment line zeroes the run). Used for the
@@ -239,18 +261,15 @@ defmodule Toxic2.Lower do
         nls
 
       text ->
-        rest =
-          text |> String.slice(col - 1, max(String.length(text) - (col - 1), 0)) |> elem_rest()
-
-        cond do
-          rest == "" -> cross_gap(opts, line, nls + 1, nls)
-          match?("#" <> _, rest) -> cross_gap(opts, line, 1, nls)
-          true -> nls
+        # Same in-place walk as `scan_eoe` (no slicing). A `;` is not a gap terminator here, so it
+        # falls into `:other` like any real token — matching the old `true ->` branch.
+        case line_probe(text, col) do
+          {:eol, _} -> cross_gap(opts, line, nls + 1, nls)
+          {:hash, _} -> cross_gap(opts, line, 1, nls)
+          _ -> nls
         end
     end
   end
-
-  defp elem_rest(seg), do: split_leading_ws(seg) |> elem(1)
 
   defp cross_gap(opts, line, next_nls, eof_nls) do
     if line < src_line_count(opts), do: gap_newlines(opts, line + 1, 1, next_nls), else: eof_nls
