@@ -6,6 +6,14 @@ defmodule Toxic2.LowerTest do
       assert {{:+, _, [1, 2]}, []} = Toxic2.parse_to_ast("1 + 2")
     end
 
+    test "unclosed grouping paren does not crash (degenerate span in add_parens_meta)" do
+      # with token_metadata the lowerer slices the paren's source to detect `;`; an unclosed `(`
+      # leaves a degenerate span that must not blow up String.slice
+      for source <- ["(\n", "bar (\n", "Foo(\n", "a + (\n", "x\n(\n", "("] do
+        assert {_ast, _diagnostics} = Toxic2.parse_to_ast(source, token_metadata: true)
+      end
+    end
+
     test "identifier lowers to a var, alias to __aliases__, atom to an atom" do
       assert {{:foo, _, nil}, []} = Toxic2.parse_to_ast("foo")
       assert {{:__aliases__, _, [:Foo]}, []} = Toxic2.parse_to_ast("Foo")

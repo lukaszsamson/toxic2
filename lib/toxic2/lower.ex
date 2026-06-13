@@ -132,11 +132,12 @@ defmodule Toxic2.Lower do
        when is_tuple(lines) and sl == el and ec >= sc,
        do: String.slice(elem(lines, sl - 1), sc - 1, ec - sc)
 
-  # a degenerate span (`ec < sc`) can arise from an unclosed/empty delimiter
-  # (e.g. a bare `(` at EOF); there is no source to slice
+  # a degenerate span (`ec < sc` on one line, or `ec < 1` / `el < sl` across lines) can arise from
+  # an unclosed/empty delimiter (e.g. a bare `(` at EOF); there is no source to slice
   defp src_slice(%{source_lines: _lines}, {sl, _sc}, {el, _ec}) when sl == el, do: nil
 
-  defp src_slice(%{source_lines: lines}, {sl, sc}, {el, ec}) when is_tuple(lines) do
+  defp src_slice(%{source_lines: lines}, {sl, sc}, {el, ec})
+       when is_tuple(lines) and el > sl and ec >= 1 do
     head = elem(lines, sl - 1) |> String.slice(sc - 1, String.length(elem(lines, sl - 1)))
     mids = for l <- (sl + 1)..(el - 1)//1, do: elem(lines, l - 1)
     tail = elem(lines, el - 1) |> String.slice(0, ec - 1)
