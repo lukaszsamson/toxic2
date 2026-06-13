@@ -128,9 +128,27 @@ defmodule Toxic2.Lower do
   defp chomp_cr(line), do: line
 
   # Raw source text spanning `{sl,sc}`..`{el,ec}` (codepoint columns, end-exclusive), or `nil`.
+  # Single-line (the hot case — `token:` text, `(`/`)` delimiter checks): map the codepoint columns
+  # to byte offsets with `col_byte` and take ONE `binary_part`, instead of `String.slice`'s
+  # grapheme walk (`do_slice`/`byte_size_remaining_at`/`unicode_util.gc` were ~3M tm words). The
+  # `:past` clamp mirrors `String.slice` returning "" past the line end / to the line end.
   defp src_slice(%{source_lines: lines}, {sl, sc}, {el, ec})
-       when is_tuple(lines) and sl == el and ec >= sc,
-       do: String.slice(elem(lines, sl - 1), sc - 1, ec - sc)
+       when is_tuple(lines) and sl == el and ec >= sc do
+    line = elem(lines, sl - 1)
+
+    case col_byte(line, sc) do
+      :past ->
+        ""
+
+      o1 ->
+        o2 = case col_byte(line, ec) do
+          :past -> byte_size(line)
+          v -> v
+        end
+
+        binary_part(line, o1, o2 - o1)
+    end
+  end
 
   # a degenerate span (`ec < sc` on one line, or `ec < 1` / `el < sl` across lines) can arise from
   # an unclosed/empty delimiter (e.g. a bare `(` at EOF); there is no source to slice
@@ -657,16 +675,50 @@ defmodule Toxic2.Lower do
         []
 
       text ->
-        seg = String.slice(text, col - 1, max(String.length(text) - (col - 1), 0))
+        # Position at codepoint column `col` (scalar byte offset, no slice), then let the C-level
+        # Boyer–Moore `:binary.match` find `needle` from there — no `String.slice`/`String.split`
+        # (the list + `++`) / `String.length`. The gap from `col` to the operator is whitespace, so
+        # its codepoint width equals the byte delta; `cp_between` keeps it exact for the rare case.
+        case col_byte(text, col) do
+          :past ->
+            scan_op(opts, line + 1, 1, needle, last_line)
 
-        case String.split(seg, needle, parts: 2) do
-          [before, _] -> [line: line, column: col + String.length(before)]
-          _ -> scan_op(opts, line + 1, 1, needle, last_line)
+          boff ->
+            case :binary.match(text, needle, scope: {boff, byte_size(text) - boff}) do
+              {moff, _} -> [line: line, column: col + cp_between(text, boff, moff)]
+              :nomatch -> scan_op(opts, line + 1, 1, needle, last_line)
+            end
         end
     end
   end
 
   defp scan_op(_opts, _line, _col, _needle, _last_line), do: []
+
+  # Byte offset of codepoint column `col` in `text` (i.e. after `col - 1` codepoints), or `:past`
+  # past the line end. Scalar return — never a tail binary — so the BEAM threads one match context
+  # with zero per-step allocation (every clause has a binary head; the `0` terminal matches
+  # `<<_::binary>>`, not a bare variable, which would silently de-opt the whole scan).
+  defp col_byte(text, col), do: col_byte(text, col - 1, 0)
+
+  defp col_byte(<<cp::utf8, rest::binary>>, n, off) when n > 0,
+    do: col_byte(rest, n - 1, off + utf8_width(cp))
+
+  defp col_byte(<<_, rest::binary>>, n, off) when n > 0, do: col_byte(rest, n - 1, off + 1)
+  defp col_byte(<<>>, n, _off) when n > 0, do: :past
+  defp col_byte(<<_::binary>>, _n, off), do: off
+
+  defp utf8_width(cp) when cp < 0x80, do: 1
+  defp utf8_width(cp) when cp < 0x800, do: 2
+  defp utf8_width(cp) when cp < 0x10000, do: 3
+  defp utf8_width(_cp), do: 4
+
+  # Codepoints in the byte range `text[lo..hi)` — the gap between a span end and the operator the
+  # scan found. Almost always pure-ASCII whitespace (so `hi - lo`), but counted for exactness.
+  defp cp_between(text, lo, hi), do: count_cp(binary_part(text, lo, hi - lo))
+
+  defp count_cp(<<>>), do: 0
+  defp count_cp(<<_::utf8, rest::binary>>), do: 1 + count_cp(rest)
+  defp count_cp(<<_, rest::binary>>), do: 1 + count_cp(rest)
 
   # `delimiter:` — the opening string/charlist/sigil delimiter, read from the source: at the node
   # span start for strings/charlists, after the leading `:` for quoted atoms, and after `~` + the
@@ -788,24 +840,39 @@ defmodule Toxic2.Lower do
 
   defp last_paren(opts, sl, sc, dsl, dsc) do
     Enum.reduce(sl..dsl, [], fn line, acc ->
-      text = src_line(opts, line) || ""
-      from = if line == sl, do: sc, else: 1
-      upto = if line == dsl, do: dsc - 1, else: String.length(text)
-      seg = String.slice(text, from - 1, max(upto - from + 1, 0))
+      case src_line(opts, line) do
+        nil ->
+          acc
 
-      case last_index_of(seg, ")") do
-        nil -> acc
-        i -> [closing: [line: line, column: from + i]]
+        text ->
+          from = if line == sl, do: sc, else: 1
+          # Non-last lines: any column is in-window; `byte_size` is a safe upper bound on the
+          # codepoint column count, so no `String.length` is needed.
+          upto = if line == dsl, do: dsc - 1, else: byte_size(text)
+
+          case last_char_col(text, ?), 1, from, upto, nil) do
+            nil -> acc
+            col -> [closing: [line: line, column: col]]
+          end
       end
     end)
   end
 
-  defp last_index_of(s, ch) do
-    case String.split(s, ch) do
-      [_] -> nil
-      parts -> String.length(s) - String.length(List.last(parts)) - 1
-    end
+  # Codepoint column of the LAST `ch` (an ASCII byte) within columns `[from, upto]` of `text`, or
+  # `nil`. One in-place walk, no slice/split/length; every clause has a binary head (the `<<>>`
+  # terminal) so the match context threads with zero per-step allocation.
+  defp last_char_col(<<>>, _ch, _col, _from, _upto, last), do: last
+
+  defp last_char_col(<<c, rest::binary>>, ch, col, from, upto, last) when c < 128 do
+    last = if c == ch and col >= from and col <= upto, do: col, else: last
+    last_char_col(rest, ch, col + 1, from, upto, last)
   end
+
+  defp last_char_col(<<_::utf8, rest::binary>>, ch, col, from, upto, last),
+    do: last_char_col(rest, ch, col + 1, from, upto, last)
+
+  defp last_char_col(<<_, rest::binary>>, ch, col, from, upto, last),
+    do: last_char_col(rest, ch, col + 1, from, upto, last)
 
   # `do:` / `end:` come from the do-block span (start = `do`, end − 3 = `end`). On TOLERANT/invalid
   # input the block may be unterminated (recovered missing `end`), which would yield an impossible
@@ -824,9 +891,25 @@ defmodule Toxic2.Lower do
   end
 
   defp kw_at(opts, line, col, word, key) do
-    if col >= 1 and src_slice(opts, {line, col}, {line, col + String.length(word)}) == word,
+    if col >= 1 and word_at?(src_line(opts, line), col, word),
       do: [{key, [line: line, column: col]}],
       else: []
+  end
+
+  # Is the literal `word` (ASCII: `do`/`end`) at codepoint column `col` of the line? Positions with
+  # `col_byte` (no `src_slice`/`String.length`) and compares the bytes directly — the only sub-binary
+  # is the ≤3-byte `binary_part` for the equality check, once per call (not per char).
+  defp word_at?(nil, _col, _word), do: false
+
+  defp word_at?(text, col, word) do
+    case col_byte(text, col) do
+      :past ->
+        false
+
+      boff ->
+        wlen = byte_size(word)
+        byte_size(text) - boff >= wlen and binary_part(text, boff, wlen) == word
+    end
   end
 
   # Attach this CST node's span as the range — UNLESS the lowered result already carries one, which
