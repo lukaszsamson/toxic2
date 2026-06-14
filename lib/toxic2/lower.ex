@@ -723,6 +723,11 @@ defmodule Toxic2.Lower do
   # `<<_::binary>>`, not a bare variable, which would silently de-opt the whole scan).
   defp col_byte(text, col), do: col_byte(text, col - 1, 0)
 
+  # ASCII fast path (the overwhelming majority of source bytes): one byte = one column, no `utf8`
+  # decode and no `utf8_width/1` call. eprof showed the all-codepoint version made `col_byte` +
+  # `utf8_width` ~32% of token_metadata CPU — this clause cuts the per-byte work to a bare `off + 1`.
+  defp col_byte(<<c, rest::binary>>, n, off) when n > 0 and c < 128, do: col_byte(rest, n - 1, off + 1)
+
   defp col_byte(<<cp::utf8, rest::binary>>, n, off) when n > 0,
     do: col_byte(rest, n - 1, off + utf8_width(cp))
 
