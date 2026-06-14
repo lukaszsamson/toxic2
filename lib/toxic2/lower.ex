@@ -98,8 +98,29 @@ defmodule Toxic2.Lower do
       token_metadata: tm,
       # always available: `src_slice` is needed for the empty-paren `;` check even without tm (the
       # tm-only meta helpers that also use it are simply not called when tm is off).
-      source_lines: source_lines(source)
+      source_lines: source_lines(source),
+      # Whole-source ASCII flag (one cached-pattern C scan). When set, EVERY line is pure ASCII, so a
+      # codepoint column equals a byte offset and `col_byte` positions in O(1) instead of walking
+      # (col_byte was ~15% of token_metadata CPU after de-slicing). Files with any byte ≥128 fall
+      # back to the (ASCII-fast-pathed) walk — always correct, just not O(1).
+      ascii_source: :binary.match(source, high_byte_pattern()) == :nomatch
     }
+  end
+
+  # Boyer–Moore pattern of every high byte (0x80–0xFF), compiled once and cached in `:persistent_term`
+  # (mirrors `Toxic2.Lexer`): a C-level pure-ASCII test that is effectively free per file.
+  defp high_byte_pattern do
+    key = {__MODULE__, :high_byte_pattern}
+
+    case :persistent_term.get(key, nil) do
+      nil ->
+        pattern = :binary.compile_pattern(Enum.map(128..255, &<<&1>>))
+        :persistent_term.put(key, pattern)
+        pattern
+
+      pattern ->
+        pattern
+    end
   end
 
   # Split into lines for codepoint-column scanning. A CRLF file leaves a trailing `\r` on each line;
@@ -132,19 +153,20 @@ defmodule Toxic2.Lower do
   # to byte offsets with `col_byte` and take ONE `binary_part`, instead of `String.slice`'s
   # grapheme walk (`do_slice`/`byte_size_remaining_at`/`unicode_util.gc` were ~3M tm words). The
   # `:past` clamp mirrors `String.slice` returning "" past the line end / to the line end.
-  defp src_slice(%{source_lines: lines}, {sl, sc}, {el, ec})
+  defp src_slice(%{source_lines: lines, ascii_source: ascii}, {sl, sc}, {el, ec})
        when is_tuple(lines) and sl == el and ec >= sc do
     line = elem(lines, sl - 1)
 
-    case col_byte(line, sc) do
+    case col_byte(line, sc, ascii) do
       :past ->
         ""
 
       o1 ->
-        o2 = case col_byte(line, ec) do
-          :past -> byte_size(line)
-          v -> v
-        end
+        o2 =
+          case col_byte(line, ec, ascii) do
+            :past -> byte_size(line)
+            v -> v
+          end
 
         binary_part(line, o1, o2 - o1)
     end
@@ -158,12 +180,12 @@ defmodule Toxic2.Lower do
   # end, the whole inner lines, and the last line UP TO column `ec`. Same `col_byte` + `binary_part`
   # treatment as the single-line clause (no `String.slice`/`String.length` grapheme walk); the inner
   # lines are already sub-binaries. The `Enum.join` materialises the one result binary (inherent).
-  defp src_slice(%{source_lines: lines}, {sl, sc}, {el, ec})
+  defp src_slice(%{source_lines: lines, ascii_source: ascii}, {sl, sc}, {el, ec})
        when is_tuple(lines) and el > sl and ec >= 1 do
     head_line = elem(lines, sl - 1)
 
     head =
-      case col_byte(head_line, sc) do
+      case col_byte(head_line, sc, ascii) do
         :past -> ""
         o -> binary_part(head_line, o, byte_size(head_line) - o)
       end
@@ -171,7 +193,7 @@ defmodule Toxic2.Lower do
     tail_line = elem(lines, el - 1)
 
     tend =
-      case col_byte(tail_line, ec) do
+      case col_byte(tail_line, ec, ascii) do
         :past -> byte_size(tail_line)
         o -> o
       end
@@ -702,7 +724,7 @@ defmodule Toxic2.Lower do
         # Boyer–Moore `:binary.match` find `needle` from there — no `String.slice`/`String.split`
         # (the list + `++`) / `String.length`. The gap from `col` to the operator is whitespace, so
         # its codepoint width equals the byte delta; `cp_between` keeps it exact for the rare case.
-        case col_byte(text, col) do
+        case col_byte(text, col, opts.ascii_source) do
           :past ->
             scan_op(opts, line + 1, 1, needle, last_line)
 
@@ -721,19 +743,26 @@ defmodule Toxic2.Lower do
   # past the line end. Scalar return — never a tail binary — so the BEAM threads one match context
   # with zero per-step allocation (every clause has a binary head; the `0` terminal matches
   # `<<_::binary>>`, not a bare variable, which would silently de-opt the whole scan).
-  defp col_byte(text, col), do: col_byte(text, col - 1, 0)
+  # O(1) when the whole source is ASCII: codepoint column == byte offset, no walk at all. `:past`
+  # mirrors the walk's "column beyond the line" result (strictly past the last byte).
+  defp col_byte(text, col, true) do
+    o = col - 1
+    if o > byte_size(text), do: :past, else: o
+  end
 
-  # ASCII fast path (the overwhelming majority of source bytes): one byte = one column, no `utf8`
-  # decode and no `utf8_width/1` call. eprof showed the all-codepoint version made `col_byte` +
-  # `utf8_width` ~32% of token_metadata CPU — this clause cuts the per-byte work to a bare `off + 1`.
-  defp col_byte(<<c, rest::binary>>, n, off) when n > 0 and c < 128, do: col_byte(rest, n - 1, off + 1)
+  defp col_byte(text, col, false), do: col_byte_walk(text, col - 1, 0)
 
-  defp col_byte(<<cp::utf8, rest::binary>>, n, off) when n > 0,
-    do: col_byte(rest, n - 1, off + utf8_width(cp))
+  # Non-ASCII source: walk codepoints. ASCII fast-path clause (one byte = one column, no `utf8`
+  # decode / `utf8_width` call) keeps even this path tight on the ASCII runs between non-ASCII chars.
+  defp col_byte_walk(<<c, rest::binary>>, n, off) when n > 0 and c < 128,
+    do: col_byte_walk(rest, n - 1, off + 1)
 
-  defp col_byte(<<_, rest::binary>>, n, off) when n > 0, do: col_byte(rest, n - 1, off + 1)
-  defp col_byte(<<>>, n, _off) when n > 0, do: :past
-  defp col_byte(<<_::binary>>, _n, off), do: off
+  defp col_byte_walk(<<cp::utf8, rest::binary>>, n, off) when n > 0,
+    do: col_byte_walk(rest, n - 1, off + utf8_width(cp))
+
+  defp col_byte_walk(<<_, rest::binary>>, n, off) when n > 0, do: col_byte_walk(rest, n - 1, off + 1)
+  defp col_byte_walk(<<>>, n, _off) when n > 0, do: :past
+  defp col_byte_walk(<<_::binary>>, _n, off), do: off
 
   defp utf8_width(cp) when cp < 0x80, do: 1
   defp utf8_width(cp) when cp < 0x800, do: 2
@@ -919,7 +948,7 @@ defmodule Toxic2.Lower do
   end
 
   defp kw_at(opts, line, col, word, key) do
-    if col >= 1 and word_at?(src_line(opts, line), col, word),
+    if col >= 1 and word_at?(src_line(opts, line), col, word, opts.ascii_source),
       do: [{key, [line: line, column: col]}],
       else: []
   end
@@ -927,10 +956,10 @@ defmodule Toxic2.Lower do
   # Is the literal `word` (ASCII: `do`/`end`) at codepoint column `col` of the line? Positions with
   # `col_byte` (no `src_slice`/`String.length`) and compares the bytes directly — the only sub-binary
   # is the ≤3-byte `binary_part` for the equality check, once per call (not per char).
-  defp word_at?(nil, _col, _word), do: false
+  defp word_at?(nil, _col, _word, _ascii), do: false
 
-  defp word_at?(text, col, word) do
-    case col_byte(text, col) do
+  defp word_at?(text, col, word, ascii) do
+    case col_byte(text, col, ascii) do
       :past ->
         false
 
