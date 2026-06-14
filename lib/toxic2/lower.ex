@@ -615,15 +615,15 @@ defmodule Toxic2.Lower do
 
   # `foo.(…)` / `Foo.{…}` — the open delimiter follows the base AND the `.`, so it sits one column
   # further than a plain call's `(`.
-  defp open_scan_pos(:anon_call, cst, view, opts), do: after_dot_delim(cst, "(", view, opts)
-  defp open_scan_pos(:dot_tuple, cst, view, opts), do: after_dot_delim(cst, "{", view, opts)
+  defp open_scan_pos(:anon_call, cst, view, opts), do: after_dot_delim(cst, ?(, view, opts)
+  defp open_scan_pos(:dot_tuple, cst, view, opts), do: after_dot_delim(cst, ?{, view, opts)
 
   # A map opens with `%{` (2) when written `%{…}`, but only `{` (1) as a struct's inner map
   # (`%Foo{…}`, where the `%` sits on the struct node), so measure the leading `%` from the source.
   defp open_scan_pos(kind, cst, _view, opts) when kind in [:map, :map_update] do
     case cspan(cst) do
       {sl, sc, _el, _ec} ->
-        len = if src_slice(opts, {sl, sc}, {sl, sc + 1}) == "%", do: 2, else: 1
+        len = if src_byte_at(opts, sl, sc) == ?%, do: 2, else: 1
         {sl, sc + len}
 
       _ ->
@@ -644,9 +644,9 @@ defmodule Toxic2.Lower do
   # The position just past the `(` following child `idx` (the callee / member name) — or `nil` when
   # the next char is not `(` (a paren-less call, which has no open-delimiter newlines).
   defp after_open_paren(cst, idx, view, opts) do
-    with child when not is_nil(child) <- cchildren(cst) |> Enum.at(idx),
+    with child when not is_nil(child) <- child_at(cchildren(cst), idx),
          {_, _, el, ec} <- child_span(child, view),
-         "(" <- src_slice(opts, {el, ec}, {el, ec + 1}) do
+         ?( <- src_byte_at(opts, el, ec) do
       {el, ec + 1}
     else
       _ -> nil
@@ -654,14 +654,37 @@ defmodule Toxic2.Lower do
   end
 
   # `foo.(…)` / `Foo.{…}` — the open delimiter is the char one past the base's `.` (two past the base
-  # end). Returns the position just inside it, or `nil` if the expected delimiter isn't there.
+  # end). Returns the position just inside it, or `nil` if the expected delimiter (a byte: `?(`/`?{`)
+  # isn't there.
   defp after_dot_delim(cst, delim, view, opts) do
-    with child when not is_nil(child) <- cchildren(cst) |> Enum.at(0),
+    with child when not is_nil(child) <- child_at(cchildren(cst), 0),
          {_, _, el, ec} <- child_span(child, view),
-         ^delim <- src_slice(opts, {el, ec + 1}, {el, ec + 2}) do
+         ^delim <- src_byte_at(opts, el, ec + 1) do
       {el, ec + 2}
     else
       _ -> nil
+    end
+  end
+
+  # Direct indexed child access (idx is always 0 or 1) — avoids `Enum.at/2`'s protocol dispatch on
+  # the call/remote-call metadata path.
+  defp child_at([c | _], 0), do: c
+  defp child_at([_, c | _], 1), do: c
+  defp child_at(_children, _idx), do: nil
+
+  # Byte at codepoint column `col` of source line `line`, or `nil` (past end / no line). For the
+  # single-char delimiter checks (`(`/`)`/`{`/`%`) — `col_byte` + `:binary.at` avoid the 1-byte
+  # sub-binary `src_slice` would build, and `col_byte` is O(1) on ASCII lines.
+  defp src_byte_at(opts, line, col) do
+    case src_line(opts, line) do
+      nil ->
+        nil
+
+      text ->
+        case col_byte(text, col, line_ascii?(opts, line)) do
+          off when is_integer(off) and off < byte_size(text) -> :binary.at(text, off)
+          _ -> nil
+        end
     end
   end
 
@@ -774,12 +797,17 @@ defmodule Toxic2.Lower do
         # Boyer–Moore `:binary.match` find `needle` from there — no `String.slice`/`String.split`
         # (the list + `++`) / `String.length`. The gap from `col` to the operator is whitespace, so
         # its codepoint width equals the byte delta; `cp_between` keeps it exact for the rare case.
-        case col_byte(text, col, line_ascii?(opts, line)) do
+        ascii = line_ascii?(opts, line)
+
+        case col_byte(text, col, ascii) do
           :past ->
             scan_op(opts, line + 1, 1, needle, last_line)
 
           boff ->
             case :binary.match(text, needle, scope: {boff, byte_size(text) - boff}) do
+              # On an ASCII line the codepoint gap equals the byte gap, so skip `cp_between`'s
+              # `binary_part` + codepoint count.
+              {moff, _} when ascii -> [line: line, column: col + (moff - boff)]
               {moff, _} -> [line: line, column: col + cp_between(text, boff, moff)]
               :nomatch -> scan_op(opts, line + 1, 1, needle, last_line)
             end
@@ -926,7 +954,7 @@ defmodule Toxic2.Lower do
       after_open_paren(cst, callee_idx(k), view, opts) == nil ->
         if k == :remote_call and remote_zero_arity?(cst), do: [no_parens: true], else: []
 
-      src_slice(opts, {el, ec - 1}, {el, ec}) == ")" ->
+      src_byte_at(opts, el, ec - 1) == ?) ->
         [closing: [line: el, column: ec - 1]]
 
       true ->
