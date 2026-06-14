@@ -354,4 +354,33 @@ end|)
       for src <- @snippets, do: assert_parity(src)
     end
   end
+
+  describe "meta key ORDER (order-sensitive, vs oracle)" do
+    # `assert_parity` normalises key order, so it cannot catch an ordering regression. The oracle's
+    # encoder emits keys in a fixed order and downstream tools (formatter / Sourceror) consume the
+    # keyword list positionally, so the order is part of true parity. These cases pin it directly.
+    defp assert_key_order(src) do
+      {_, mine, _} = mine(src)
+      {_, oracle, _} = oracle!(src)
+      assert Keyword.keys(mine) == Keyword.keys(oracle), """
+      meta key ORDER mismatch for #{inspect(src)}
+      oracle: #{inspect(Keyword.keys(oracle))}
+      mine:   #{inspect(Keyword.keys(mine))}
+      """
+    end
+
+    test "multi-line call + do-block: do/end precede newlines precede closing" do
+      # Regression: a call with BOTH a multi-line open delimiter and a do-block must order keys
+      # `do, end, newlines, closing` (not `newlines, do, end, closing`).
+      assert_key_order("foo(\n  a,\n  b\n) do\n  c\nend\n")
+    end
+
+    test "multi-line call without a do-block: newlines precedes closing" do
+      assert_key_order("foo(\n  a\n)\n")
+    end
+
+    test "single-line call with a do-block: no spurious newlines key" do
+      assert_key_order("foo(a) do\n  b\nend\n")
+    end
+  end
 end

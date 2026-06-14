@@ -487,11 +487,15 @@ defmodule Toxic2.Lower do
 
   defp leading_unary_pm?(_arg, _view), do: false
 
+  # Key ORDER mirrors Elixir's encoder exactly (the AST is compared as ordered keyword lists):
+  # `do`/`end` first, THEN `newlines`, THEN `closing`, THEN `delimiter`. A call with both a
+  # multi-line open delimiter and a do-block (`foo(\n a\n) do … end`) needs `do, end, newlines,
+  # closing` — putting `open_newlines` first (correct only when there is no do-block) misordered it.
   defp tm_node_keys(kind, cst, view, opts) do
     if tm?(opts) do
       Enum.concat([
-        open_newlines(kind, cst, view, opts),
         doend_keys(cst, opts),
+        open_newlines(kind, cst, view, opts),
         closing_keys(kind, cst, view, opts),
         delimiter_keys(kind, cst, opts)
       ])
