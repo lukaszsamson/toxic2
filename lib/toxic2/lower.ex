@@ -846,16 +846,19 @@ defmodule Toxic2.Lower do
     if o < 0 or o > byte_size(text), do: :past, else: o
   end
 
+  # Degenerate column (< 1, from an inferred/unclosed delimiter) — checked HERE so `col_byte_walk`
+  # never sees a negative count and every one of its clauses can begin with a binary match (a bare
+  # `(_text, n, _off) when n < 0` head there silently de-opted the walk to per-step sub-binary
+  # materialization on non-ASCII lines — `bin_opt_info`-confirmed).
+  defp col_byte(_text, col, _any) when col < 1, do: :past
+
   # Mixed line: a column within the leading-ASCII prefix is O(1) (byte offset == codepoint col there);
   # past the prefix, walk codepoints (the walk's ASCII fast-path keeps the leading run cheap anyway).
-  defp col_byte(_text, col, prefix) when col - 1 >= 0 and col - 1 <= prefix, do: col - 1
+  defp col_byte(_text, col, prefix) when col - 1 <= prefix, do: col - 1
   defp col_byte(text, col, _prefix), do: col_byte_walk(text, col - 1, 0)
 
-  # Non-ASCII source: walk codepoints. ASCII fast-path clause (one byte = one column, no `utf8`
-  # decode / `utf8_width` call) keeps even this path tight on the ASCII runs between non-ASCII chars.
-  # a degenerate column (< 1) has no byte offset
-  defp col_byte_walk(_text, n, _off) when n < 0, do: :past
-
+  # Non-ASCII source: walk codepoints from a non-negative count. ASCII fast-path clause (one byte =
+  # one column, no `utf8` decode / `utf8_width` call) keeps even this path tight on ASCII runs.
   defp col_byte_walk(<<c, rest::binary>>, n, off) when n > 0 and c < 128,
     do: col_byte_walk(rest, n - 1, off + 1)
 
