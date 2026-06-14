@@ -90,22 +90,30 @@ defmodule Toxic2.Lower do
   # carries the source split into lines (codepoint columns) so helpers can slice `delimiter:`/`token:`.
   defp resolve_opts(opts, source) do
     tm = Keyword.get(opts, :token_metadata, false)
-    lines = source_lines(source)
+    range = Keyword.get(opts, :range, false)
+    encoder = Keyword.get(opts, :literal_encoder)
+
+    # `source_lines` (a `String.split` + per-line ASCII scan) is only needed when we slice the source:
+    # always for token_metadata / range / literal_encoder, but in DEFAULT lowering only for the rare
+    # empty-paren `;` check. So default mode keeps a `{:lazy, source}` marker and `src_slice` splits
+    # on demand (see its lazy clause) — avoiding the whole-source split+scan per file on the hot path.
+    {lines, ascii} =
+      if tm or range or encoder != nil do
+        l = source_lines(source)
+        {l, ascii_lines(source, l)}
+      else
+        {{:lazy, source}, {:lazy, source}}
+      end
 
     %{
       existing_atoms_only: Keyword.get(opts, :existing_atoms_only, false),
-      range: Keyword.get(opts, :range, false),
-      literal_encoder: Keyword.get(opts, :literal_encoder),
+      range: range,
+      literal_encoder: encoder,
       token_metadata: tm,
-      # always available: `src_slice` is needed for the empty-paren `;` check even without tm (the
-      # tm-only meta helpers that also use it are simply not called when tm is off).
       source_lines: lines,
-      # Per-LINE ASCII flags. On an ASCII line a codepoint column equals a byte offset, so `col_byte`
-      # / `line_probe` position in O(1) instead of walking (the walks were ~9% of tm CPU). A single
-      # non-ASCII byte should only cost its OWN line the walk, not the whole file — hence per-line.
-      # Common all-ASCII files (one whole-source C scan says so) collapse to the `:all` sentinel: no
-      # per-line tuple is built and `line_ascii?` is a constant `true`.
-      ascii_lines: ascii_lines(source, lines)
+      # Per-LINE ASCII descriptor (`:all` | per-line prefix tuple), so `col_byte`/`line_probe` are
+      # O(1) within a line's leading-ASCII run instead of walking.
+      ascii_lines: ascii
     }
   end
 
@@ -173,6 +181,15 @@ defmodule Toxic2.Lower do
   end
 
   defp chomp_cr(line), do: line
+
+  # Default lowering stored a `{:lazy, source}` marker instead of splitting (the lines/ascii are only
+  # needed here, for the rare empty-paren `;` check). Build them once, then recurse with eager opts so
+  # every downstream read (`col_byte`, `line_ascii_prefix`) sees the real tuple. Rare in default mode,
+  # so the on-demand split is not a hot path.
+  defp src_slice(%{source_lines: {:lazy, source}} = opts, from, to) do
+    lines = source_lines(source)
+    src_slice(%{opts | source_lines: lines, ascii_lines: ascii_lines(source, lines)}, from, to)
+  end
 
   # Raw source text spanning `{sl,sc}`..`{el,ec}` (codepoint columns, end-exclusive), or `nil`.
   # Single-line (the hot case — `token:` text, `(`/`)` delimiter checks): map the codepoint columns
