@@ -775,13 +775,17 @@ defmodule Toxic2.Lower do
   # mirrors the walk's "column beyond the line" result (strictly past the last byte).
   defp col_byte(text, col, true) do
     o = col - 1
-    if o > byte_size(text), do: :past, else: o
+    # a degenerate column (< 1, from an inferred/unclosed delimiter) has no byte offset
+    if o < 0 or o > byte_size(text), do: :past, else: o
   end
 
   defp col_byte(text, col, false), do: col_byte_walk(text, col - 1, 0)
 
   # Non-ASCII source: walk codepoints. ASCII fast-path clause (one byte = one column, no `utf8`
   # decode / `utf8_width` call) keeps even this path tight on the ASCII runs between non-ASCII chars.
+  # a degenerate column (< 1) has no byte offset
+  defp col_byte_walk(_text, n, _off) when n < 0, do: :past
+
   defp col_byte_walk(<<c, rest::binary>>, n, off) when n > 0 and c < 128,
     do: col_byte_walk(rest, n - 1, off + 1)
 

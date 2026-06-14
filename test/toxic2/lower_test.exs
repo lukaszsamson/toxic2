@@ -14,6 +14,16 @@ defmodule Toxic2.LowerTest do
       end
     end
 
+    test "incomplete guard before end does not crash (degenerate column 0 in src_slice)" do
+      # an inferred closing at a column < 1 produced a negative byte offset in src_slice/col_byte
+      for source <- [
+            "defmodule M do\n  def new(my_var) when is_integer(my\nend\n",
+            "def f(x) when is_atom(\nend"
+          ] do
+        assert {_ast, _diagnostics} = Toxic2.parse_to_ast(source, token_metadata: true)
+      end
+    end
+
     test "identifier lowers to a var, alias to __aliases__, atom to an atom" do
       assert {{:foo, _, nil}, []} = Toxic2.parse_to_ast("foo")
       assert {{:__aliases__, _, [:Foo]}, []} = Toxic2.parse_to_ast("Foo")
