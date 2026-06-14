@@ -248,7 +248,7 @@ defmodule Toxic2.Lower do
         # First significant char at/after column `col`, found by ONE in-place codepoint walk —
         # no `String.slice`/`String.length` and no `split_leading_ws` tail binary (those were the
         # top token_metadata allocator). `tok_col` is the codepoint column of that char.
-        case line_probe(text, col) do
+        case line_probe(text, col, opts.ascii_source) do
           # End of line: cross this line's `\n`.
           {:eol, tok_col} ->
             cross_newline(opts, line, nls, semi, pos || {line, tok_col})
@@ -294,7 +294,23 @@ defmodule Toxic2.Lower do
   # the `utf8` clause keeps the SKIP phase counting one column per codepoint on non-ASCII lines
   # (matching the lexer's span columns). At `n == 0` we return on the first non-ws byte, so the
   # classify phase needs no `utf8` clause (any non-ws lead byte is `:other`).
-  defp line_probe(text, col), do: line_walk(text, col - 1, col)
+  # ASCII source: codepoint column == byte offset, so the SKIP phase is O(1) — jump straight to byte
+  # `col - 1` and classify from there with O(1) `:binary.at` peeks (no per-codepoint walk, no slice).
+  # For `end_of_expression` `col` is a statement end (often column 60-80), so eliding that skip is the
+  # win. Returns the same `{class, tok_col}` as the walk (`tok_col` = byte offset + 1, 1-based column).
+  defp line_probe(text, col, true), do: line_classify_ascii(text, col - 1, byte_size(text))
+  defp line_probe(text, col, false), do: line_walk(text, col - 1, col)
+
+  defp line_classify_ascii(_text, off, size) when off >= size, do: {:eol, off + 1}
+
+  defp line_classify_ascii(text, off, size) do
+    case :binary.at(text, off) do
+      c when c == ?\s or c == ?\t -> line_classify_ascii(text, off + 1, size)
+      ?# -> {:hash, off + 1}
+      ?; -> {:semi, off + 1}
+      _ -> {:other, off + 1}
+    end
+  end
 
   defp line_walk(<<c, rest::binary>>, n, col) when n > 0 and c < 128,
     do: line_walk(rest, n - 1, col)
@@ -322,7 +338,7 @@ defmodule Toxic2.Lower do
       text ->
         # Same in-place walk as `scan_eoe` (no slicing). A `;` is not a gap terminator here, so it
         # falls into `:other` like any real token — matching the old `true ->` branch.
-        case line_probe(text, col) do
+        case line_probe(text, col, opts.ascii_source) do
           {:eol, _} -> cross_gap(opts, line, nls + 1, nls)
           {:hash, _} -> cross_gap(opts, line, 1, nls)
           _ -> nls
