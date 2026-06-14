@@ -1593,8 +1593,20 @@ defmodule Toxic2.Parser do
   end
 
   # Bracket/`fn`/`do`/`end` depth change for the clause-head scan (other tokens are depth-neutral).
-  defp depth_delta(k) when k in [:"(", :"[", :"{", :"<<", :fn, :do], do: 1
-  defp depth_delta(k) when k in [:")", :"]", :"}", :">>", :end], do: -1
+  # Explicit per-atom clauses (not `k in [list]`) so the BEAM dispatches via a single atom select
+  # rather than ~11 sequential `=:=` checks per token — `depth_delta` runs once per scanned token in
+  # the `clause_head_ahead?` lookahead, which is hot on do-block-dense code.
+  defp depth_delta(:"("), do: 1
+  defp depth_delta(:"["), do: 1
+  defp depth_delta(:"{"), do: 1
+  defp depth_delta(:"<<"), do: 1
+  defp depth_delta(:fn), do: 1
+  defp depth_delta(:do), do: 1
+  defp depth_delta(:")"), do: -1
+  defp depth_delta(:"]"), do: -1
+  defp depth_delta(:"}"), do: -1
+  defp depth_delta(:">>"), do: -1
+  defp depth_delta(:end), do: -1
   defp depth_delta(_k), do: 0
 
   # `head_patterns` always returns at least one pattern, so `patterns` is non-empty here.
