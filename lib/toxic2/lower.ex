@@ -1709,12 +1709,33 @@ defmodule Toxic2.Lower do
   # `newlines:` on a binary operator: the count AFTER the operator (operator at line end) if any,
   # else the count BEFORE it (operator at line start). `gap_newlines` stops at the next token, so
   # scanning from the operator end yields the after-count and from the lhs end the before-count.
-  defp op_newlines(lhs, op_leaf, _rhs, view, opts) do
+  defp op_newlines(lhs, op_leaf, rhs, view, opts) do
     if tm?(opts) do
       {_l1, _c1, lel, lec} = child_span(lhs, view)
-      {_osl, _osc, oel, oec} = child_span(op_leaf, view)
-      after_n = gap_newlines(opts, oel, oec)
-      n = if after_n > 0, do: after_n, else: gap_newlines(opts, lel, lec)
+      {osl, _osc, oel, oec} = child_span(op_leaf, view)
+
+      # `newlines:` is non-zero only if a line break is ADJACENT to the operator. Gate the
+      # (comment-aware) `gap_newlines` scans on span line numbers we already have, so a SINGLE-LINE
+      # operator — the common case — does no eol scan at all. `after_n` (a newline between op and rhs)
+      # can only exist if the rhs starts on a later line than the op ends; the before-count only if
+      # the op starts on a later line than the lhs ends. On operator-dense files these scans
+      # (`gap_newlines` → `line_classify_ascii`) were ~4% of tm CPU.
+      rhs_sl =
+        case child_span(rhs, view) do
+          {sl, _, _, _} -> sl
+          # unknown rhs span (degenerate) → force the after-scan, preserving the old behaviour
+          _ -> oel + 1
+        end
+
+      after_n = if rhs_sl > oel, do: gap_newlines(opts, oel, oec), else: 0
+
+      n =
+        cond do
+          after_n > 0 -> after_n
+          osl > lel -> gap_newlines(opts, lel, lec)
+          true -> 0
+        end
+
       if n > 0, do: [newlines: n], else: []
     else
       []
