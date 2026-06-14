@@ -718,17 +718,21 @@ defmodule Toxic2.Lexer do
 
   # `foo!=1` / `bar?=1` — an identifier/atom ending in `!`/`?` immediately followed by `=` is
   # ambiguous (`foo! = 1` vs `foo != 1`); Elixir warns. A space on either side removes it.
-  defp bang_before_eq_notice(name, <<?=, _::binary>>, line, col, len, w) do
-    case :binary.last(name) do
-      c when c in [??, ?!] ->
-        [{:lexer, :warning, :ambiguous_bang_before_equals, {line, col, line, col + len}, %{}} | w]
+  #
+  # Check the NAME's last byte first (`:binary.last`, a BIF — no allocation, short-circuits for the
+  # ~99% of identifiers not ending in `?`/`!`), THEN peek the next source byte. The previous version
+  # matched `<<?=, _::binary>>` in the clause head, whose `bs_start_match4` allocated a fresh match
+  # context (~6 words) on EVERY identifier just to test one byte — ~1M words / 2% of allocation on
+  # the OSS corpus, shared with default mode.
+  defp bang_before_eq_notice(name, after_bin, line, col, len, w) do
+    last = :binary.last(name)
 
-      _ ->
-        w
+    if (last == ?? or last == ?!) and after_bin != <<>> and :binary.first(after_bin) == ?= do
+      [{:lexer, :warning, :ambiguous_bang_before_equals, {line, col, line, col + len}, %{}} | w]
+    else
+      w
     end
   end
-
-  defp bang_before_eq_notice(_name, _after, _line, _col, _len, w), do: w
 
   defp deprecated_op_notice(value, len, line, col, w) do
     case @deprecated_ops do
