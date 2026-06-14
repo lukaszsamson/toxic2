@@ -111,22 +111,27 @@ defmodule Toxic2.Lower do
 
   defp ascii_lines(source, lines) do
     case :binary.match(source, high_byte_pattern()) do
-      :nomatch ->
-        :all
-
-      _ ->
-        lines
-        |> Tuple.to_list()
-        |> Enum.map(&(:binary.match(&1, high_byte_pattern()) == :nomatch))
-        |> List.to_tuple()
+      :nomatch -> :all
+      _ -> lines |> Tuple.to_list() |> Enum.map(&line_prefix/1) |> List.to_tuple()
     end
   end
 
-  # Is source line `n` pure ASCII (codepoint column == byte offset)? `:all` ⇒ every line (all-ASCII
-  # file); out-of-range ⇒ `false` (fall to the always-correct walk).
-  defp line_ascii?(%{ascii_lines: :all}, _n), do: true
-  defp line_ascii?(%{ascii_lines: t}, n) when n >= 1 and n <= tuple_size(t), do: elem(t, n - 1)
-  defp line_ascii?(_opts, _n), do: false
+  # Per-line ASCII descriptor: `:all` (fully ASCII) or an integer = the byte offset of the first
+  # non-ASCII byte = the count of LEADING ASCII codepoints. A line that's only non-ASCII in a trailing
+  # string/comment still has a long ASCII prefix where delimiters/operators live, so positioning there
+  # stays O(1) even though the line isn't fully ASCII (col_byte_walk on such lines was ~3% of tm CPU
+  # on the unicode-heavy worst-ratio OSS files).
+  defp line_prefix(line) do
+    case :binary.match(line, high_byte_pattern()) do
+      :nomatch -> :all
+      {pos, _} -> pos
+    end
+  end
+
+  # ASCII descriptor for line `n` — `:all`, an integer prefix length, or `0` (out-of-range: walk all).
+  defp line_ascii_prefix(%{ascii_lines: :all}, _n), do: :all
+  defp line_ascii_prefix(%{ascii_lines: t}, n) when n >= 1 and n <= tuple_size(t), do: elem(t, n - 1)
+  defp line_ascii_prefix(_opts, _n), do: 0
 
   # Boyer–Moore pattern of every high byte (0x80–0xFF), compiled once and cached in `:persistent_term`
   # (mirrors `Toxic2.Lexer`): a C-level pure-ASCII test that is effectively free per file.
@@ -177,7 +182,7 @@ defmodule Toxic2.Lower do
   defp src_slice(%{source_lines: lines} = opts, {sl, sc}, {el, ec})
        when is_tuple(lines) and sl == el and ec >= sc do
     line = elem(lines, sl - 1)
-    ascii = line_ascii?(opts, sl)
+    ascii = line_ascii_prefix(opts, sl)
 
     case col_byte(line, sc, ascii) do
       :past ->
@@ -207,7 +212,7 @@ defmodule Toxic2.Lower do
     head_line = elem(lines, sl - 1)
 
     head =
-      case col_byte(head_line, sc, line_ascii?(opts, sl)) do
+      case col_byte(head_line, sc, line_ascii_prefix(opts, sl)) do
         :past -> ""
         o -> binary_part(head_line, o, byte_size(head_line) - o)
       end
@@ -215,7 +220,7 @@ defmodule Toxic2.Lower do
     tail_line = elem(lines, el - 1)
 
     tend =
-      case col_byte(tail_line, ec, line_ascii?(opts, el)) do
+      case col_byte(tail_line, ec, line_ascii_prefix(opts, el)) do
         :past -> byte_size(tail_line)
         o -> o
       end
@@ -270,7 +275,7 @@ defmodule Toxic2.Lower do
         # First significant char at/after column `col`, found by ONE in-place codepoint walk —
         # no `String.slice`/`String.length` and no `split_leading_ws` tail binary (those were the
         # top token_metadata allocator). `tok_col` is the codepoint column of that char.
-        case line_probe(text, col, line_ascii?(opts, line)) do
+        case line_probe(text, col, line_ascii_prefix(opts, line)) do
           # End of line: cross this line's `\n`.
           {:eol, tok_col} ->
             cross_newline(opts, line, nls, semi, pos || {line, tok_col})
@@ -320,8 +325,15 @@ defmodule Toxic2.Lower do
   # `col - 1` and classify from there with O(1) `:binary.at` peeks (no per-codepoint walk, no slice).
   # For `end_of_expression` `col` is a statement end (often column 60-80), so eliding that skip is the
   # win. Returns the same `{class, tok_col}` as the walk (`tok_col` = byte offset + 1, 1-based column).
-  defp line_probe(text, col, true), do: line_classify_ascii(text, col - 1, byte_size(text))
-  defp line_probe(text, col, false), do: line_walk(text, col - 1, col)
+  defp line_probe(text, col, :all), do: line_classify_ascii(text, col - 1, byte_size(text))
+
+  # Mixed line: if the scan start is within the leading-ASCII prefix, classify with O(1) :binary.at
+  # peeks (the ws it skips is ASCII, so it stays within byte==codepoint territory; a non-ASCII byte at
+  # the prefix boundary classifies as :other with the correct column). Past the prefix, walk.
+  defp line_probe(text, col, prefix) when col - 1 >= 0 and col - 1 <= prefix,
+    do: line_classify_ascii(text, col - 1, byte_size(text))
+
+  defp line_probe(text, col, _prefix), do: line_walk(text, col - 1, col)
 
   defp line_classify_ascii(_text, off, size) when off >= size, do: {:eol, off + 1}
 
@@ -360,7 +372,7 @@ defmodule Toxic2.Lower do
       text ->
         # Same in-place walk as `scan_eoe` (no slicing). A `;` is not a gap terminator here, so it
         # falls into `:other` like any real token — matching the old `true ->` branch.
-        case line_probe(text, col, line_ascii?(opts, line)) do
+        case line_probe(text, col, line_ascii_prefix(opts, line)) do
           {:eol, _} -> cross_gap(opts, line, nls + 1, nls)
           {:hash, _} -> cross_gap(opts, line, 1, nls)
           _ -> nls
@@ -681,7 +693,7 @@ defmodule Toxic2.Lower do
         nil
 
       text ->
-        case col_byte(text, col, line_ascii?(opts, line)) do
+        case col_byte(text, col, line_ascii_prefix(opts, line)) do
           off when is_integer(off) and off < byte_size(text) -> :binary.at(text, off)
           _ -> nil
         end
@@ -797,7 +809,7 @@ defmodule Toxic2.Lower do
         # Boyer–Moore `:binary.match` find `needle` from there — no `String.slice`/`String.split`
         # (the list + `++`) / `String.length`. The gap from `col` to the operator is whitespace, so
         # its codepoint width equals the byte delta; `cp_between` keeps it exact for the rare case.
-        ascii = line_ascii?(opts, line)
+        ascii = line_ascii_prefix(opts, line)
 
         case col_byte(text, col, ascii) do
           :past ->
@@ -805,10 +817,7 @@ defmodule Toxic2.Lower do
 
           boff ->
             case :binary.match(text, needle, scope: {boff, byte_size(text) - boff}) do
-              # On an ASCII line the codepoint gap equals the byte gap, so skip `cp_between`'s
-              # `binary_part` + codepoint count.
-              {moff, _} when ascii -> [line: line, column: col + (moff - boff)]
-              {moff, _} -> [line: line, column: col + cp_between(text, boff, moff)]
+              {moff, _} -> [line: line, column: col + scan_gap(text, boff, moff, ascii)]
               :nomatch -> scan_op(opts, line + 1, 1, needle, last_line)
             end
         end
@@ -817,19 +826,30 @@ defmodule Toxic2.Lower do
 
   defp scan_op(_opts, _line, _col, _needle, _last_line), do: []
 
+  # Codepoint gap from byte offset `boff` to the operator at `moff`. When `boff..moff` is entirely in
+  # the line's ASCII region (whole line `:all`, or the operator found within the leading-ASCII prefix)
+  # the codepoint gap equals the byte gap — skip `cp_between`'s `binary_part` + codepoint count.
+  defp scan_gap(_text, boff, moff, :all), do: moff - boff
+  defp scan_gap(_text, boff, moff, prefix) when moff <= prefix, do: moff - boff
+  defp scan_gap(text, boff, moff, _prefix), do: cp_between(text, boff, moff)
+
   # Byte offset of codepoint column `col` in `text` (i.e. after `col - 1` codepoints), or `:past`
   # past the line end. Scalar return — never a tail binary — so the BEAM threads one match context
   # with zero per-step allocation (every clause has a binary head; the `0` terminal matches
   # `<<_::binary>>`, not a bare variable, which would silently de-opt the whole scan).
   # O(1) when the whole source is ASCII: codepoint column == byte offset, no walk at all. `:past`
   # mirrors the walk's "column beyond the line" result (strictly past the last byte).
-  defp col_byte(text, col, true) do
+  # Fully-ASCII line: codepoint col == byte offset everywhere, O(1). (Degenerate col < 1 from an
+  # inferred/unclosed delimiter → :past, no byte offset.)
+  defp col_byte(text, col, :all) do
     o = col - 1
-    # a degenerate column (< 1, from an inferred/unclosed delimiter) has no byte offset
     if o < 0 or o > byte_size(text), do: :past, else: o
   end
 
-  defp col_byte(text, col, false), do: col_byte_walk(text, col - 1, 0)
+  # Mixed line: a column within the leading-ASCII prefix is O(1) (byte offset == codepoint col there);
+  # past the prefix, walk codepoints (the walk's ASCII fast-path keeps the leading run cheap anyway).
+  defp col_byte(_text, col, prefix) when col - 1 >= 0 and col - 1 <= prefix, do: col - 1
+  defp col_byte(text, col, _prefix), do: col_byte_walk(text, col - 1, 0)
 
   # Non-ASCII source: walk codepoints. ASCII fast-path clause (one byte = one column, no `utf8`
   # decode / `utf8_width` call) keeps even this path tight on the ASCII runs between non-ASCII chars.
@@ -1030,7 +1050,7 @@ defmodule Toxic2.Lower do
   end
 
   defp kw_at(opts, line, col, word, key) do
-    if col >= 1 and word_at?(src_line(opts, line), col, word, line_ascii?(opts, line)),
+    if col >= 1 and word_at?(src_line(opts, line), col, word, line_ascii_prefix(opts, line)),
       do: [{key, [line: line, column: col]}],
       else: []
   end
