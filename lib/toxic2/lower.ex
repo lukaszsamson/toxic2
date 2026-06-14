@@ -466,8 +466,7 @@ defmodule Toxic2.Lower do
     if opts.range or opts.token_metadata do
       {form, ranged_meta, args} = put_node_range(ast, cst, opts)
 
-      meta =
-        tm_anchor(form, Enum.concat(tm_node_keys(kind, cst, view, opts), ranged_meta), cst, opts)
+      meta = tm_anchor(form, tm_node_keys(kind, cst, view, opts, ranged_meta), cst, opts)
 
       {{form, meta, args}, acc, nid}
     else
@@ -494,7 +493,7 @@ defmodule Toxic2.Lower do
 
       enc ->
         span = cspan(cst)
-        meta = Enum.concat(tm_node_keys(kind, cst, view, opts), literal_meta(span, opts))
+        meta = tm_node_keys(kind, cst, view, opts, literal_meta(span, opts))
         run_encoder_meta(enc, ast, meta, span, acc, nid)
     end
   end
@@ -529,18 +528,31 @@ defmodule Toxic2.Lower do
   # `do`/`end` first, THEN `newlines`, THEN `closing`, THEN `delimiter`. A call with both a
   # multi-line open delimiter and a do-block (`foo(\n a\n) do … end`) needs `do, end, newlines,
   # closing` — putting `open_newlines` first (correct only when there is no do-block) misordered it.
-  defp tm_node_keys(kind, cst, view, opts) do
+  #
+  # The base meta (`line:`/`column:`/`range:`) is threaded in as `tail` and each component is
+  # PREPENDED right-to-left, so the result is built with at most one small `++` per non-empty
+  # component (and ZERO work when a node has no tm keys — `prepend([], tail)` is `tail`). This
+  # replaces the old `Enum.concat([a,b,c,d])` intermediate (a `concat_list` over four mostly-empty
+  # lists, ~3% of tm CPU) followed by a second concat onto the base.
+  defp tm_node_keys(kind, cst, view, opts, tail) do
     if tm?(opts) do
-      Enum.concat([
-        doend_keys(cst, opts),
-        open_newlines(kind, cst, view, opts),
-        closing_keys(kind, cst, view, opts),
-        delimiter_keys(kind, cst, opts)
-      ])
+      doend_keys(cst, opts)
+      |> prepend(
+        open_newlines(kind, cst, view, opts)
+        |> prepend(
+          closing_keys(kind, cst, view, opts)
+          |> prepend(delimiter_keys(kind, cst, opts) |> prepend(tail))
+        )
+      )
     else
-      []
+      tail
     end
   end
+
+  # Prepend a (usually short) key list onto a tail, skipping the `++` entirely for the common empty
+  # component. `keys ++ tail` copies only `keys`; `tail` is shared.
+  defp prepend([], tail), do: tail
+  defp prepend(keys, tail), do: Enum.concat(keys, tail)
 
   # `newlines:` for a container / call / `fn`: the (comment-aware) newline count between the open
   # delimiter and the first inner element. `foo(\n a)` / `{\n a}` / `%{\n a: 1}` / `fn\n x -> …` → 1;
