@@ -90,6 +90,7 @@ defmodule Toxic2.Lower do
   # carries the source split into lines (codepoint columns) so helpers can slice `delimiter:`/`token:`.
   defp resolve_opts(opts, source) do
     tm = Keyword.get(opts, :token_metadata, false)
+    lines = source_lines(source)
 
     %{
       existing_atoms_only: Keyword.get(opts, :existing_atoms_only, false),
@@ -98,14 +99,34 @@ defmodule Toxic2.Lower do
       token_metadata: tm,
       # always available: `src_slice` is needed for the empty-paren `;` check even without tm (the
       # tm-only meta helpers that also use it are simply not called when tm is off).
-      source_lines: source_lines(source),
-      # Whole-source ASCII flag (one cached-pattern C scan). When set, EVERY line is pure ASCII, so a
-      # codepoint column equals a byte offset and `col_byte` positions in O(1) instead of walking
-      # (col_byte was ~15% of token_metadata CPU after de-slicing). Files with any byte ≥128 fall
-      # back to the (ASCII-fast-pathed) walk — always correct, just not O(1).
-      ascii_source: :binary.match(source, high_byte_pattern()) == :nomatch
+      source_lines: lines,
+      # Per-LINE ASCII flags. On an ASCII line a codepoint column equals a byte offset, so `col_byte`
+      # / `line_probe` position in O(1) instead of walking (the walks were ~9% of tm CPU). A single
+      # non-ASCII byte should only cost its OWN line the walk, not the whole file — hence per-line.
+      # Common all-ASCII files (one whole-source C scan says so) collapse to the `:all` sentinel: no
+      # per-line tuple is built and `line_ascii?` is a constant `true`.
+      ascii_lines: ascii_lines(source, lines)
     }
   end
+
+  defp ascii_lines(source, lines) do
+    case :binary.match(source, high_byte_pattern()) do
+      :nomatch ->
+        :all
+
+      _ ->
+        lines
+        |> Tuple.to_list()
+        |> Enum.map(&(:binary.match(&1, high_byte_pattern()) == :nomatch))
+        |> List.to_tuple()
+    end
+  end
+
+  # Is source line `n` pure ASCII (codepoint column == byte offset)? `:all` ⇒ every line (all-ASCII
+  # file); out-of-range ⇒ `false` (fall to the always-correct walk).
+  defp line_ascii?(%{ascii_lines: :all}, _n), do: true
+  defp line_ascii?(%{ascii_lines: t}, n) when n >= 1 and n <= tuple_size(t), do: elem(t, n - 1)
+  defp line_ascii?(_opts, _n), do: false
 
   # Boyer–Moore pattern of every high byte (0x80–0xFF), compiled once and cached in `:persistent_term`
   # (mirrors `Toxic2.Lexer`): a C-level pure-ASCII test that is effectively free per file.
@@ -153,9 +174,10 @@ defmodule Toxic2.Lower do
   # to byte offsets with `col_byte` and take ONE `binary_part`, instead of `String.slice`'s
   # grapheme walk (`do_slice`/`byte_size_remaining_at`/`unicode_util.gc` were ~3M tm words). The
   # `:past` clamp mirrors `String.slice` returning "" past the line end / to the line end.
-  defp src_slice(%{source_lines: lines, ascii_source: ascii}, {sl, sc}, {el, ec})
+  defp src_slice(%{source_lines: lines} = opts, {sl, sc}, {el, ec})
        when is_tuple(lines) and sl == el and ec >= sc do
     line = elem(lines, sl - 1)
+    ascii = line_ascii?(opts, sl)
 
     case col_byte(line, sc, ascii) do
       :past ->
@@ -180,12 +202,12 @@ defmodule Toxic2.Lower do
   # end, the whole inner lines, and the last line UP TO column `ec`. Same `col_byte` + `binary_part`
   # treatment as the single-line clause (no `String.slice`/`String.length` grapheme walk); the inner
   # lines are already sub-binaries. The `Enum.join` materialises the one result binary (inherent).
-  defp src_slice(%{source_lines: lines, ascii_source: ascii}, {sl, sc}, {el, ec})
+  defp src_slice(%{source_lines: lines} = opts, {sl, sc}, {el, ec})
        when is_tuple(lines) and el > sl and ec >= 1 do
     head_line = elem(lines, sl - 1)
 
     head =
-      case col_byte(head_line, sc, ascii) do
+      case col_byte(head_line, sc, line_ascii?(opts, sl)) do
         :past -> ""
         o -> binary_part(head_line, o, byte_size(head_line) - o)
       end
@@ -193,7 +215,7 @@ defmodule Toxic2.Lower do
     tail_line = elem(lines, el - 1)
 
     tend =
-      case col_byte(tail_line, ec, ascii) do
+      case col_byte(tail_line, ec, line_ascii?(opts, el)) do
         :past -> byte_size(tail_line)
         o -> o
       end
@@ -248,7 +270,7 @@ defmodule Toxic2.Lower do
         # First significant char at/after column `col`, found by ONE in-place codepoint walk —
         # no `String.slice`/`String.length` and no `split_leading_ws` tail binary (those were the
         # top token_metadata allocator). `tok_col` is the codepoint column of that char.
-        case line_probe(text, col, opts.ascii_source) do
+        case line_probe(text, col, line_ascii?(opts, line)) do
           # End of line: cross this line's `\n`.
           {:eol, tok_col} ->
             cross_newline(opts, line, nls, semi, pos || {line, tok_col})
@@ -338,7 +360,7 @@ defmodule Toxic2.Lower do
       text ->
         # Same in-place walk as `scan_eoe` (no slicing). A `;` is not a gap terminator here, so it
         # falls into `:other` like any real token — matching the old `true ->` branch.
-        case line_probe(text, col, opts.ascii_source) do
+        case line_probe(text, col, line_ascii?(opts, line)) do
           {:eol, _} -> cross_gap(opts, line, nls + 1, nls)
           {:hash, _} -> cross_gap(opts, line, 1, nls)
           _ -> nls
@@ -752,7 +774,7 @@ defmodule Toxic2.Lower do
         # Boyer–Moore `:binary.match` find `needle` from there — no `String.slice`/`String.split`
         # (the list + `++`) / `String.length`. The gap from `col` to the operator is whitespace, so
         # its codepoint width equals the byte delta; `cp_between` keeps it exact for the rare case.
-        case col_byte(text, col, opts.ascii_source) do
+        case col_byte(text, col, line_ascii?(opts, line)) do
           :past ->
             scan_op(opts, line + 1, 1, needle, last_line)
 
@@ -980,7 +1002,7 @@ defmodule Toxic2.Lower do
   end
 
   defp kw_at(opts, line, col, word, key) do
-    if col >= 1 and word_at?(src_line(opts, line), col, word, opts.ascii_source),
+    if col >= 1 and word_at?(src_line(opts, line), col, word, line_ascii?(opts, line)),
       do: [{key, [line: line, column: col]}],
       else: []
   end
