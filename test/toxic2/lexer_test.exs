@@ -112,6 +112,23 @@ defmodule Toxic2.LexerTest do
     test "mixed-script identifiers are rejected (UTS-39), as a single error token" do
       assert [{:error, %Toxic2.LexError{}}] = shapes("aαb")
     end
+
+    test "rejects identifiers that normalize to unsupported codepoints" do
+      alias Toxic2.String.Tokenizer
+
+      # [?u, 0x0308, 0x0300] (u + combining diaeresis + combining grave) are each
+      # valid identifier continue chars, but normalize (NFC) to U+01DC `ǜ`, which
+      # is not a supported identifier codepoint.
+      decomposed = [?u, 0x0308, 0x0300]
+
+      assert Tokenizer.tokenize(<<0x01DC::utf8>>) == {:error, :empty}
+
+      assert Tokenizer.tokenize(:unicode.characters_to_binary(decomposed)) ==
+               {:error, {:unexpected_token, :unicode.characters_to_binary(decomposed)}}
+
+      assert Tokenizer.tokenize("fooǜlul") ==
+               {:error, {:unexpected_token, "fooǜ"}}
+    end
   end
 
   describe "closed-set lexemes carry atoms (safe to intern)" do
