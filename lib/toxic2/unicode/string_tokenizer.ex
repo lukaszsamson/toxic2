@@ -555,7 +555,11 @@ defmodule Toxic2.String.Tokenizer do
         invalid_original_prefix(original_acc, :unicode.characters_to_list(invalid_prefix))
 
       _other ->
-        invalid_original_prefix(original_acc, acc)
+        # The NFC form re-tokenizes to a different kind, or leaves a trailing remainder, or fails
+        # otherwise — the whole identifier is the offending token. (Searching for an original prefix
+        # whose NFC equals the full `acc` would only ever match the entire `original_acc`, since
+        # `acc == nfc(original_acc)` by construction, so report it directly.)
+        original_acc
     end
   end
 

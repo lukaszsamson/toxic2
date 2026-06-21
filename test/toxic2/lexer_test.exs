@@ -338,6 +338,13 @@ defmodule Toxic2.LexerTest do
       [_a, _eol, b] = tokens("a\n  b")
       assert Token.span(b) == {2, 3, 2, 4}
     end
+
+    test "the :eol after a multi-byte comment gets a codepoint (not byte) start column" do
+      # `# café` is 6 codepoints but 7 bytes (é is 2 bytes); the newline starts at column 7.
+      [eol, b] = tokens("# café\nx")
+      assert {:eol, 1, 7, 2, 1, _} = eol
+      assert Token.span(b) == {2, 1, 2, 2}
+    end
   end
 
   describe "tolerant lexing (review #2: codepoint-aware; P3: :error is the sole transport)" do

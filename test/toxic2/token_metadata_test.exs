@@ -362,6 +362,7 @@ end|)
     defp assert_key_order(src) do
       {_, mine, _} = mine(src)
       {_, oracle, _} = oracle!(src)
+
       assert Keyword.keys(mine) == Keyword.keys(oracle), """
       meta key ORDER mismatch for #{inspect(src)}
       oracle: #{inspect(Keyword.keys(oracle))}

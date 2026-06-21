@@ -217,9 +217,17 @@ defmodule Toxic2.Lexer do
     # `nonascii_byte?/1` is a cheap binary scan over the SOURCE that rejects pure-ASCII files (the
     # common case) in one pass; the costlier token scan (`any_unicode_name?/1`, which also rules out
     # non-ASCII that's only in strings/comments) runs only when the source has a non-ASCII byte.
+    # Confusable lint is a SEPARATE whole-file pass, so its warnings have to be merged back into
+    # source order with the in-line lexer warnings (each list is already source-ordered) — otherwise
+    # a confusable on an earlier line would sort after a later-line in-line warning. `sort_by/2` is
+    # stable, so warnings sharing a start position keep their relative order.
     warnings =
       if nonascii_byte?(source) and any_unicode_name?(tokens),
-        do: Enum.concat(warnings, confusable_lint(tokens)),
+        do:
+          Enum.sort_by(
+            Enum.concat(warnings, confusable_lint(tokens)),
+            fn {_p, _s, _c, sp, _d} -> sp end
+          ),
         else: warnings
 
     {tokens, warnings, :lists.reverse(rev_comments)}
@@ -334,8 +342,15 @@ defmodule Toxic2.Lexer do
         :nomatch -> byte_size(rest)
       end
 
+    # The suspicious-byte pre-check (high bytes + VT/FF/CR) gates the lint scan AND tells us whether
+    # the comment is plain ASCII: when nothing matched, bytes == codepoints so the column advance can
+    # skip the codepoint walk (the common case). High bytes are part of the pattern, so any multi-byte
+    # comment trips it.
+    suspicious? =
+      :binary.match(rest, comment_suspicious_pattern(), scope: {0, drop_len}) != :nomatch
+
     acc =
-      if :binary.match(rest, comment_suspicious_pattern(), scope: {0, drop_len}) != :nomatch,
+      if suspicious?,
         do: comment_bidi_check(rest, line, col + 1, acc),
         else: acc
 
@@ -356,7 +371,14 @@ defmodule Toxic2.Lexer do
       {:comment, line, col, "#" <> binary_part(rest, 0, text_len),
        comment_previous_eol_count(acc), next_eol_count(after_comment, 0)}
 
-    lex(after_comment, line, col + 1 + drop_len, acc, [comment | w], st)
+    # Advance by the comment's CODEPOINT width, not its byte width: a multi-byte comment (`# café`)
+    # would otherwise hand the following `:eol`/EOF token a byte-based start column.
+    comment_cols =
+      if suspicious?,
+        do: cp_width(binary_part(rest, 0, drop_len), 0),
+        else: drop_len
+
+    lex(after_comment, line, col + 1 + comment_cols, acc, [comment | w], st)
   end
 
   # --- line continuation: a `\` right before a newline joins the lines (no :eol emitted) ----
@@ -1961,6 +1983,12 @@ defmodule Toxic2.Lexer do
   defp word_len(<<c, rest::binary>>, n) when is_word(c), do: word_len(rest, n + 1)
   defp word_len(rest, n), do: {n, rest}
 
+  # Codepoint width of a byte slice, for column advance — total over invalid UTF-8: a UTF-8
+  # continuation byte (`0x80..0xBF`) rides with its lead byte; every other byte counts as one column.
+  defp cp_width(<<c, rest::binary>>, n) when c >= 0x80 and c <= 0xBF, do: cp_width(rest, n)
+  defp cp_width(<<_, rest::binary>>, n), do: cp_width(rest, n + 1)
+  defp cp_width(<<>>, n), do: n
+
   defp take_while(<<c, rest::binary>> = bin, n, pred) do
     if pred.(c), do: take_while(rest, n + 1, pred), else: {n, bin}
   end
@@ -2073,5 +2101,4 @@ defmodule Toxic2.Lexer do
   defp delim_kind(?[), do: :"["
   defp delim_kind(?]), do: :"]"
   defp delim_kind(?,), do: :","
-  defp delim_kind(?;), do: :";"
 end

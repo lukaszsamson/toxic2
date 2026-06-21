@@ -47,11 +47,18 @@ defmodule Toxic2.SourceRanges do
           {{pos_integer(), pos_integer()}, {pos_integer(), pos_integer()}} | nil
   def outer_range(code) do
     {view, _} = Tokens.from_source(code)
-    {cst, _} = Parser.parse_tokens(view)
 
-    case CST.span(cst) do
-      {sl, sc, el, ec} -> {{sl, sc}, {el, ec}}
-      _ -> nil
+    # Empty / whitespace-only input has no tokens: the parser synthesizes a zero-width `{1,1,1,1}`
+    # root span, but there is no code to range over, so report `nil` (matching the documented contract).
+    if Tokens.size(view) == 0 do
+      nil
+    else
+      {cst, _} = Parser.parse_tokens(view)
+
+      case CST.span(cst) do
+        {sl, sc, el, ec} -> {{sl, sc}, {el, ec}}
+        _ -> nil
+      end
     end
   end
 

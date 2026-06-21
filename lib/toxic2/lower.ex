@@ -73,6 +73,11 @@ defmodule Toxic2.Lower do
   # Backward-compatible arities: the original public shape was `to_ast(cst, view, opts, start_id)`
   # (no source). `token_metadata: true` needs the source to scan `delimiter:`/`token:`/`newlines:`,
   # so the 5-arity form threads it; the keyword-`opts` 3/4-arities keep old callers working.
+  #
+  # These source-less arities are for DEFAULT lowering only. The source-sensitive options
+  # (`token_metadata: true`, `range: true`, a source-reading `literal_encoder`) need the source
+  # binary and will produce nil/empty metadata here — use the 5-arity form or `Toxic2.parse_to_ast/2`
+  # (which always threads the source) when any of those are set.
   def to_ast(cst, view, opts) when is_list(opts), do: to_ast(cst, view, "", opts, 1)
 
   def to_ast(cst, view, opts, start_id) when is_list(opts) and is_integer(start_id),
@@ -138,7 +143,10 @@ defmodule Toxic2.Lower do
 
   # ASCII descriptor for line `n` — `:all`, an integer prefix length, or `0` (out-of-range: walk all).
   defp line_ascii_prefix(%{ascii_lines: :all}, _n), do: :all
-  defp line_ascii_prefix(%{ascii_lines: t}, n) when n >= 1 and n <= tuple_size(t), do: elem(t, n - 1)
+
+  defp line_ascii_prefix(%{ascii_lines: t}, n) when n >= 1 and n <= tuple_size(t),
+    do: elem(t, n - 1)
+
   defp line_ascii_prefix(_opts, _n), do: 0
 
   # Boyer–Moore pattern of every high byte (0x80–0xFF), compiled once and cached in `:persistent_term`
@@ -257,8 +265,9 @@ defmodule Toxic2.Lower do
 
   defp src_line(_opts, _n), do: nil
 
+  # `source_lines` is always a forced line tuple here: every caller runs only under
+  # `token_metadata: true`, where `resolve_opts` splits eagerly (never the `{:lazy, _}` marker).
   defp src_line_count(%{source_lines: lines}) when is_tuple(lines), do: tuple_size(lines)
-  defp src_line_count(_opts), do: 0
 
   # --- end_of_expression (token_metadata) --------------------------------------------------------
   # A statement carries `end_of_expression: [newlines: n, line: l, column: c]` when it is followed by
@@ -882,7 +891,9 @@ defmodule Toxic2.Lower do
   defp col_byte_walk(<<cp::utf8, rest::binary>>, n, off) when n > 0,
     do: col_byte_walk(rest, n - 1, off + utf8_width(cp))
 
-  defp col_byte_walk(<<_, rest::binary>>, n, off) when n > 0, do: col_byte_walk(rest, n - 1, off + 1)
+  defp col_byte_walk(<<_, rest::binary>>, n, off) when n > 0,
+    do: col_byte_walk(rest, n - 1, off + 1)
+
   defp col_byte_walk(<<>>, n, _off) when n > 0, do: :past
   defp col_byte_walk(<<_::binary>>, _n, off), do: off
 

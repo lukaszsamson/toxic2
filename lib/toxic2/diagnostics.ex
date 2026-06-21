@@ -71,7 +71,14 @@ defmodule Toxic2.Diagnostics do
 
   @doc "One past the highest id in `diags` (1 when empty) — the next free id."
   @spec next_id([Diagnostic.t()]) :: pos_integer()
-  def next_id(diags), do: Enum.reduce(diags, 0, &max(Diagnostic.id(&1), &2)) + 1
+  def next_id(diags) do
+    # Fold an explicit integer accumulator rather than `max/2` + 1: `max/2`'s success typing
+    # widens to `number()`, so dialyzer infers a spurious `float()` return for the trailing `+ 1`.
+    Enum.reduce(diags, 1, fn d, acc ->
+      id = Diagnostic.id(d)
+      if id >= acc, do: id + 1, else: acc
+    end)
+  end
 
   @doc "Merge already-source-ordered streams into one, stably ordered by start position."
   @spec merge_sorted([[Diagnostic.t()]]) :: [Diagnostic.t()]

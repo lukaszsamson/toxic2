@@ -178,5 +178,9 @@ defmodule Toxic2.SourceRangesTest do
       assert SR.outer_range("foo(bar)") == {{1, 1}, {1, 9}}
       assert SR.outer_range("a\n+ b") == {{1, 1}, {2, 4}}
     end
+
+    test "is nil for empty input (no tokens), per the documented contract" do
+      assert SR.outer_range("") == nil
+    end
   end
 end
