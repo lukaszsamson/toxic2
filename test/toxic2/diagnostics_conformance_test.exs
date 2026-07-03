@@ -382,13 +382,22 @@ defmodule Toxic2.DiagnosticsConformanceTest do
       {ast, _} = Toxic2.parse_to_ast("quote(do: defstruct a: 1, b: 2)")
       assert {:quote, _, [[do: {:defstruct, _, [[a: 1, b: 2]]}]]} = ast
 
-      # inner calls with a POSITIONAL arg stay keyword-last errors (oracle rejects them too)
+      # inner calls with a POSITIONAL arg stay keyword-last errors (oracle rejects them too),
+      # in maps just like in calls/lists
       for src <- [
             "f(a: g b, c: 1)",
             "f(a: g b, c)",
             "f(a: g x: 1, b)",
-            "f(a: if x, do: 1, else: 2)"
+            "f(a: if x, do: 1, else: 2)",
+            "%{a: g b, c: 1}",
+            ~S(%{"a": g b, c: 1}),
+            "%{x | a: g b, c: 1}"
           ] do
+        assert_classified(src)
+      end
+
+      # …while a positional no-parens kw value with NO following comma stays valid
+      for src <- ["%{a: g b}", "%{a: case x do _ -> 1 end, b: 1}", "%{a: fn -> 1 end, b: 2}"] do
         assert_classified(src)
       end
     end

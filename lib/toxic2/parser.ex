@@ -1906,7 +1906,8 @@ defmodule Toxic2.Parser do
   defp check_map_entry_np_comma(t, entry, comma_i, diags, nid) do
     val = map_entry_value(entry)
 
-    if val != nil and CST.category(val) == :no_parens and not has_do_block?(val) do
+    if val != nil and CST.category(val) == :no_parens and not has_do_block?(val) and
+         not kw_only_np_call?(val) do
       {_id, diags, nid} =
         Diagnostics.emit(
           diags,
@@ -1925,12 +1926,14 @@ defmodule Toxic2.Parser do
   end
 
   # The node whose trailing no-parens call would illegally swallow the following comma: an assoc's
-  # value (2nd child), or a bare expression entry itself. A `kw_pair` value is parsed `:matched`
-  # (keyword-last is enforced separately), so it is exempt.
+  # or kw pair's value (2nd child), or a bare expression entry itself. A kw-ONLY no-parens kw value
+  # is exempt above — it has already absorbed the keyword run (`absorb_kw_run`), and what follows
+  # is the ordinary keyword-not-last error; a POSITIONAL no-parens kw value (`%{a: g b, c: 1}`)
+  # is the same ambiguity as everywhere else and is diagnosed here.
   defp map_entry_value(entry) do
     case entry do
       {:node, :assoc, _sp, [_key, val], _f, _d} -> val
-      {:node, :kw_pair, _sp, _ch, _f, _d} -> nil
+      {:node, :kw_pair, _sp, [_key, val], _f, _d} -> val
       {:node, _kind, _sp, _ch, _f, _d} = node -> node
       _ -> nil
     end

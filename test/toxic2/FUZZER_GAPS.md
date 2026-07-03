@@ -90,6 +90,9 @@ no-parens keyword value (greedy-innermost, matching upstream `call_args_no_paren
 calls, lists, tuples, bitstrings, access args and maps, incl. quoted keys; `check_np_kw_last` now
 exempts the kw-only shape (what follows the absorbed run is the ordinary keyword-not-last error).
 AST matches the oracle (`quote(do: defstruct a: 1, b: 2)` => inner `defstruct([a: 1, b: 2])`).
+Follow-up (same day): map kw VALUES with a *positional* no-parens call followed by a comma
+(`%{a: g b, c: 1}`) now error like their call/list twins — `map_entry_value` no longer exempts
+`kw_pair` values (the kw-only shape stays exempt, it absorbed the run).
 
 ### V2. MISSED ERROR — operator-rooted bare map/struct entries (a `=`/`:` typo class) — **FIXED 2026-07-03**
 
@@ -225,8 +228,9 @@ are now FIXED — see "Upstream diagnostics addressed" above — leaving 47):
 - **[FIXED] charlist invalid encoding** — `'\xFF'` now `:invalid_charlist_encoding`. (The earlier
   catalogue wrongly listed `"\xFF"` here; a double-quoted `"\xFF"` is valid binary syntax `<<255>>`
   and is NOT an error — only the charlist is.)
-- **[1] bidi in a string** — `"this is a ‪"` (a bidi control char inside a string; toxic2
-  already rejects bidi as a bare token but not inside a string escaped this way).
+- **[STALE — already conforms]** bidi in a string — `"this is a ‪"`: re-probed 2026-07-03, toxic2
+  emits `:invalid_bidi` for raw bidi controls inside strings, charlists, sigils and heredocs (the
+  escaped `"‪"` form stays valid on both sides). Nothing to do.
 
 ## False ERRORS (83) — oracle accepts (with a warning), toxic2 rejects
 
