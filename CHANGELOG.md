@@ -4,6 +4,20 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- Parser: a kw-only no-parens call as a keyword value in a parens call / list / tuple / bitstring /
+  access / map now absorbs the rest of the trailing keyword run into the inner call, matching the
+  oracle (`quote(do: defstruct a: 1, b: 2)` no longer false-errors with `:no_parens_kw_not_last`).
+- Parser: bare map/struct entries (incl. update entries) rooted at a binary operator, a no-parens
+  call, a capture, or a do-block call now emit the new `:invalid_map_entry` error, matching the
+  oracle's `map_base_expr` rule (`%User{name = "x"}`, `%{state | count + 1}` were silently
+  accepted); grammar-valid shorthands (`%{name}`, `%{user.id}`, `%{m | name}`, unary chains) stay
+  clean.
+- Parser: `%//x{}` (a prefix-`//` struct base) is accepted like every other unary base.
+
 ## [0.1.0] - 2026-06-21
 
 Initial release: a complete tolerant-only Elixir lexer → green CST parser → AST lowerer.

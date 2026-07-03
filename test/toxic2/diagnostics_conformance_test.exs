@@ -356,4 +356,92 @@ defmodule Toxic2.DiagnosticsConformanceTest do
       assert warnings("fn () when node() == x -> true end") == []
     end
   end
+
+  # The four validish-reachable buckets from the FUZZER_GAPS 2026-06-12 re-audit.
+  describe "FUZZER_GAPS validish-reachable fixes" do
+    # V1: a keyword VALUE that is a kw-ONLY no-parens call absorbs the rest of the keyword run
+    # into the INNER call (upstream `call_args_no_parens_kw` is greedy-innermost) — the
+    # parenthesised twin of the `defmodule Foo, do: defstruct a: 1, b: 2` fix. Was a false
+    # `:no_parens_kw_not_last` error on ordinary macro-writing code.
+    test "V1: kw-only no-parens call as a parens-call kw value absorbs the keyword run" do
+      for src <- [
+            "quote(do: defstruct a: 1, b: 2)",
+            "defmodule(Foo, do: defstruct a: 1, b: 2)",
+            "foo(x: bar a: 1, b: 2)",
+            "[x: bar a: 1, b: 2]",
+            "{1, x: bar a: 1, b: 2}",
+            "%{x: bar a: 1, b: 2}",
+            "m[x: bar a: 1, b: 2]",
+            # nested runs attach innermost
+            "foo(x: bar a: 1, y: baz b: 1, c: 2)"
+          ] do
+        assert_classified(src)
+      end
+
+      # the trailing keyword run belongs to the INNER call, exactly like the oracle
+      {ast, _} = Toxic2.parse_to_ast("quote(do: defstruct a: 1, b: 2)")
+      assert {:quote, _, [[do: {:defstruct, _, [[a: 1, b: 2]]}]]} = ast
+
+      # inner calls with a POSITIONAL arg stay keyword-last errors (oracle rejects them too)
+      for src <- [
+            "f(a: g b, c: 1)",
+            "f(a: g b, c)",
+            "f(a: g x: 1, b)",
+            "f(a: if x, do: 1, else: 2)"
+          ] do
+        assert_classified(src)
+      end
+    end
+
+    # V2: a bare (no `=>`, no `key:`) map/struct entry must be `map_base_expr`-shaped — an entry
+    # rooted at a binary operator is a syntax error upstream (the classic `=`-for-`:` /
+    # missing-`key:` typos). Bare identifier/access/update shorthands stay valid.
+    test "V2: operator-rooted bare map/struct entries are errors" do
+      for src <- [
+            ~S(%User{name = "x", age: 1}),
+            "%{state | count + 1}",
+            "%{count + 1}",
+            ~S(%{key <> "x"}),
+            "%{0*0}",
+            "%Foo{o=t}",
+            "%{x | &b}",
+            "%{&x}",
+            "%{foo bar}",
+            "%{foo do end}"
+          ] do
+        assert_classified(src)
+        assert :invalid_map_entry in Enum.map(errors(src), &Diagnostic.code/1)
+      end
+
+      # grammar-valid bare entries (upstream `assoc_expr -> map_base_expr`) stay clean
+      for src <- [
+            "%{name}",
+            "%{user.id}",
+            "%{m | name}",
+            "%{compute(x)}",
+            "%{-x}",
+            "%{not x}",
+            "%{@x}",
+            "%{^x}",
+            "%{//x}",
+            "%{...x}",
+            "%{&1}",
+            "%{(a + b)}",
+            "%{fn -> 1 end}",
+            "%{x => 1, y}",
+            # the update BASE is a full matched_expr — no check
+            "%{a + b | x: 1}"
+          ] do
+        assert_classified(src)
+      end
+    end
+
+    # V4: `//` (ternary_op) is a valid unary struct-base prefix, like every other unary —
+    # completeness gap from the GRAMMAR_GAPS §1.1 prefix-`//` fix.
+    test "V4: %//x{} struct base parses like the other unary bases" do
+      for src <- ["%//x{}", "%!x{}", "%not x{}", "%-x{}"] do
+        assert_classified(src)
+      end
+    end
+  end
 end

@@ -65,7 +65,10 @@ plausible human-written embodiment found four that are genuinely reachable. Meth
 ~40 hand-built realistic candidates run through both parsers post-`f8dbc2f` (harness left at
 `/tmp/fuzzer_gaps_audit.exs` during the audit; not committed).
 
-### V1. FALSE ERROR — `quote(do: defstruct a: 1, b: 2)` (parens-call kw value is a kw-only no-parens call)
+> **Fix status (2026-07-03):** V1, V2 and V4 are **FIXED** (see the per-finding notes and the
+> "Fixed" section below); V3 remains open as the doc classed it optional.
+
+### V1. FALSE ERROR — `quote(do: defstruct a: 1, b: 2)` (parens-call kw value is a kw-only no-parens call) — **FIXED 2026-07-03**
 
 This is the "structural theme" already flagged at the bottom of "False ERRORS" — but it is **not**
 fuzzer-only. It is the parenthesized twin of the very bug already fixed in "Fixed" §1 (which bit real
@@ -82,7 +85,13 @@ Root cause + fix are the SAME as "Fixed" §1: a trailing run of keyword pairs is
 (`call_args_no_parens_kw`), but here the inner call sits as a `kw_call`/`kw_data` *value* of an outer
 **parens** call, and that absorption path wasn't updated. **Recommend fix** (clean, mirrors §1).
 
-### V2. MISSED ERROR — operator-rooted bare map/struct entries (a `=`/`:` typo class)
+**Fixed:** `absorb_kw_run` in `parser.ex` absorbs the rest of the keyword run into a kw-ONLY
+no-parens keyword value (greedy-innermost, matching upstream `call_args_no_parens_kw`), in parens
+calls, lists, tuples, bitstrings, access args and maps, incl. quoted keys; `check_np_kw_last` now
+exempts the kw-only shape (what follows the absorbed run is the ordinary keyword-not-last error).
+AST matches the oracle (`quote(do: defstruct a: 1, b: 2)` => inner `defstruct([a: 1, b: 2])`).
+
+### V2. MISSED ERROR — operator-rooted bare map/struct entries (a `=`/`:` typo class) — **FIXED 2026-07-03**
 
 The fuzzer exemplars (`%{0*0}`, `%Foo{o=t}`) read as soup, but the bucket is "a bare entry whose root
 is a binary operator," and that is a textbook typo:
@@ -106,7 +115,15 @@ asks for as its promotion bar: a bare map/struct entry (and update entry) must b
 shaped (a `sub_matched_expr` under at/unary/ellipsis chains), not an arbitrary `matched_expr`.
 **Recommend fix** (one grouped rule covers all the `[42] syntax error before:` map/struct rows).
 
-### V3. MISSED ERROR — ambiguous comma in `assert`-style no-parens code
+**Fixed:** `check_bare_map_entry` / `map_base_entry?` in `parser.ex` implement exactly that grouped
+rule — a bare entry must be a sub-matched expression, optionally under at/unary/dual/`//`/`...`
+prefix chains; binary-op-rooted entries, no-parens calls (`%{foo bar}`), captures (`%{&x}`; the
+numeric `&1` stays valid) and do-block calls emit the new `:invalid_map_entry` error (tolerant: the
+entry is kept in the tree). Applies to update entries; the update BASE stays a full `matched_expr`
+(`%{a + b | x: 1}` is valid). This also covers the `%{x | &b}` / `%{x | e>n,}` update rows and
+`%{foo bar, baz}` / `%{0*0}` / `%Foo{o=t}` / `%{&x}` from "[42]" below.
+
+### V3. MISSED ERROR — ambiguous comma in `assert`-style no-parens code — still open (optional)
 
 Bucket `[4]` (`foo 1, 2 + bar 3, 4`) is reachable via ExUnit's `assert msg` idiom:
 
@@ -119,7 +136,7 @@ Oracle rejects (`unexpected comma. Parentheses are required…`); toxic2 builds 
 best-effort tree silently. Borderline: real but rarer, and the tolerant tree is sound.
 **Optional fix.**
 
-### V4. FALSE ERROR — `%//x{}` (completeness gap from our own §1.1 // fix)
+### V4. FALSE ERROR — `%//x{}` (completeness gap from our own §1.1 // fix) — **FIXED 2026-07-03**
 
 Not validish itself, but a self-inflicted inconsistency: the grammar-gaps §1.1 fix added `//` as a
 unary in expression position, but `struct_base_start?` / the struct-base unary chain weren't updated,
@@ -131,6 +148,9 @@ so a struct base disagrees with every other unary base:
 ```
 
 **Recommend fix** (one-liner: add `:ternary_op` to `struct_base_start?` and the map_base unary path).
+
+**Fixed:** `:ternary_op` added to `struct_base_start?` (the unary-chain expression parser already
+handled prefix `//` since §1.1, so the gate was the only gap); `%//x{}` now agrees with the oracle.
 
 ### Confirmed fuzzer-only (no plausible embodiment found)
 
@@ -165,7 +185,23 @@ predates `f8dbc2f`.)
    expression. Fixed by scoping to paren *expressions* (in `lower_paren`) and checking the source
    between the delimiters for a `;`.
 
-Both are covered by regressions in `diagnostics_conformance_test.exs`.
+3. **V1 (2026-07-03): `:no_parens_kw_not_last` on `quote(do: defstruct a: 1, b: 2)`.** A kw-only
+   no-parens call as a *parens*-call/list/map keyword VALUE now absorbs the rest of the keyword run
+   into the inner call (`absorb_kw_run`), matching the oracle's greedy-innermost
+   `call_args_no_parens_kw`.
+
+4. **V2 (2026-07-03): operator-rooted bare map/struct entries.** `%User{name = "x"}`,
+   `%{state | count + 1}` etc. now emit `:invalid_map_entry` (`check_bare_map_entry` enforces the
+   upstream `map_base_expr` shape); grammar-valid shorthands (`%{name}`, `%{user.id}`, `%{m | name}`,
+   unary chains, `%{&1}`) stay clean.
+
+5. **V4 (2026-07-03): `%//x{}`.** `:ternary_op` added to `struct_base_start?`, so the prefix-`//`
+   struct base agrees with every other unary base.
+
+All are covered by regressions in `diagnostics_conformance_test.exs` (V1/V2/V4 under
+"FUZZER_GAPS validish-reachable fixes"). A 13,467-file real-world sweep (elixir, ecto, phoenix,
+ash, credo, … under `elixir_oss/projects`) after V1/V2/V4: **0 false errors, 0 missed errors,
+0 crashes.**
 
 ## Missed ERRORS (47) — oracle rejects, toxic2 builds a best-effort tree
 
@@ -174,9 +210,10 @@ are now FIXED — see "Upstream diagnostics addressed" above — leaving 47):
 
 - **[42] `syntax error before:`** — fuzzer operator-soup that hits a grammar production toxic2
   tolerates. Sub-categories (curated examples):
-  - map/struct entry that isn't `key => value` / `key: value` (a bare expression):
-    `%{foo bar, baz}`, `%{0*0}`, `%Foo{o=t}`, `%{&x}`
-  - map-UPDATE (`%{x | …}`) with a non-entry: `%{x | &b}`, `%{x | e>n,}`
+  - **[FIXED — V2, 2026-07-03]** map/struct entry that isn't `key => value` / `key: value` (a bare
+    expression): `%{foo bar, baz}`, `%{0*0}`, `%Foo{o=t}`, `%{&x}` — now `:invalid_map_entry`
+  - **[FIXED — V2, 2026-07-03]** map-UPDATE (`%{x | …}`) with a non-entry: `%{x | &b}`,
+    `%{x | e>n,}` — same rule
   - `fn (a, …)` parenthesised args with newline-comma / kw-guard: `fn (a, l\n,n) -> :ok end`,
     `fn (a, b) when h: e -> :ok end`
   - newline-then-comma in brackets/access/bitstring: `[d\n,]`, `{s\n,}`, `foo[l\n,]`,
@@ -206,7 +243,8 @@ All synthetic operator-soup; none occur in the 2632-file real corpus. By toxic2 
 The one structural theme worth noting: a no-parens call with keyword args as a **parenthesised**-call
 kw value (`foo(x: defstruct a: 1, b: 2)`) raises `:no_parens_kw_not_last` because the inner kw args
 don't get absorbed by the inner call. **This is NOT fuzzer-only** — `quote(do: defstruct a: 1, b: 2)`
-is ordinary macro code; see "Validish-reachable" §V1 above (promoted 2026-06-12).
+is ordinary macro code; see "Validish-reachable" §V1 above (promoted 2026-06-12, **fixed
+2026-07-03**).
 
 ## Missed WARNINGS (16) — oracle warns, toxic2 stays clean
 
@@ -235,8 +273,10 @@ crashes, and never false-positives on real code, so — per the tolerant-parser 
 "Validish-reachable" above): V1 `quote(do: defstruct a: 1, b: 2)` (false error, parens twin of
 "Fixed" §1), V2 operator-rooted bare map/struct entries (missed error, `=`/`:` typo class, has an
 obvious grouped grammar rule), V3 `assert msg, … x, y` ambiguous comma (missed error), and V4
-`%//x{}` (false error, completeness gap from the §1.1 fix). V1/V2/V4 meet this doc's own promotion
-bar ("a real corpus example appears or a grouped grammar rule becomes obvious") and are recommended
-for fixing; V3 is optional. The headline "83 false errors" count also predates `f8dbc2f` and is
-overstated (see "Stale rows"). (This catalogue is scoped to the toxic_parser corpus; it is not a
-guarantee that every upstream diagnostic is covered.)
+`%//x{}` (false error, completeness gap from the §1.1 fix). V1/V2/V4 met this doc's own promotion
+bar ("a real corpus example appears or a grouped grammar rule becomes obvious") and **are now fixed
+(2026-07-03; "Fixed" §3–5)**; V3 stays open as optional. The headline "83 false errors" count also
+predates `f8dbc2f` and is overstated (see "Stale rows"), and the "[42]" map/struct rows and the
+"False ERRORS" structural theme are largely resolved by V2/V1 — both need a re-count on the next
+full corpus sweep. (This catalogue is scoped to the toxic_parser corpus; it is not a guarantee that
+every upstream diagnostic is covered.)
