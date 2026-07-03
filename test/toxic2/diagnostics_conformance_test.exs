@@ -452,5 +452,76 @@ defmodule Toxic2.DiagnosticsConformanceTest do
         assert_classified(src)
       end
     end
+
+    # V3: upstream absorbs a comma after an operator-embedded trailing no-parens call into the
+    # INNER call and then rejects (`error_no_parens_many_strict`) — any NON-FIRST comma-separated
+    # position is strict; first/last/rightmost positions absorb and stay valid.
+    test "V3: ambiguous comma past an operator-embedded no-parens call" do
+      for src <- [
+            # the validish embodiment: assert with a built message
+            ~S|assert x == y, "expected " <> inspect x, label: "x"|,
+            ~S|assert valid?, "got " <> describe x, y|,
+            "foo 1, 2 + bar 3, 4",
+            "f(1, 2 + bar 3, 4)",
+            "[1, 2 + bar 3, 4]",
+            "{1, 2 + bar 3, 4}",
+            "<<1, 2 + bar 3, 4>>",
+            "[2 + bar 3,]",
+            "[1, -bar 3, 4]",
+            "%{k => 2 + bar 3, k2 => 4}",
+            "%{a: 2 + bar 3, b: 4}",
+            "f(a: 2 + bar 3, b: 4)",
+            ~S|f("a": g b, c: 1)|,
+            "fn a, 1 + bar 2, c -> x end",
+            "fn a, b when bar 2, c -> x end"
+          ] do
+        assert_classified(src)
+        assert errors(src) != []
+      end
+
+      # first / last / rightmost positions absorb greedily and stay clean — as do do-block
+      # operands, sealed parens, and non-strict do-block clause heads
+      for src <- [
+            "foo 2 + bar 3, 4",
+            "f(2 + bar 3, 4)",
+            "[1, 2 + bar 3]",
+            "x = 1 + foo 2, 3",
+            "[1, 2 + (bar 3), 4]",
+            "[1, 2 + case x do _ -> 3 end, 4]",
+            "case x do y when bar 2, c -> 1 end",
+            "cond do bar 2, c -> 1 end",
+            "fn bar 2, c -> x end",
+            "fn a when bar 2, c -> x end",
+            "def f(x) when x > 0 and is_atom y, do: 1"
+          ] do
+        assert_classified(src)
+      end
+    end
+
+    # V1 follow-up (keyword-run absorption completeness): the absorption descends operator
+    # chains to the RIGHTMOST kw-only no-parens call, in kw values, assoc values, bare container
+    # elements, and access indices — matching the oracle's greedy-innermost AST exactly.
+    test "keyword-run absorption descends operator chains and covers all containers" do
+      cases = [
+        {"f(a: 2 + g x: 1, b: 2)", ~S|f(a: 2 + g(x: 1, b: 2))|},
+        {"f(a: -g x: 1, b: 2)", ~S|f(a: -g(x: 1, b: 2))|},
+        {"[render x: 1, y: 2]", ~S|[render(x: 1, y: 2)]|},
+        {"[2 + foo x: 1, y: 2]", ~S|[2 + foo(x: 1, y: 2)]|},
+        {"{1, foo x: 1, y: 2}", ~S|{1, foo(x: 1, y: 2)}|},
+        {"%{k => g x: 1, y: 2}", ~S|%{k => g(x: 1, y: 2)}|},
+        {"m[foo x: 1, y: 2]", ~S|m[foo(x: 1, y: 2)]|}
+      ]
+
+      for {src, expected} <- cases do
+        assert_classified(src)
+        {ast, _} = Toxic2.parse_to_ast(src)
+        assert Macro.to_string(ast) == expected
+      end
+
+      # …but an absorption that stops (non-kw follows) is the upstream error
+      for src <- ["[foo x: 1, 2]", "%{k => g x: 1, j => 2}"] do
+        assert_classified(src)
+      end
+    end
   end
 end

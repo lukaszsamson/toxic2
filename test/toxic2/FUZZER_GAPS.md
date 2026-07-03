@@ -65,8 +65,8 @@ plausible human-written embodiment found four that are genuinely reachable. Meth
 ~40 hand-built realistic candidates run through both parsers post-`f8dbc2f` (harness left at
 `/tmp/fuzzer_gaps_audit.exs` during the audit; not committed).
 
-> **Fix status (2026-07-03):** V1, V2 and V4 are **FIXED** (see the per-finding notes and the
-> "Fixed" section below); V3 remains open as the doc classed it optional.
+> **Fix status (2026-07-03):** V1, V2, V3 and V4 are all **FIXED** (see the per-finding notes and
+> the "Fixed" section below).
 
 ### V1. FALSE ERROR — `quote(do: defstruct a: 1, b: 2)` (parens-call kw value is a kw-only no-parens call) — **FIXED 2026-07-03**
 
@@ -126,7 +126,7 @@ entry is kept in the tree). Applies to update entries; the update BASE stays a f
 (`%{a + b | x: 1}` is valid). This also covers the `%{x | &b}` / `%{x | e>n,}` update rows and
 `%{foo bar, baz}` / `%{0*0}` / `%Foo{o=t}` / `%{&x}` from "[42]" below.
 
-### V3. MISSED ERROR — ambiguous comma in `assert`-style no-parens code — still open (optional)
+### V3. MISSED ERROR — ambiguous comma in `assert`-style no-parens code — **FIXED 2026-07-03**
 
 Bucket `[4]` (`foo 1, 2 + bar 3, 4`) is reachable via ExUnit's `assert msg` idiom:
 
@@ -138,6 +138,23 @@ assert valid?, "got " <> describe x, y                # MISSED ERROR
 Oracle rejects (`unexpected comma. Parentheses are required…`); toxic2 builds a (well-formed)
 best-effort tree silently. Borderline: real but rarer, and the tolerant tree is sound.
 **Optional fix.**
+
+**Fixed:** probing showed the bucket is much broader than the statement-level exemplars — upstream
+absorbs the comma into the operator-embedded trailing no-parens call and then rejects
+(`error_no_parens_many_strict`) in EVERY non-first comma-separated position: parens-call args
+(`f(1, 2 + bar 3, 4)`), container elements (`[1, 2 + bar 3, 4]`, incl. before a trailing comma),
+map assoc/kw values, call/list kw values (incl. quoted keys), and `fn` clause heads
+(`fn a, 1 + bar 2, c -> x end`) — but NOT first/last/rightmost positions (`foo 2 + bar 3, 4` and
+`x = 1 + foo 2, 3` absorb and are valid), do-block operands, sealed parens, or do-block clause
+heads (`case … do y when bar 2, c -> 1 end` is valid; only `fn` is strict, and only with ≥2
+patterns). Implemented as a `rightmost_operand/1` descent shared by `check_no_parens_strict`,
+`check_call_arg_strict`, `check_np_comma`, `check_np_kw_last`, `check_map_entry_np_comma`, and a
+new `check_fn_head_strict` (all emit `:ambiguous_no_parens`; the best-effort tree is unchanged).
+The same audit found the V1 keyword-run absorption must ALSO descend operator chains
+(`f(a: 2 + g x: 1, b: 2)` => `g(x: 1, b: 2)` — toxic2 silently built a different AST) and apply to
+bare container elements (`[render x: 1, y: 2]` was a false `:ambiguous_no_parens`), assoc values
+(`%{k => g x: 1, y: 2}`), and access indices (`m[foo x: 1, y: 2]` was a false error) — all fixed
+via the same descent (`absorb_kw_run` + `append_trailing_kw`).
 
 ### V4. FALSE ERROR — `%//x{}` (completeness gap from our own §1.1 // fix) — **FIXED 2026-07-03**
 
@@ -201,6 +218,16 @@ predates `f8dbc2f`.)
 5. **V4 (2026-07-03): `%//x{}`.** `:ternary_op` added to `struct_base_start?`, so the prefix-`//`
    struct base agrees with every other unary base.
 
+6. **V3 (2026-07-03): ambiguous comma past an operator-embedded no-parens call.** `assert x == y,
+   "expected " <> inspect x, label: "x"` and every other non-first comma-separated embodiment now
+   emit `:ambiguous_no_parens` (see the V3 note above for the full position rule); the same
+   `rightmost_operand` descent extended the V1 keyword-run absorption to operator chains, bare
+   container elements, assoc values, and access indices (three of which were silent AST
+   divergences or false errors).
+
+7. **`[4] unexpected comma`** and the **`fn (a, …)` kw-guard / newline-comma `fn` rows** from
+   "[42]" are covered by the V3 fix where they are strict upstream (`fn` heads with ≥2 patterns).
+
 All are covered by regressions in `diagnostics_conformance_test.exs` (V1/V2/V4 under
 "FUZZER_GAPS validish-reachable fixes"). A 13,467-file real-world sweep (elixir, ecto, phoenix,
 ash, credo, … under `elixir_oss/projects`) after V1/V2/V4: **0 false errors, 0 missed errors,
@@ -221,8 +248,8 @@ are now FIXED — see "Upstream diagnostics addressed" above — leaving 47):
     `fn (a, b) when h: e -> :ok end`
   - newline-then-comma in brackets/access/bitstring: `[d\n,]`, `{s\n,}`, `foo[l\n,]`,
     `foo(0\n,a)`, `<<a::n\n,>>`
-- **[4] `unexpected comma. Parentheses are required…`** — ambiguous no-parens with a following comma
-  past an operator: `foo 1, 2 + bar 3, 4`.
+- **[FIXED — V3, 2026-07-03]** `unexpected comma. Parentheses are required…` — ambiguous no-parens
+  with a following comma past an operator: `foo 1, 2 + bar 3, 4` — now `:ambiguous_no_parens`.
 - **[FIXED] comment break char** — U+2028/U+2029/VT/FF/NEL inside a `#` comment, now
   `:invalid_break`. (was: `# This is a  `. (Lexical — a clean candidate if ever wanted.)
 - **[FIXED] charlist invalid encoding** — `'\xFF'` now `:invalid_charlist_encoding`. (The earlier
@@ -279,7 +306,8 @@ crashes, and never false-positives on real code, so — per the tolerant-parser 
 obvious grouped grammar rule), V3 `assert msg, … x, y` ambiguous comma (missed error), and V4
 `%//x{}` (false error, completeness gap from the §1.1 fix). V1/V2/V4 met this doc's own promotion
 bar ("a real corpus example appears or a grouped grammar rule becomes obvious") and **are now fixed
-(2026-07-03; "Fixed" §3–5)**; V3 stays open as optional. The headline "83 false errors" count also
+(2026-07-03; "Fixed" §3–5)**; **V3 is fixed too ("Fixed" §6)** — probing showed it generalizes to a
+clean grouped rule over every non-first comma position. The headline "83 false errors" count also
 predates `f8dbc2f` and is overstated (see "Stale rows"), and the "[42]" map/struct rows and the
 "False ERRORS" structural theme are largely resolved by V2/V1 — both need a re-count on the next
 full corpus sweep. (This catalogue is scoped to the toxic_parser corpus; it is not a guarantee that

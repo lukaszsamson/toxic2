@@ -463,8 +463,13 @@ defmodule Toxic2.ParserTest do
       assert {{:+, _, [1, {:if, _, [{:x, _, nil}, [do: :ok]]}]}, []} =
                Toxic2.parse_to_ast("1 + if x do :ok end")
 
-      # but inside brackets the element stays single-arg (the comma is the delimiter)
-      assert {[{:+, _, [1, {:foo, _, [2]}]}, 3], []} = Toxic2.parse_to_ast("[1 + foo 2, 3]")
+      # but inside brackets the element stays single-arg (the comma is the delimiter) — and, like
+      # the oracle (which would absorb the comma into `foo` and then reject), the non-last element
+      # is flagged ambiguous; the best-effort tree still nests `foo 2` as one arg
+      assert {[{:+, _, [1, {:foo, _, [2]}]}, 3], [diag]} = Toxic2.parse_to_ast("[1 + foo 2, 3]")
+      assert elem(diag, 3) == :ambiguous_no_parens
+      # with no following comma it stays clean
+      assert {[{:+, _, [1, {:foo, _, [2]}]}], []} = Toxic2.parse_to_ast("[1 + foo 2]")
     end
 
     test "a unary prefix's rightmost operand may be a multi-arg no-parens call" do

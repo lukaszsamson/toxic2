@@ -17,6 +17,17 @@ All notable changes to this project are documented here. The format is based on
   accepted); grammar-valid shorthands (`%{name}`, `%{user.id}`, `%{m | name}`, unary chains) stay
   clean.
 - Parser: `%//x{}` (a prefix-`//` struct base) is accepted like every other unary base.
+- Parser: an operator-embedded trailing no-parens call followed by a comma is now rejected with
+  `:ambiguous_no_parens` in every non-first comma-separated position, matching the oracle's
+  `error_no_parens_many_strict` (`assert x == y, "expected " <> inspect x, label: "x"`,
+  `f(1, 2 + bar 3, 4)`, `[1, 2 + bar 3, 4]`, map values, `fn` heads with ≥2 patterns);
+  first/last/rightmost positions, do-block operands, sealed parens, and do-block clause heads
+  stay valid.
+- Parser: the keyword-run absorption now descends operator chains to the rightmost kw-only
+  no-parens call (`f(a: 2 + g x: 1, b: 2)` => `g(x: 1, b: 2)`, previously a silently different
+  AST) and also applies to bare container elements (`[render x: 1, y: 2]` was a false error),
+  assoc values (`%{k => g x: 1, y: 2}`), and access indices (`m[foo x: 1, y: 2]` was a false
+  error).
 
 ## [0.1.0] - 2026-06-21
 
