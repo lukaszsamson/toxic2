@@ -43,9 +43,13 @@ defmodule Toxic2.SemanticTokens do
   # Closed name-sets — the honest slice of "defaultLibrary" knowledge that needs no symbol table.
   # These all lex as :identifier (they are macros/special forms, NOT reserved words), so the
   # call-callee rule MUST consult them or it would repaint `if`/`case`/`def` as `function`.
-  @def_family ~w(def defp defmacro defmacrop defguard defguardp)
-  @macro_def ~w(defmacro defmacrop)
+  # `defguard`/`defguardp` define macros, so their targets are `:macro`.
+  @def_family ~w(def defp defmacro defmacrop defguard defguardp defdelegate)
+  @macro_def ~w(defmacro defmacrop defguard defguardp)
   @module_def ~w(defmodule defprotocol defimpl)
+  # Structural Kernel macros whose "arguments" are data (fields, options) — the callee itself is
+  # left to TextMate, like directives.
+  @structural_def ~w(defstruct defexception defoverridable)
   @directives ~w(alias import require use)
   @control ~w(if unless case cond for with try receive quote unquote unquote_splicing fn raise throw)
   @doc_attrs ~w(moduledoc doc typedoc)
@@ -53,6 +57,35 @@ defmodule Toxic2.SemanticTokens do
   @type_attrs ~w(type typep opaque)
   # Block/control option keys in their inline keyword form (`if x, do: y, else: z`).
   @block_keys ~w(do else rescue catch after)
+  # Compiler-provided pseudo-variables — a closed set, safe to classify by name alone. They are
+  # exempt from the per-statement `variable` gate (fixed names cannot be mid-edit garbage).
+  @special_vars ~w(__MODULE__ __ENV__ __CALLER__ __DIR__ __STACKTRACE__)
+
+  @known_types [
+    :namespace,
+    :type,
+    :class,
+    :function,
+    :method,
+    :macro,
+    :property,
+    :number,
+    :variable,
+    :atom,
+    :attribute,
+    :typespec,
+    :sigil,
+    :capture
+  ]
+  @known_modifiers [:definition, :declaration, :readonly, :documentation, :deprecated, :defaultLibrary]
+
+  @doc "Every `type` atom this module can emit — for editor-side legend consistency checks."
+  @spec known_types() :: [type()]
+  def known_types, do: @known_types
+
+  @doc "Every `modifier` atom this module can emit — for editor-side legend consistency checks."
+  @spec known_modifiers() :: [modifier()]
+  def known_modifiers, do: @known_modifiers
 
   @doc """
   Classify `source` into source-ordered, single-line semantic spans
@@ -85,11 +118,22 @@ defmodule Toxic2.SemanticTokens do
     Enum.reduce(ch, acc, fn child, acc -> walk(child, clean, view, acc) end)
   end
 
-  # Identifier leaf with no structural role, inside a clean statement → `variable`.
+  # Identifier leaf with no structural role: compiler pseudo-variables (`__MODULE__` & co.) are
+  # classified by name (gate-exempt); anything else becomes `variable` inside a clean statement.
   defp walk({:token, i, _f, _d}, clean, view, acc) do
-    if clean and Tokens.kind(view, i) == :identifier,
-      do: Map.put_new(acc, i, {:variable, []}),
-      else: acc
+    cond do
+      Tokens.kind(view, i) != :identifier ->
+        acc
+
+      Tokens.value(view, i) in @special_vars ->
+        Map.put_new(acc, i, {:variable, [:readonly, :defaultLibrary]})
+
+      clean ->
+        Map.put_new(acc, i, {:variable, []})
+
+      true ->
+        acc
+    end
   end
 
   defp walk(_other, _clean, _view, acc), do: acc
@@ -104,6 +148,7 @@ defmodule Toxic2.SemanticTokens do
         # directives (`alias`/`import`/…) and control forms (`if`/`case`/…): emit nothing for the
         # callee — TextMate's keyword scope is correct and richer. `:skip` blocks the `variable`
         # gate too, so these never leak through as variables.
+        {ci, v} when v in @structural_def -> skip(acc, ci)
         {ci, v} when v in @directives -> skip(acc, ci)
         {ci, v} when v in @control -> skip(acc, ci)
         {i, _v} -> Map.put_new(acc, i, {:function, []})
@@ -118,7 +163,7 @@ defmodule Toxic2.SemanticTokens do
 
   defp node_roles(:remote_call, [base, name | args], view, acc) do
     case leaf_id(name, view) do
-      {i, _v} -> Map.put_new(acc, i, {remote_member_type(base, args), []})
+      {i, _v} -> Map.put_new(acc, i, {remote_member_type(base, args, view, i), []})
       nil -> acc
     end
   end
@@ -184,8 +229,14 @@ defmodule Toxic2.SemanticTokens do
        else: nil
   end
 
-  defp def_name_index({:token, i, _f, _d}, view),
-    do: if(Tokens.kind(view, i) == :identifier, do: i, else: nil)
+  # `def unquote(name)(args)` descends into the header call — the `unquote` callee is macro
+  # plumbing, not the defined name; the inner-call `@control` rule will `skip` it instead.
+  defp def_name_index({:token, i, _f, _d}, view) do
+    if Tokens.kind(view, i) == :identifier and
+         Tokens.value(view, i) not in ~w(unquote unquote_splicing),
+       do: i,
+       else: nil
+  end
 
   defp def_name_index(_other, _view), do: nil
 
@@ -272,10 +323,17 @@ defmodule Toxic2.SemanticTokens do
   end
 
   # Remote member: `Foo.bar()`/`conn.assigns` — UX-driven. Call-shape ⇒ method; else lean on the
-  # base shape (capitalized alias base ⇒ method, variable base ⇒ property).
-  defp remote_member_type(_base, args) when args != [], do: :method
-  defp remote_member_type({:node, :alias, _sp, _ch, _f, _d}, _args), do: :method
-  defp remote_member_type(_base, _args), do: :property
+  # base shape (capitalized alias base ⇒ method, variable base ⇒ property). Zero-arg parens
+  # (`x.foo()`) leave no arg children in the CST, so check for a `(` right after the name.
+  defp remote_member_type(_base, args, _view, _i) when args != [], do: :method
+
+  defp remote_member_type(base, _args, view, i) do
+    cond do
+      Tokens.kind(view, i + 1) == :"(" -> :method
+      match?({:node, :alias, _sp, _ch, _f, _d}, base) -> :method
+      true -> :property
+    end
+  end
 
   # --- emission ----------------------------------------------------------------------------
 

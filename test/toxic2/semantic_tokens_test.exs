@@ -40,6 +40,29 @@ defmodule Toxic2.SemanticTokensTest do
       assert {:method, "map"} in marks("Enum.map(l, f)")
       assert {:property, "assigns"} in marks("conn.assigns")
     end
+
+    test "zero-arg parens on a variable base are still a call shape" do
+      assert {:method, "foo"} in marks("x.foo()")
+      assert {:method, "foo"} in marks("__MODULE__.foo()")
+      assert {:property, "foo"} in marks("x.foo")
+    end
+  end
+
+  describe "compiler pseudo-variables" do
+    test "__MODULE__ and friends are readonly defaultLibrary variables" do
+      for name <- ~w(__MODULE__ __ENV__ __CALLER__ __DIR__ __STACKTRACE__) do
+        assert Enum.any?(full("x = #{name}"), fn {_, _, _, _, t, mods} ->
+                 t == :variable and :readonly in mods and :defaultLibrary in mods
+               end),
+               name
+      end
+    end
+
+    test "the gate exemption: classified even inside an errored statement" do
+      assert Enum.any?(full("x = __MODULE__ +"), fn {_, _, _, _, t, mods} ->
+               t == :variable and :defaultLibrary in mods
+             end)
+    end
   end
 
   describe "the control/def stop-list (must NOT become function or variable)" do
@@ -70,12 +93,40 @@ defmodule Toxic2.SemanticTokensTest do
       assert {:function, "foo"} in marks("def foo(x) when is_atom(x), do: x")
       assert {:function, "foo"} in marks("defp foo(x) when is_atom(x), do: x")
       assert {:macro, "m"} in marks("defmacro m(x) when is_atom(x), do: x")
-      assert {:function, "is_foo"} in marks("defguard is_foo(x) when is_atom(x)")
-      assert {:function, "is_foo"} in marks("defguardp is_foo(x) when is_atom(x)")
+      # defguard/defguardp define macros
+      assert {:macro, "is_foo"} in marks("defguard is_foo(x) when is_atom(x)")
+      assert {:macro, "is_foo"} in marks("defguardp is_foo(x) when is_atom(x)")
 
       assert Enum.any?(full("def foo(x) when is_atom(x), do: x"), fn {_, _, _, _, t, m} ->
                t == :function and :definition in m
              end)
+    end
+
+    test "defdelegate marks its target as a function definition" do
+      m = marks("defdelegate foo(a), to: Bar")
+      assert {:function, "foo"} in m
+      refute Enum.any?(m, fn {_t, txt} -> txt == "defdelegate" end)
+
+      assert Enum.any?(full("defdelegate foo(a), to: Bar"), fn {_, _, _, _, t, mods} ->
+               t == :function and :definition in mods
+             end)
+    end
+
+    test "structural Kernel macros (defstruct/defexception/defoverridable) are not emitted" do
+      for src <- ["defstruct a: 1, b: 2", "defexception [:message]", "defoverridable foo: 1"] do
+        [kw | _] = String.split(src)
+        refute Enum.any?(marks(src), fn {_t, txt} -> txt == kw end), src
+      end
+
+      # their data arguments keep their lexical roles
+      assert {:property, "a"} in marks("defstruct a: 1, b: 2")
+      assert {:atom, ":message"} in marks("defexception [:message]")
+    end
+
+    test "def unquote(name)(args) does not paint unquote as the defined function" do
+      m = marks("def unquote(name)(x), do: x")
+      refute Enum.any?(m, fn {_t, txt} -> txt == "unquote" end)
+      assert {:variable, "name"} in m
     end
   end
 
@@ -99,6 +150,11 @@ defmodule Toxic2.SemanticTokensTest do
     test "ordinary keyword keys are still property" do
       assert {:property, "key"} in marks("[key: 1]")
       assert {:property, "name"} in marks("foo(name: 1)")
+    end
+
+    test "quoted keyword keys are string territory — nothing is emitted for the key" do
+      # `"foo bar":` lexes as string_start/fragment/end + kw_quote; strings stay with TextMate.
+      assert marks(~s(["foo bar": 1])) == [{:number, "1"}]
     end
   end
 
