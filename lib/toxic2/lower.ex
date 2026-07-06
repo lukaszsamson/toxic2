@@ -1934,13 +1934,25 @@ defmodule Toxic2.Lower do
       build_alias([first | rest], meta, view, opts, acc, nid)
     else
       {base_ast, acc, nid} = lower(first, view, opts, acc, nid)
-      meta = alias_base_meta(first, meta, view, opts)
       {acc, nid} = maybe_atom_dot_alias(base_ast, rest, view, acc, nid)
 
       case seg_atoms(rest, view, opts) do
         {:ok, atoms} ->
-          {{:__aliases__, with_alias_last(meta, List.last(rest), view, opts), [base_ast | atoms]},
-           acc, nid}
+          case base_ast do
+            # A base that itself lowered to an alias — only parens produce this (`(Foo).Bar`,
+            # `(Foo.Bar).Baz`) — splices into ONE flat alias (upstream's build_dot_alias
+            # concatenates the segment lists), keeping the base's meta (parens included) and
+            # re-pointing `last:` at the new final segment.
+            {:__aliases__, bmeta, base_segs} ->
+              {{:__aliases__, replace_alias_last(bmeta, List.last(rest), view, opts),
+                prepend(base_segs, atoms)}, acc, nid}
+
+            _ ->
+              meta = alias_base_meta(first, meta, view, opts)
+
+              {{:__aliases__, with_alias_last(meta, List.last(rest), view, opts),
+                [base_ast | atoms]}, acc, nid}
+          end
 
         {:error, leaf} ->
           alias_seg_error(leaf, view, acc, nid)
@@ -1978,6 +1990,17 @@ defmodule Toxic2.Lower do
   end
 
   defp with_alias_last(meta, _last_leaf, _view, _opts), do: meta
+
+  # Update a spliced base's `last:` in place (the base alias always carries one under
+  # `token_metadata`), preserving key order so the meta list compares equal to upstream's.
+  defp replace_alias_last(meta, _last_leaf, _view, %{token_metadata: false}), do: meta
+
+  defp replace_alias_last(meta, {:token, idx, _f, _d}, view, _opts) do
+    {sl, sc, _el, _ec} = tspan(view, idx)
+    List.keyreplace(meta, :last, 0, {:last, [line: sl, column: sc]})
+  end
+
+  defp replace_alias_last(meta, _last_leaf, _view, _opts), do: meta
 
   # Atomize every alias segment through the gated policy; the first that fails (a fresh atom under
   # `existing_atoms_only`, or invalid UTF-8) short-circuits to `{:error, that_leaf}`.

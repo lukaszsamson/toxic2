@@ -77,7 +77,14 @@ defmodule Toxic2.SemanticTokens do
     :sigil,
     :capture
   ]
-  @known_modifiers [:definition, :declaration, :readonly, :documentation, :deprecated, :defaultLibrary]
+  @known_modifiers [
+    :definition,
+    :declaration,
+    :readonly,
+    :documentation,
+    :deprecated,
+    :defaultLibrary
+  ]
 
   @doc "Every `type` atom this module can emit — for editor-side legend consistency checks."
   @spec known_types() :: [type()]

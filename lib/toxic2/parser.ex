@@ -492,6 +492,39 @@ defmodule Toxic2.Parser do
   end
 
   # A no-parens callee is a bare identifier, or a bare remote (`a.b` with no args yet).
+  # Operator families that may name a function reference (`op/arity`). `->`, `=>` and the structural
+  # `.` are excluded (`->/2` etc. are not captures). `..`/`...` (`range_op`/`ellipsis_op`) ARE valid
+  # here: Elixir's tokenizer re-emits an operator followed by `/arity` in capture position as an
+  # identifier, so `&../2` yields the identifier-shaped `{:.., _, nil}` (args nil), exactly as the
+  # other op refs lower (`op_ref` => `{op_atom, meta, nil}`).
+  @op_ref_kinds [
+    :dual_op,
+    :mult_op,
+    :concat_op,
+    :comp_op,
+    :rel_op,
+    :arrow_op,
+    :and_op,
+    :or_op,
+    :xor_op,
+    :power_op,
+    :in_op,
+    :when_op,
+    :unary_op,
+    :pipe_op,
+    :type_op,
+    :match_op,
+    :in_match_op,
+    :ternary_op,
+    :range_op,
+    :ellipsis_op,
+    # `&/1` is a reference to the capture operator itself (`& &/1` => `&(&/1)`); upstream
+    # accepts it anywhere an operator ref is legal (`f(&/1)`).
+    :capture_op
+  ]
+
+  defp op_ref_slash?(t, i), do: tk(t, i) == :mult_op and tv(t, i) == :/
+
   defp np_callee?({:token, idx, _f, _d}, t), do: tk(t, idx) == :identifier
   defp np_callee?({:node, :remote_call, _sp, [_base, _name], _f, _d}, _t), do: true
   defp np_callee?(_lhs, _t), do: false
@@ -503,11 +536,7 @@ defmodule Toxic2.Parser do
   defp np_arg_start?(t, lhs, i) do
     case {cst_span(t, lhs), tspan(t, i)} do
       {{_, _, el, ec}, {sl, sc, _, _}} when el == sl and ec <= sc ->
-        case tk(t, i) do
-          k when k in [:string_start, :charlist_start] -> true
-          _ when ec == sc -> false
-          k -> np_arg_kind?(t, i, k)
-        end
+        np_same_line_arg?(t, i, ec == sc)
 
       # The arg sits on a LATER line than the callee yet the cursor reached it with no `:eol` token
       # between — only a `\`-newline line continuation does that, which joins them into one logical
@@ -530,12 +559,34 @@ defmodule Toxic2.Parser do
     end
   end
 
-  defp np_arg_kind?(t, i, :dual_op),
-    do: Tokens.adjacent?(t, i, i + 1) and np_first_kind?(tk(t, i + 1))
+  # Same-line argument start. `adjacent?` = no space between callee and token: only a
+  # string/charlist (`foo"bar"`) or an op-ref may start there — `f+/2`, `f|/2` (upstream's
+  # identifier+dual-op adjacency rule explicitly exempts a following `/`).
+  defp np_same_line_arg?(t, i, adjacent?) do
+    case tk(t, i) do
+      k when k in [:string_start, :charlist_start] -> true
+      k when adjacent? -> k in @op_ref_kinds and op_ref_slash?(t, i + 1)
+      k -> np_arg_kind?(t, i, k)
+    end
+  end
+
+  # The operand may itself be a stacked `+`/`-` (`f +-var` => `f(+(-var))`) — only the FIRST
+  # dual op needs the space-before/adjacent-after shape; the rest is an ordinary unary chain
+  # (`f +- var` is still a call). A following `/` makes it an op-ref arg instead, where the
+  # adjacency rule does NOT apply (`f +/2` and `f + / 2` are both `f(+/2)`).
+  defp np_arg_kind?(t, i, :dual_op) do
+    op_ref_slash?(t, i + 1) or
+      (Tokens.adjacent?(t, i, i + 1) and
+         (np_first_kind?(tk(t, i + 1)) or tk(t, i + 1) == :dual_op))
+  end
 
   # `not` starts an arg (`f not x`) unless it is the `not in` operator (`a not in b`).
   defp np_arg_kind?(t, i, :unary_op), do: not not_in?(t, i)
-  defp np_arg_kind?(_t, _i, k), do: np_first_kind?(k)
+
+  # Any operator followed by `/arity` is an op-ref, which may be a no-parens argument
+  # (`f |/2` => `f(|/2)`, `misplaced operator |/2`) even though the bare operator could not.
+  defp np_arg_kind?(t, i, k),
+    do: np_first_kind?(k) or (k in @op_ref_kinds and op_ref_slash?(t, i + 1))
 
   # `not in` is only fused when both words are on the same line — upstream's tokenizer rewrites
   # `not` + `in` to a single `in_op` only without an intervening newline; `a not\nin b` is a syntax
@@ -1034,36 +1085,6 @@ defmodule Toxic2.Parser do
     {CST.node(:kw_list, list_span(t, pairs), pairs, :matched, nil), k, diags, nid, fuel}
   end
 
-  # Operator families that may name a function reference (`op/arity`). `->`, `=>` and the structural
-  # `.` are excluded (`->/2` etc. are not captures). `..`/`...` (`range_op`/`ellipsis_op`) ARE valid
-  # here: Elixir's tokenizer re-emits an operator followed by `/arity` in capture position as an
-  # identifier, so `&../2` yields the identifier-shaped `{:.., _, nil}` (args nil), exactly as the
-  # other op refs lower (`op_ref` => `{op_atom, meta, nil}`).
-  @op_ref_kinds [
-    :dual_op,
-    :mult_op,
-    :concat_op,
-    :comp_op,
-    :rel_op,
-    :arrow_op,
-    :and_op,
-    :or_op,
-    :xor_op,
-    :power_op,
-    :in_op,
-    :when_op,
-    :unary_op,
-    :pipe_op,
-    :type_op,
-    :match_op,
-    :in_match_op,
-    :ternary_op,
-    :range_op,
-    :ellipsis_op
-  ]
-
-  defp op_ref_slash?(t, i), do: tk(t, i) == :mult_op and tv(t, i) == :/
-
   defp parse_prefix(t, i, ctx, diags, nid, fuel) do
     kind = tk(t, i)
     prefix_bp = Precedence.prefix(kind)
@@ -1083,8 +1104,11 @@ defmodule Toxic2.Parser do
       # An operator function reference: `+/2`, `>=/2`, `&++/2`. In nud position an operator name
       # immediately followed by `/` is a bare operator value (`{:+, [], nil}`); the trailing
       # `/arity` is an ordinary division in the led loop. The `/` guard keeps this from changing
-      # any other use of these operators.
-      kind in @op_ref_kinds and op_ref_slash?(t, i + 1) ->
+      # any other use of these operators. `&` yields to a following `/`-ref (upstream's
+      # tokenizer rule): `&/1` refs `&` itself, but in `&//2` / `&/ /2` the `/` after the slash
+      # means the ref is `/` and `&` stays a capture (`&(//2)`).
+      kind in @op_ref_kinds and op_ref_slash?(t, i + 1) and
+          not (kind == :capture_op and op_ref_slash?(t, i + 2)) ->
         {CST.node(:op_ref, tok_span(t, i), [ctoken(i)], :matched, nil), i + 1, diags, nid, fuel}
 
       # `..` / `...` with no left operand: `..` is nullary only (`{:.., [], []}`); `...` is nullary
@@ -1970,7 +1994,8 @@ defmodule Toxic2.Parser do
   end
 
   # After an entry: finish at `}` (trailing comma allowed), continue at `,`, else unterminated.
-  defp map_rest(t, i, acc, seen_kw, diags, nid, fuel) do
+  defp map_rest(t, i, [entry | _] = acc, seen_kw, diags, nid, fuel) do
+    {diags, nid} = check_map_entry_embedded_many(t, entry, diags, nid)
     i2 = skip_eols(t, i)
 
     cond do
@@ -1983,6 +2008,36 @@ defmodule Toxic2.Parser do
 
       true ->
         map_unterminated(t, i2, acc, diags, nid, fuel)
+    end
+  end
+
+  # The absorbed-comma analogue of `check_map_entry_np_comma` (and of
+  # `check_container_elem_strict`): a NESTED inner call may have taken the separating comma
+  # itself (`%{a => foo bar 1, 2}` parses as one entry, `foo(bar(1, 2))`), so the comma check
+  # below never fires. Runs once per completed entry, on any terminator.
+  defp check_map_entry_embedded_many(t, entry, diags, nid) do
+    leaf =
+      case map_entry_value(entry) do
+        nil -> nil
+        val -> rightmost_operand(val)
+      end
+
+    if leaf != nil and no_parens_expr?(leaf) and not has_do_block?(leaf) and
+         not (ckind(entry) == :kw_pair and kw_only_np_call?(leaf)) do
+      {_id, diags, nid} =
+        Diagnostics.emit(
+          diags,
+          nid,
+          :parser,
+          :error,
+          :ambiguous_no_parens,
+          cst_span(t, entry),
+          %{}
+        )
+
+      {diags, nid}
+    else
+      {diags, nid}
     end
   end
 
@@ -2177,6 +2232,7 @@ defmodule Toxic2.Parser do
     {el, i, is_kw, diags, nid, fuel} = parse_element(t, i, mode, diags, nid, fuel)
     {diags, nid} = check_kw_last(seen_kw, is_kw, t, el, diags, nid)
     {diags, nid} = check_call_arg_strict(mode, el, acc, t, diags, nid)
+    {diags, nid} = check_container_elem_strict(mode, el, t, diags, nid)
     acc = [el | acc]
     i2 = skip_eols(t, i)
 
@@ -2386,22 +2442,41 @@ defmodule Toxic2.Parser do
     # is the ordinary keyword-not-last error, diagnosed by the element loop, not here.
     leaf = rightmost_operand(val)
 
-    if CST.category(leaf) == :no_parens and not has_do_block?(leaf) and
-         not kw_only_np_call?(leaf) and tk(t, skip_eols(t, j)) == :"," do
-      {_id, diags, nid} =
-        Diagnostics.emit(
-          diags,
-          nid,
-          :parser,
-          :error,
-          :no_parens_kw_not_last,
-          cst_span(t, val),
-          %{}
-        )
+    cond do
+      # A value whose inner call already ABSORBED the separating comma (`[a: foo bar 1, 2]` —
+      # one pair, value `foo(bar(1, 2))`) is invalid with no comma left to see; same
+      # absorbed-comma rule as `check_container_elem_strict` / `check_map_entry_embedded_many`.
+      no_parens_expr?(leaf) and not has_do_block?(leaf) and not kw_only_np_call?(leaf) ->
+        {_id, diags, nid} =
+          Diagnostics.emit(
+            diags,
+            nid,
+            :parser,
+            :error,
+            :ambiguous_no_parens,
+            cst_span(t, val),
+            %{}
+          )
 
-      {diags, nid}
-    else
-      {diags, nid}
+        {diags, nid}
+
+      CST.category(leaf) == :no_parens and not has_do_block?(leaf) and
+        not kw_only_np_call?(leaf) and tk(t, skip_eols(t, j)) == :"," ->
+        {_id, diags, nid} =
+          Diagnostics.emit(
+            diags,
+            nid,
+            :parser,
+            :error,
+            :no_parens_kw_not_last,
+            cst_span(t, val),
+            %{}
+          )
+
+        {diags, nid}
+
+      true ->
+        {diags, nid}
     end
   end
 
@@ -2456,6 +2531,27 @@ defmodule Toxic2.Parser do
   end
 
   defp check_np_comma(_mode, _el, _t, _comma_i, diags, nid), do: {diags, nid}
+
+  # A container element may not be a no-parens MANY / ambiguous-one call even when no comma
+  # FOLLOWS it — a nested inner call may have already absorbed the separating comma
+  # (`{foo bar 1, 2}` parses as `{foo(bar(1, 2))}`), so `check_np_comma` never sees one.
+  # Upstream rejects via `error_no_parens_container_strict` (`container_expr -> no_parens_expr`).
+  # A do-block seals the call (`[for x <- a, y <- b do … end]` is fine).
+  defp check_container_elem_strict(mode, el, t, diags, nid)
+       when mode in [:list, :tuple, :bitstring] do
+    leaf = rightmost_operand(el)
+
+    if no_parens_expr?(leaf) and not has_do_block?(leaf) do
+      {_id, diags, nid} =
+        Diagnostics.emit(diags, nid, :parser, :error, :ambiguous_no_parens, cst_span(t, el), %{})
+
+      {diags, nid}
+    else
+      {diags, nid}
+    end
+  end
+
+  defp check_container_elem_strict(_mode, _el, _t, diags, nid), do: {diags, nid}
 
   # A NON-FIRST parenthesised call argument may not be a no-parens MANY / ambiguous-one call (`foo(a,
   # bar b, c)` — `bar b, c` absorbs the comma into a `no_parens_many`) — including under operator
