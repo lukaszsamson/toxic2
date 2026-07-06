@@ -65,7 +65,10 @@ plausible human-written embodiment found four that are genuinely reachable. Meth
 ~40 hand-built realistic candidates run through both parsers post-`f8dbc2f` (harness left at
 `/tmp/fuzzer_gaps_audit.exs` during the audit; not committed).
 
-### V1. FALSE ERROR — `quote(do: defstruct a: 1, b: 2)` (parens-call kw value is a kw-only no-parens call)
+> **Fix status (2026-07-03):** V1, V2, V3 and V4 are all **FIXED** (see the per-finding notes and
+> the "Fixed" section below).
+
+### V1. FALSE ERROR — `quote(do: defstruct a: 1, b: 2)` (parens-call kw value is a kw-only no-parens call) — **FIXED 2026-07-03**
 
 This is the "structural theme" already flagged at the bottom of "False ERRORS" — but it is **not**
 fuzzer-only. It is the parenthesized twin of the very bug already fixed in "Fixed" §1 (which bit real
@@ -82,7 +85,16 @@ Root cause + fix are the SAME as "Fixed" §1: a trailing run of keyword pairs is
 (`call_args_no_parens_kw`), but here the inner call sits as a `kw_call`/`kw_data` *value* of an outer
 **parens** call, and that absorption path wasn't updated. **Recommend fix** (clean, mirrors §1).
 
-### V2. MISSED ERROR — operator-rooted bare map/struct entries (a `=`/`:` typo class)
+**Fixed:** `absorb_kw_run` in `parser.ex` absorbs the rest of the keyword run into a kw-ONLY
+no-parens keyword value (greedy-innermost, matching upstream `call_args_no_parens_kw`), in parens
+calls, lists, tuples, bitstrings, access args and maps, incl. quoted keys; `check_np_kw_last` now
+exempts the kw-only shape (what follows the absorbed run is the ordinary keyword-not-last error).
+AST matches the oracle (`quote(do: defstruct a: 1, b: 2)` => inner `defstruct([a: 1, b: 2])`).
+Follow-up (same day): map kw VALUES with a *positional* no-parens call followed by a comma
+(`%{a: g b, c: 1}`) now error like their call/list twins — `map_entry_value` no longer exempts
+`kw_pair` values (the kw-only shape stays exempt, it absorbed the run).
+
+### V2. MISSED ERROR — operator-rooted bare map/struct entries (a `=`/`:` typo class) — **FIXED 2026-07-03**
 
 The fuzzer exemplars (`%{0*0}`, `%Foo{o=t}`) read as soup, but the bucket is "a bare entry whose root
 is a binary operator," and that is a textbook typo:
@@ -106,7 +118,15 @@ asks for as its promotion bar: a bare map/struct entry (and update entry) must b
 shaped (a `sub_matched_expr` under at/unary/ellipsis chains), not an arbitrary `matched_expr`.
 **Recommend fix** (one grouped rule covers all the `[42] syntax error before:` map/struct rows).
 
-### V3. MISSED ERROR — ambiguous comma in `assert`-style no-parens code
+**Fixed:** `check_bare_map_entry` / `map_base_entry?` in `parser.ex` implement exactly that grouped
+rule — a bare entry must be a sub-matched expression, optionally under at/unary/dual/`//`/`...`
+prefix chains; binary-op-rooted entries, no-parens calls (`%{foo bar}`), captures (`%{&x}`; the
+numeric `&1` stays valid) and do-block calls emit the new `:invalid_map_entry` error (tolerant: the
+entry is kept in the tree). Applies to update entries; the update BASE stays a full `matched_expr`
+(`%{a + b | x: 1}` is valid). This also covers the `%{x | &b}` / `%{x | e>n,}` update rows and
+`%{foo bar, baz}` / `%{0*0}` / `%Foo{o=t}` / `%{&x}` from "[42]" below.
+
+### V3. MISSED ERROR — ambiguous comma in `assert`-style no-parens code — **FIXED 2026-07-03**
 
 Bucket `[4]` (`foo 1, 2 + bar 3, 4`) is reachable via ExUnit's `assert msg` idiom:
 
@@ -119,7 +139,24 @@ Oracle rejects (`unexpected comma. Parentheses are required…`); toxic2 builds 
 best-effort tree silently. Borderline: real but rarer, and the tolerant tree is sound.
 **Optional fix.**
 
-### V4. FALSE ERROR — `%//x{}` (completeness gap from our own §1.1 // fix)
+**Fixed:** probing showed the bucket is much broader than the statement-level exemplars — upstream
+absorbs the comma into the operator-embedded trailing no-parens call and then rejects
+(`error_no_parens_many_strict`) in EVERY non-first comma-separated position: parens-call args
+(`f(1, 2 + bar 3, 4)`), container elements (`[1, 2 + bar 3, 4]`, incl. before a trailing comma),
+map assoc/kw values, call/list kw values (incl. quoted keys), and `fn` clause heads
+(`fn a, 1 + bar 2, c -> x end`) — but NOT first/last/rightmost positions (`foo 2 + bar 3, 4` and
+`x = 1 + foo 2, 3` absorb and are valid), do-block operands, sealed parens, or do-block clause
+heads (`case … do y when bar 2, c -> 1 end` is valid; only `fn` is strict, and only with ≥2
+patterns). Implemented as a `rightmost_operand/1` descent shared by `check_no_parens_strict`,
+`check_call_arg_strict`, `check_np_comma`, `check_np_kw_last`, `check_map_entry_np_comma`, and a
+new `check_fn_head_strict` (all emit `:ambiguous_no_parens`; the best-effort tree is unchanged).
+The same audit found the V1 keyword-run absorption must ALSO descend operator chains
+(`f(a: 2 + g x: 1, b: 2)` => `g(x: 1, b: 2)` — toxic2 silently built a different AST) and apply to
+bare container elements (`[render x: 1, y: 2]` was a false `:ambiguous_no_parens`), assoc values
+(`%{k => g x: 1, y: 2}`), and access indices (`m[foo x: 1, y: 2]` was a false error) — all fixed
+via the same descent (`absorb_kw_run` + `append_trailing_kw`).
+
+### V4. FALSE ERROR — `%//x{}` (completeness gap from our own §1.1 // fix) — **FIXED 2026-07-03**
 
 Not validish itself, but a self-inflicted inconsistency: the grammar-gaps §1.1 fix added `//` as a
 unary in expression position, but `struct_base_start?` / the struct-base unary chain weren't updated,
@@ -131,6 +168,9 @@ so a struct base disagrees with every other unary base:
 ```
 
 **Recommend fix** (one-liner: add `:ternary_op` to `struct_base_start?` and the map_base unary path).
+
+**Fixed:** `:ternary_op` added to `struct_base_start?` (the unary-chain expression parser already
+handled prefix `//` since §1.1, so the gate was the only gap); `%//x{}` now agrees with the oracle.
 
 ### Confirmed fuzzer-only (no plausible embodiment found)
 
@@ -165,7 +205,33 @@ predates `f8dbc2f`.)
    expression. Fixed by scoping to paren *expressions* (in `lower_paren`) and checking the source
    between the delimiters for a `;`.
 
-Both are covered by regressions in `diagnostics_conformance_test.exs`.
+3. **V1 (2026-07-03): `:no_parens_kw_not_last` on `quote(do: defstruct a: 1, b: 2)`.** A kw-only
+   no-parens call as a *parens*-call/list/map keyword VALUE now absorbs the rest of the keyword run
+   into the inner call (`absorb_kw_run`), matching the oracle's greedy-innermost
+   `call_args_no_parens_kw`.
+
+4. **V2 (2026-07-03): operator-rooted bare map/struct entries.** `%User{name = "x"}`,
+   `%{state | count + 1}` etc. now emit `:invalid_map_entry` (`check_bare_map_entry` enforces the
+   upstream `map_base_expr` shape); grammar-valid shorthands (`%{name}`, `%{user.id}`, `%{m | name}`,
+   unary chains, `%{&1}`) stay clean.
+
+5. **V4 (2026-07-03): `%//x{}`.** `:ternary_op` added to `struct_base_start?`, so the prefix-`//`
+   struct base agrees with every other unary base.
+
+6. **V3 (2026-07-03): ambiguous comma past an operator-embedded no-parens call.** `assert x == y,
+   "expected " <> inspect x, label: "x"` and every other non-first comma-separated embodiment now
+   emit `:ambiguous_no_parens` (see the V3 note above for the full position rule); the same
+   `rightmost_operand` descent extended the V1 keyword-run absorption to operator chains, bare
+   container elements, assoc values, and access indices (three of which were silent AST
+   divergences or false errors).
+
+7. **`[4] unexpected comma`** and the **`fn (a, …)` kw-guard / newline-comma `fn` rows** from
+   "[42]" are covered by the V3 fix where they are strict upstream (`fn` heads with ≥2 patterns).
+
+All are covered by regressions in `diagnostics_conformance_test.exs` (V1/V2/V4 under
+"FUZZER_GAPS validish-reachable fixes"). A 13,467-file real-world sweep (elixir, ecto, phoenix,
+ash, credo, … under `elixir_oss/projects`) after V1/V2/V4: **0 false errors, 0 missed errors,
+0 crashes.**
 
 ## Missed ERRORS (47) — oracle rejects, toxic2 builds a best-effort tree
 
@@ -174,22 +240,24 @@ are now FIXED — see "Upstream diagnostics addressed" above — leaving 47):
 
 - **[42] `syntax error before:`** — fuzzer operator-soup that hits a grammar production toxic2
   tolerates. Sub-categories (curated examples):
-  - map/struct entry that isn't `key => value` / `key: value` (a bare expression):
-    `%{foo bar, baz}`, `%{0*0}`, `%Foo{o=t}`, `%{&x}`
-  - map-UPDATE (`%{x | …}`) with a non-entry: `%{x | &b}`, `%{x | e>n,}`
+  - **[FIXED — V2, 2026-07-03]** map/struct entry that isn't `key => value` / `key: value` (a bare
+    expression): `%{foo bar, baz}`, `%{0*0}`, `%Foo{o=t}`, `%{&x}` — now `:invalid_map_entry`
+  - **[FIXED — V2, 2026-07-03]** map-UPDATE (`%{x | …}`) with a non-entry: `%{x | &b}`,
+    `%{x | e>n,}` — same rule
   - `fn (a, …)` parenthesised args with newline-comma / kw-guard: `fn (a, l\n,n) -> :ok end`,
     `fn (a, b) when h: e -> :ok end`
   - newline-then-comma in brackets/access/bitstring: `[d\n,]`, `{s\n,}`, `foo[l\n,]`,
     `foo(0\n,a)`, `<<a::n\n,>>`
-- **[4] `unexpected comma. Parentheses are required…`** — ambiguous no-parens with a following comma
-  past an operator: `foo 1, 2 + bar 3, 4`.
+- **[FIXED — V3, 2026-07-03]** `unexpected comma. Parentheses are required…` — ambiguous no-parens
+  with a following comma past an operator: `foo 1, 2 + bar 3, 4` — now `:ambiguous_no_parens`.
 - **[FIXED] comment break char** — U+2028/U+2029/VT/FF/NEL inside a `#` comment, now
   `:invalid_break`. (was: `# This is a  `. (Lexical — a clean candidate if ever wanted.)
 - **[FIXED] charlist invalid encoding** — `'\xFF'` now `:invalid_charlist_encoding`. (The earlier
   catalogue wrongly listed `"\xFF"` here; a double-quoted `"\xFF"` is valid binary syntax `<<255>>`
   and is NOT an error — only the charlist is.)
-- **[1] bidi in a string** — `"this is a ‪"` (a bidi control char inside a string; toxic2
-  already rejects bidi as a bare token but not inside a string escaped this way).
+- **[STALE — already conforms]** bidi in a string — `"this is a ‪"`: re-probed 2026-07-03, toxic2
+  emits `:invalid_bidi` for raw bidi controls inside strings, charlists, sigils and heredocs (the
+  escaped `"‪"` form stays valid on both sides). Nothing to do.
 
 ## False ERRORS (83) — oracle accepts (with a warning), toxic2 rejects
 
@@ -206,7 +274,8 @@ All synthetic operator-soup; none occur in the 2632-file real corpus. By toxic2 
 The one structural theme worth noting: a no-parens call with keyword args as a **parenthesised**-call
 kw value (`foo(x: defstruct a: 1, b: 2)`) raises `:no_parens_kw_not_last` because the inner kw args
 don't get absorbed by the inner call. **This is NOT fuzzer-only** — `quote(do: defstruct a: 1, b: 2)`
-is ordinary macro code; see "Validish-reachable" §V1 above (promoted 2026-06-12).
+is ordinary macro code; see "Validish-reachable" §V1 above (promoted 2026-06-12, **fixed
+2026-07-03**).
 
 ## Missed WARNINGS (16) — oracle warns, toxic2 stays clean
 
@@ -235,8 +304,11 @@ crashes, and never false-positives on real code, so — per the tolerant-parser 
 "Validish-reachable" above): V1 `quote(do: defstruct a: 1, b: 2)` (false error, parens twin of
 "Fixed" §1), V2 operator-rooted bare map/struct entries (missed error, `=`/`:` typo class, has an
 obvious grouped grammar rule), V3 `assert msg, … x, y` ambiguous comma (missed error), and V4
-`%//x{}` (false error, completeness gap from the §1.1 fix). V1/V2/V4 meet this doc's own promotion
-bar ("a real corpus example appears or a grouped grammar rule becomes obvious") and are recommended
-for fixing; V3 is optional. The headline "83 false errors" count also predates `f8dbc2f` and is
-overstated (see "Stale rows"). (This catalogue is scoped to the toxic_parser corpus; it is not a
-guarantee that every upstream diagnostic is covered.)
+`%//x{}` (false error, completeness gap from the §1.1 fix). V1/V2/V4 met this doc's own promotion
+bar ("a real corpus example appears or a grouped grammar rule becomes obvious") and **are now fixed
+(2026-07-03; "Fixed" §3–5)**; **V3 is fixed too ("Fixed" §6)** — probing showed it generalizes to a
+clean grouped rule over every non-first comma position. The headline "83 false errors" count also
+predates `f8dbc2f` and is overstated (see "Stale rows"), and the "[42]" map/struct rows and the
+"False ERRORS" structural theme are largely resolved by V2/V1 — both need a re-count on the next
+full corpus sweep. (This catalogue is scoped to the toxic_parser corpus; it is not a guarantee that
+every upstream diagnostic is covered.)

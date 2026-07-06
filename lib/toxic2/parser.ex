@@ -341,9 +341,11 @@ defmodule Toxic2.Parser do
   # A non-first argument of a no-parens call may not itself be a no-parens MANY / ambiguous-one call
   # (`foo a, bar b, c` is ambiguous between `foo(a, bar(b, c))` and `foo(a, bar(b), c)`). Elixir's
   # grammar rejects it via `error_no_parens_many_strict`; parentheses are required. We diagnose it
-  # (tolerant: the best-effort AST still nests the inner call).
+  # (tolerant: the best-effort AST still nests the inner call). The call may also sit under
+  # operator chains (`assert x == y, "e " <> inspect x, label: "x"` — the inner `inspect` absorbed
+  # the comma), hence the rightmost-operand descent.
   defp check_no_parens_strict(t, arg, diags, nid) do
-    if no_parens_expr?(arg) do
+    if embedded_no_parens_many?(arg) do
       {_id, diags, nid} =
         Diagnostics.emit(diags, nid, :parser, :error, :ambiguous_no_parens, cst_span(t, arg), %{})
 
@@ -352,6 +354,30 @@ defmodule Toxic2.Parser do
       {diags, nid}
     end
   end
+
+  # The rightmost operand through binary/unary operator chains — the position where upstream's
+  # greedy no-parens call would have absorbed a following comma. A paren, container, or do-block
+  # call seals the chain (they are their own leaf).
+  defp rightmost_operand({:node, :binary_op, _sp, [_l, _op, rhs], _f, _d}),
+    do: rightmost_operand(rhs)
+
+  defp rightmost_operand({:node, :unary_op, _sp, [_op, operand], _f, _d}),
+    do: rightmost_operand(operand)
+
+  defp rightmost_operand(node), do: node
+
+  # Does the expression END in a bare no-parens call (any arity)? In a `:matched` position
+  # (container element, map entry) upstream absorbs a following comma into that call and then
+  # rejects, so `[1, 2 + bar 3, 4]` is an error even though toxic2 parses `bar 3` as one arg.
+  defp trailing_np_call?(node) do
+    leaf = rightmost_operand(node)
+    CST.category(leaf) == :no_parens and not has_do_block?(leaf)
+  end
+
+  # Does the expression END in a no-parens MANY / ambiguous-one call? In an absorbing position
+  # (parens-call / no-parens-call argument, fn head) the inner call has already taken the commas,
+  # so a multi-arg inner call marks upstream's `error_no_parens_many_strict`.
+  defp embedded_no_parens_many?(node), do: no_parens_expr?(rightmost_operand(node))
 
   # A `no_parens_expr` in the grammar: a no-parens call with several args (`a, b` → no_parens_many)
   # or a single argument that is itself a no-parens expr (`g a, b` → no_parens_one_ambig). A plain
@@ -466,6 +492,39 @@ defmodule Toxic2.Parser do
   end
 
   # A no-parens callee is a bare identifier, or a bare remote (`a.b` with no args yet).
+  # Operator families that may name a function reference (`op/arity`). `->`, `=>` and the structural
+  # `.` are excluded (`->/2` etc. are not captures). `..`/`...` (`range_op`/`ellipsis_op`) ARE valid
+  # here: Elixir's tokenizer re-emits an operator followed by `/arity` in capture position as an
+  # identifier, so `&../2` yields the identifier-shaped `{:.., _, nil}` (args nil), exactly as the
+  # other op refs lower (`op_ref` => `{op_atom, meta, nil}`).
+  @op_ref_kinds [
+    :dual_op,
+    :mult_op,
+    :concat_op,
+    :comp_op,
+    :rel_op,
+    :arrow_op,
+    :and_op,
+    :or_op,
+    :xor_op,
+    :power_op,
+    :in_op,
+    :when_op,
+    :unary_op,
+    :pipe_op,
+    :type_op,
+    :match_op,
+    :in_match_op,
+    :ternary_op,
+    :range_op,
+    :ellipsis_op,
+    # `&/1` is a reference to the capture operator itself (`& &/1` => `&(&/1)`); upstream
+    # accepts it anywhere an operator ref is legal (`f(&/1)`).
+    :capture_op
+  ]
+
+  defp op_ref_slash?(t, i), do: tk(t, i) == :mult_op and tv(t, i) == :/
+
   defp np_callee?({:token, idx, _f, _d}, t), do: tk(t, idx) == :identifier
   defp np_callee?({:node, :remote_call, _sp, [_base, _name], _f, _d}, _t), do: true
   defp np_callee?(_lhs, _t), do: false
@@ -477,11 +536,7 @@ defmodule Toxic2.Parser do
   defp np_arg_start?(t, lhs, i) do
     case {cst_span(t, lhs), tspan(t, i)} do
       {{_, _, el, ec}, {sl, sc, _, _}} when el == sl and ec <= sc ->
-        case tk(t, i) do
-          k when k in [:string_start, :charlist_start] -> true
-          _ when ec == sc -> false
-          k -> np_arg_kind?(t, i, k)
-        end
+        np_same_line_arg?(t, i, ec == sc)
 
       # The arg sits on a LATER line than the callee yet the cursor reached it with no `:eol` token
       # between — only a `\`-newline line continuation does that, which joins them into one logical
@@ -504,12 +559,34 @@ defmodule Toxic2.Parser do
     end
   end
 
-  defp np_arg_kind?(t, i, :dual_op),
-    do: Tokens.adjacent?(t, i, i + 1) and np_first_kind?(tk(t, i + 1))
+  # Same-line argument start. `adjacent?` = no space between callee and token: only a
+  # string/charlist (`foo"bar"`) or an op-ref may start there — `f+/2`, `f|/2` (upstream's
+  # identifier+dual-op adjacency rule explicitly exempts a following `/`).
+  defp np_same_line_arg?(t, i, adjacent?) do
+    case tk(t, i) do
+      k when k in [:string_start, :charlist_start] -> true
+      k when adjacent? -> k in @op_ref_kinds and op_ref_slash?(t, i + 1)
+      k -> np_arg_kind?(t, i, k)
+    end
+  end
+
+  # The operand may itself be a stacked `+`/`-` (`f +-var` => `f(+(-var))`) — only the FIRST
+  # dual op needs the space-before/adjacent-after shape; the rest is an ordinary unary chain
+  # (`f +- var` is still a call). A following `/` makes it an op-ref arg instead, where the
+  # adjacency rule does NOT apply (`f +/2` and `f + / 2` are both `f(+/2)`).
+  defp np_arg_kind?(t, i, :dual_op) do
+    op_ref_slash?(t, i + 1) or
+      (Tokens.adjacent?(t, i, i + 1) and
+         (np_first_kind?(tk(t, i + 1)) or tk(t, i + 1) == :dual_op))
+  end
 
   # `not` starts an arg (`f not x`) unless it is the `not in` operator (`a not in b`).
   defp np_arg_kind?(t, i, :unary_op), do: not not_in?(t, i)
-  defp np_arg_kind?(_t, _i, k), do: np_first_kind?(k)
+
+  # Any operator followed by `/arity` is an op-ref, which may be a no-parens argument
+  # (`f |/2` => `f(|/2)`, `misplaced operator |/2`) even though the bare operator could not.
+  defp np_arg_kind?(t, i, k),
+    do: np_first_kind?(k) or (k in @op_ref_kinds and op_ref_slash?(t, i + 1))
 
   # `not in` is only fused when both words are on the same line — upstream's tokenizer rewrites
   # `not` + `in` to a single `in_op` only without an intervening newline; `a not\nin b` is a syntax
@@ -666,6 +743,10 @@ defmodule Toxic2.Parser do
     # A newline after `[` is allowed before the index (`foo[\n:bar]`).
     {idx, j, diags, nid, fuel} =
       parse_expr(t, skip_eols(t, open + 1), 0, :matched, diags, nid, fuel - 1)
+
+    # An index ending in a kw-only no-parens call absorbs the trailing keyword run
+    # (`m[foo x: 1, y: 2]` => `m[foo(x: 1, y: 2)]`).
+    {idx, j, diags, nid, fuel} = absorb_kw_run(t, idx, j, diags, nid, fuel)
 
     # A single trailing comma is allowed (`foo[1,]`); `foo[a, b]` (a real second index) is not.
     jj0 = skip_eols(t, j)
@@ -1004,36 +1085,6 @@ defmodule Toxic2.Parser do
     {CST.node(:kw_list, list_span(t, pairs), pairs, :matched, nil), k, diags, nid, fuel}
   end
 
-  # Operator families that may name a function reference (`op/arity`). `->`, `=>` and the structural
-  # `.` are excluded (`->/2` etc. are not captures). `..`/`...` (`range_op`/`ellipsis_op`) ARE valid
-  # here: Elixir's tokenizer re-emits an operator followed by `/arity` in capture position as an
-  # identifier, so `&../2` yields the identifier-shaped `{:.., _, nil}` (args nil), exactly as the
-  # other op refs lower (`op_ref` => `{op_atom, meta, nil}`).
-  @op_ref_kinds [
-    :dual_op,
-    :mult_op,
-    :concat_op,
-    :comp_op,
-    :rel_op,
-    :arrow_op,
-    :and_op,
-    :or_op,
-    :xor_op,
-    :power_op,
-    :in_op,
-    :when_op,
-    :unary_op,
-    :pipe_op,
-    :type_op,
-    :match_op,
-    :in_match_op,
-    :ternary_op,
-    :range_op,
-    :ellipsis_op
-  ]
-
-  defp op_ref_slash?(t, i), do: tk(t, i) == :mult_op and tv(t, i) == :/
-
   defp parse_prefix(t, i, ctx, diags, nid, fuel) do
     kind = tk(t, i)
     prefix_bp = Precedence.prefix(kind)
@@ -1053,8 +1104,11 @@ defmodule Toxic2.Parser do
       # An operator function reference: `+/2`, `>=/2`, `&++/2`. In nud position an operator name
       # immediately followed by `/` is a bare operator value (`{:+, [], nil}`); the trailing
       # `/arity` is an ordinary division in the led loop. The `/` guard keeps this from changing
-      # any other use of these operators.
-      kind in @op_ref_kinds and op_ref_slash?(t, i + 1) ->
+      # any other use of these operators. `&` yields to a following `/`-ref (upstream's
+      # tokenizer rule): `&/1` refs `&` itself, but in `&//2` / `&/ /2` the `/` after the slash
+      # means the ref is `/` and `&` stays a capture (`&(//2)`).
+      kind in @op_ref_kinds and op_ref_slash?(t, i + 1) and
+          not (kind == :capture_op and op_ref_slash?(t, i + 2)) ->
         {CST.node(:op_ref, tok_span(t, i), [ctoken(i)], :matched, nil), i + 1, diags, nid, fuel}
 
       # `..` / `...` with no left operand: `..` is nullary only (`{:.., [], []}`); `...` is nullary
@@ -1302,10 +1356,65 @@ defmodule Toxic2.Parser do
 
       true ->
         {clause, j, diags, nid, fuel} = parse_clause(t, i, :end, diags, nid, fuel)
+        {diags, nid} = check_fn_head_strict(t, clause, diags, nid)
         j = if j > i, do: j, else: i + 1
         parse_clauses(t, j, [clause | acc], diags, nid, fuel)
     end
   end
+
+  # `fn` clause heads use upstream's STRICT no-parens rule (`error_no_parens_many_strict`): a
+  # NON-FIRST pattern — or the `when` guard — that is (or ends in) a multi-arg no-parens call is
+  # ambiguous (`fn a, bar 2, c -> x end`, `fn a, b when bar 2, c -> x end`); the absorption makes
+  # these parse as ONE pattern/guard, so only this check distinguishes them. As the FIRST pattern
+  # the absorption is the meaning (`fn bar 2, c -> x end` = one `bar(2, c)` pattern) — and
+  # do-block clause heads (`case … do y when bar 2, c -> 1 end`) are NOT strict upstream, which is
+  # why this runs in `parse_clauses` (fn) and not `parse_block_clauses`.
+  defp check_fn_head_strict(t, {:node, :stab, _sp, [head, _body], _f, _d}, diags, nid) do
+    case head do
+      # `stab_when` children are patterns ++ [guard]; the guard belongs to the LAST pattern's
+      # comma-item, so a SINGLE-pattern head (`fn a when bar 2, c -> x end`) is ONE item — first
+      # position, absorption allowed. With ≥2 patterns, items 2..n (and the guard) are strict.
+      {:node, :stab_args, _s, [{:node, :stab_when, _sw, [_, _, _ | _] = parts, _fw, _dw}], _f2,
+       _d2} ->
+        check_fn_head_parts(t, parts, diags, nid)
+
+      {:node, :stab_args, _s, [{:node, :stab_when, _sw, _parts, _fw, _dw}], _f2, _d2} ->
+        {diags, nid}
+
+      {:node, :stab_args, _s, patterns, _f2, _d2} ->
+        check_fn_head_parts(t, patterns, diags, nid)
+
+      _ ->
+        {diags, nid}
+    end
+  end
+
+  defp check_fn_head_strict(_t, _clause, diags, nid), do: {diags, nid}
+
+  # `parts` is the pattern list (for a `when` head: patterns ++ [guard]) — everything but the
+  # first pattern is strict.
+  defp check_fn_head_parts(t, [_first | rest], diags, nid) do
+    Enum.reduce(rest, {diags, nid}, fn part, {diags, nid} ->
+      if embedded_no_parens_many?(part) do
+        {_id, diags, nid} =
+          Diagnostics.emit(
+            diags,
+            nid,
+            :parser,
+            :error,
+            :ambiguous_no_parens,
+            cst_span(t, part),
+            %{}
+          )
+
+        {diags, nid}
+      else
+        {diags, nid}
+      end
+    end)
+  end
+
+  defp check_fn_head_parts(_t, _parts, diags, nid), do: {diags, nid}
 
   defp parse_clause(t, i, stop, diags, nid, fuel) do
     {head, arrow_i, diags, nid, fuel} = parse_clause_head(t, i, diags, nid, fuel)
@@ -1722,8 +1831,10 @@ defmodule Toxic2.Parser do
   end
 
   # A struct base is a (non-paren, non-bracket) primary expression — `%Alias{}`, `%var{}`,
-  # `%nil{}`, `%@attr{}`, `%"s"{}`, `%-a{}`, `%<<x>>{}`, `%%{}{}`. Notably `%(...)`/`%[...]`/`%&x`
-  # are NOT valid struct bases (Elixir rejects them), so `(`/`[`/capture are excluded.
+  # `%nil{}`, `%@attr{}`, `%"s"{}`, `%-a{}`, `%//a{}`, `%<<x>>{}`, `%%{}{}`. Notably
+  # `%(...)`/`%[...]`/`%&x` are NOT valid struct bases (Elixir rejects them), so `(`/`[`/capture
+  # are excluded. `map_base_expr` admits the same unary chains as bare map entries, incl. the
+  # prefix `//` (`ternary_op`).
   defp struct_base_start?(kind) do
     kind in [
       :alias,
@@ -1740,6 +1851,7 @@ defmodule Toxic2.Parser do
       :at_op,
       :unary_op,
       :dual_op,
+      :ternary_op,
       :ellipsis_op,
       :"<<",
       :percent
@@ -1837,6 +1949,8 @@ defmodule Toxic2.Parser do
         {val, k, diags, nid, fuel} =
           parse_expr(t, skip_eols(t, jj + 1), 0, :matched, diags, nid, fuel - 1)
 
+        {val, k, diags, nid, fuel} = absorb_kw_run(t, val, k, diags, nid, fuel)
+
         first =
           CST.node(:assoc, merge(cst_span(t, key), cst_span(t, val)), [key, val], :matched, nil)
 
@@ -1853,6 +1967,7 @@ defmodule Toxic2.Parser do
       # `%{"k": v}` — a quoted keyword key as the first entry (kw, so seen_kw is now true).
       quoted_kw?(t, j) ->
         {first, k, diags, nid, fuel} = parse_quoted_kw(t, key, j, :matched, diags, nid, fuel)
+        {first, k, diags, nid, fuel} = absorb_kw_pair_run(t, first, k, diags, nid, fuel)
         {entries, m, diags, nid, fuel} = map_rest(t, k, [first], true, diags, nid, fuel)
 
         {CST.node(
@@ -1865,6 +1980,7 @@ defmodule Toxic2.Parser do
 
       # No `|` and no `=>`: a BARE first entry (`%{x}`, `%{1, 2}`). Continue with the rest.
       true ->
+        {diags, nid} = check_bare_map_entry(t, key, diags, nid)
         {entries, m, diags, nid, fuel} = map_rest(t, j, [key], false, diags, nid, fuel)
 
         {CST.node(
@@ -1878,7 +1994,8 @@ defmodule Toxic2.Parser do
   end
 
   # After an entry: finish at `}` (trailing comma allowed), continue at `,`, else unterminated.
-  defp map_rest(t, i, acc, seen_kw, diags, nid, fuel) do
+  defp map_rest(t, i, [entry | _] = acc, seen_kw, diags, nid, fuel) do
+    {diags, nid} = check_map_entry_embedded_many(t, entry, diags, nid)
     i2 = skip_eols(t, i)
 
     cond do
@@ -1894,14 +2011,53 @@ defmodule Toxic2.Parser do
     end
   end
 
+  # The absorbed-comma analogue of `check_map_entry_np_comma` (and of
+  # `check_container_elem_strict`): a NESTED inner call may have taken the separating comma
+  # itself (`%{a => foo bar 1, 2}` parses as one entry, `foo(bar(1, 2))`), so the comma check
+  # below never fires. Runs once per completed entry, on any terminator.
+  defp check_map_entry_embedded_many(t, entry, diags, nid) do
+    leaf =
+      case map_entry_value(entry) do
+        nil -> nil
+        val -> rightmost_operand(val)
+      end
+
+    if leaf != nil and no_parens_expr?(leaf) and not has_do_block?(leaf) and
+         not (ckind(entry) == :kw_pair and kw_only_np_call?(leaf)) do
+      {_id, diags, nid} =
+        Diagnostics.emit(
+          diags,
+          nid,
+          :parser,
+          :error,
+          :ambiguous_no_parens,
+          cst_span(t, entry),
+          %{}
+        )
+
+      {diags, nid}
+    else
+      {diags, nid}
+    end
+  end
+
   # `assoc_expr` admits only matched/unmatched exprs — a no-parens MANY call (`g b, c`) in an assoc
   # key or value (or a bare entry) position is rejected (`%{f(a) => g b, c}`, `%{g b, c}`). The
   # signal is the entry's value being a bare no-parens call immediately followed by `,` (it would
   # otherwise absorb the comma into a `no_parens_many`). Mirrors `check_np_comma` for containers.
   defp check_map_entry_np_comma(t, entry, comma_i, diags, nid) do
-    val = map_entry_value(entry)
+    leaf =
+      case map_entry_value(entry) do
+        nil -> nil
+        val -> rightmost_operand(val)
+      end
 
-    if val != nil and CST.category(val) == :no_parens and not has_do_block?(val) do
+    # A kw-pair value whose rightmost call is kw-ONLY already absorbed the keyword run
+    # (`absorb_kw_run`) — what follows the comma is the ordinary keyword-not-last error. An ASSOC
+    # value gets no such exemption: `%{k => g x: 1, j => 2}` is rejected upstream, and no
+    # keyword-not-last fires for it here (an assoc entry is not a keyword).
+    if leaf != nil and CST.category(leaf) == :no_parens and not has_do_block?(leaf) and
+         not (ckind(entry) == :kw_pair and kw_only_np_call?(leaf)) do
       {_id, diags, nid} =
         Diagnostics.emit(
           diags,
@@ -1920,12 +2076,14 @@ defmodule Toxic2.Parser do
   end
 
   # The node whose trailing no-parens call would illegally swallow the following comma: an assoc's
-  # value (2nd child), or a bare expression entry itself. A `kw_pair` value is parsed `:matched`
-  # (keyword-last is enforced separately), so it is exempt.
+  # or kw pair's value (2nd child), or a bare expression entry itself. A kw-ONLY no-parens kw value
+  # is exempt above — it has already absorbed the keyword run (`absorb_kw_run`), and what follows
+  # is the ordinary keyword-not-last error; a POSITIONAL no-parens kw value (`%{a: g b, c: 1}`)
+  # is the same ambiguity as everywhere else and is diagnosed here.
   defp map_entry_value(entry) do
     case entry do
       {:node, :assoc, _sp, [_key, val], _f, _d} -> val
-      {:node, :kw_pair, _sp, _ch, _f, _d} -> nil
+      {:node, :kw_pair, _sp, [_key, val], _f, _d} -> val
       {:node, _kind, _sp, _ch, _f, _d} = node -> node
       _ -> nil
     end
@@ -1952,6 +2110,8 @@ defmodule Toxic2.Parser do
       {val, j, diags, nid, fuel} =
         parse_expr(t, skip_eols(t, i + 1), 0, :matched, diags, nid, fuel - 1)
 
+      {val, j, diags, nid, fuel} = absorb_kw_run(t, val, j, diags, nid, fuel)
+
       {CST.node(:kw_pair, merge_tc(t, i, val), [key, val], :matched, nil), j, diags, nid, fuel}
     else
       {key, j, diags, nid, fuel} = parse_expr(t, i, @map_key_bp, :matched, diags, nid, fuel - 1)
@@ -1962,20 +2122,60 @@ defmodule Toxic2.Parser do
           {val, k, diags, nid, fuel} =
             parse_expr(t, skip_eols(t, jj + 1), 0, :matched, diags, nid, fuel - 1)
 
+          {val, k, diags, nid, fuel} = absorb_kw_run(t, val, k, diags, nid, fuel)
+
           {CST.node(:assoc, merge(cst_span(t, key), cst_span(t, val)), [key, val], :matched, nil),
            k, diags, nid, fuel}
 
         # `%{"k": v}` — a quoted keyword key (the `:kw_quote` sits right after the close quote).
         quoted_kw?(t, j) ->
-          parse_quoted_kw(t, key, j, :matched, diags, nid, fuel)
+          {node, k, diags, nid, fuel} = parse_quoted_kw(t, key, j, :matched, diags, nid, fuel)
+          absorb_kw_pair_run(t, node, k, diags, nid, fuel)
 
         true ->
-          # A map entry without `=>` is a BARE expression (`%{x}`, `%{1, 2}`, `%{&0}`) — Elixir
-          # allows them freely (used in quoted/macro code). The expression IS the entry.
+          # A map entry without `=>` is a BARE expression (`%{x}`, `%{user.id}`, `%{&1}`) — valid
+          # when `map_base_expr`-shaped (used in quoted/macro code); see `check_bare_map_entry`.
+          {diags, nid} = check_bare_map_entry(t, key, diags, nid)
           {key, j, diags, nid, fuel}
       end
     end
   end
+
+  # A bare map/struct entry (no `=>`, no `key:`) must be `map_base_expr`-shaped (upstream
+  # `assoc_expr -> map_base_expr`): a sub-matched expression, optionally under a chain of
+  # at/unary/dual/`//`/`...` prefix operators. Anything rooted at a BINARY operator (`%{count + 1}`,
+  # `%{name = "x"}` — the classic `=`-for-`:` typo), a no-parens call (`%{foo bar}`), a capture
+  # (`%{&x}`; the numeric `&1` is fine), or a do-block call is rejected by Elixir. Applies to
+  # update entries too (`%{state | count + 1}`); the update BASE is a full `matched_expr` and is
+  # not checked.
+  defp check_bare_map_entry(t, entry, diags, nid) do
+    if map_base_entry?(entry, t) do
+      {diags, nid}
+    else
+      {_id, diags, nid} =
+        Diagnostics.emit(diags, nid, :parser, :error, :invalid_map_entry, cst_span(t, entry), %{})
+
+      {diags, nid}
+    end
+  end
+
+  defp map_base_entry?({:token, _i, _f, _d}, _t), do: true
+
+  defp map_base_entry?({:node, :unary_op, _sp, children, _f, _d}, t) do
+    case children do
+      [op, operand] -> tk(t, CST.token_index(op)) != :capture_op and map_base_entry?(operand, t)
+      # dangling unary (no operand) — already diagnosed by the expression parser
+      _ -> true
+    end
+  end
+
+  defp map_base_entry?({:node, kind, _sp, _ch, _f, _d} = node, _t) do
+    kind not in [:binary_op, :np_call] and CST.category(node) != :no_parens and
+      not has_do_block?(node)
+  end
+
+  # `:missing` placeholders already carry their own error.
+  defp map_base_entry?(_other, _t), do: true
 
   defp map_unterminated(t, i, acc, diags, nid, fuel) do
     {id, diags, nid} =
@@ -2032,6 +2232,7 @@ defmodule Toxic2.Parser do
     {el, i, is_kw, diags, nid, fuel} = parse_element(t, i, mode, diags, nid, fuel)
     {diags, nid} = check_kw_last(seen_kw, is_kw, t, el, diags, nid)
     {diags, nid} = check_call_arg_strict(mode, el, acc, t, diags, nid)
+    {diags, nid} = check_container_elem_strict(mode, el, t, diags, nid)
     acc = [el | acc]
     i2 = skip_eols(t, i)
 
@@ -2113,9 +2314,12 @@ defmodule Toxic2.Parser do
       key = ctoken(i)
 
       # A keyword VALUE is a single `matched_expr` (`f(a: g b)` => `g(b)`), NOT a `:no_parens`
-      # call that grabs the outer commas — `f(a: g b, c)` is rejected (keyword-not-last).
+      # call that grabs the outer commas — `f(a: g b, c)` is rejected (keyword-not-last). But a
+      # kw-ONLY no-parens value absorbs the rest of the keyword run (see `absorb_kw_run`).
       {val, j, diags, nid, fuel} =
         parse_expr(t, skip_eols(t, i + 1), 0, :matched, diags, nid, fuel - 1)
+
+      {val, j, diags, nid, fuel} = absorb_kw_run(t, val, j, diags, nid, fuel)
 
       node =
         CST.node(:kw_pair, merge_tc(t, i, val), [key, val], :matched, nil)
@@ -2128,11 +2332,101 @@ defmodule Toxic2.Parser do
 
       if quoted_kw?(t, j) do
         {node, k, diags, nid, fuel} = parse_quoted_kw(t, expr, j, :matched, diags, nid, fuel)
+        {node, k, diags, nid, fuel} = absorb_kw_pair_run(t, node, k, diags, nid, fuel)
         {diags, nid} = check_kw_allowed(mode, t, i, diags, nid)
+        {diags, nid} = check_np_kw_last(kw_pair_value(node), t, k, diags, nid)
         {node, k, true, diags, nid, fuel}
       else
+        # A bare element ending in a kw-only no-parens call absorbs the trailing keyword run
+        # (`[render x: 1, y: 2]` => `[render(x: 1, y: 2)]`) — in a parens call the `:no_parens`
+        # ctx already absorbed it, so this only acts in list/tuple/bitstring elements.
+        {expr, j, diags, nid, fuel} = absorb_kw_run(t, expr, j, diags, nid, fuel)
         {expr, j, false, diags, nid, fuel}
       end
+    end
+  end
+
+  defp kw_pair_value({:node, :kw_pair, _sp, [_key, val], _f, _d}), do: val
+
+  # `f(a: g x: 1, y: 2)` / `[a: g x: 1, y: 2]` / `%{a: g x: 1, y: 2}` — when a keyword VALUE (or a
+  # bare container element, or an assoc value) ENDS in a kw-ONLY no-parens call, the rest of the
+  # trailing keyword run belongs to that INNER call (upstream `call_args_no_parens_kw` is
+  # greedy-innermost): `quote(do: defstruct a: 1, b: 2)` is `quote(do: defstruct(a: 1, b: 2))`,
+  # the parenthesised twin of the no-parens absorption in `parse_np_arg`. The call may sit under
+  # operator chains (`f(a: 2 + g x: 1, b: 2)` => `g(x: 1, b: 2)`), hence the rightmost descent.
+  # Absorb `, key: val` pairs into it until the run ends.
+  defp absorb_kw_run(t, val, j, diags, nid, fuel) do
+    jj = skip_eols(t, j)
+    nxt = skip_eols(t, jj + 1)
+
+    if fuel > 0 and tk(t, jj) == :"," and kw_only_np_call?(rightmost_operand(val)) and
+         kw_data_start?(t, nxt) do
+      {pair, k, diags, nid, fuel} = parse_absorbed_kw(t, nxt, diags, nid, fuel)
+      absorb_kw_run(t, append_trailing_kw(t, val, pair), k, diags, nid, fuel)
+    else
+      {val, j, diags, nid, fuel}
+    end
+  end
+
+  # One absorbed pair (`k: v` or `"k": v`); its own value may absorb the rest of the run first
+  # (innermost-greedy).
+  defp parse_absorbed_kw(t, i, diags, nid, fuel) do
+    if tk(t, i) == :kw_identifier do
+      key = ctoken(i)
+
+      {v, k, diags, nid, fuel} =
+        parse_expr(t, skip_eols(t, i + 1), 0, :matched, diags, nid, fuel - 1)
+
+      {v, k, diags, nid, fuel} = absorb_kw_run(t, v, k, diags, nid, fuel)
+      {CST.node(:kw_pair, merge_tc(t, i, v), [key, v], :matched, nil), k, diags, nid, fuel}
+    else
+      # a quoted key (`"k": v`) — `kw_data_start?` guaranteed the `:kw_quote` after the literal
+      {key, j, diags, nid, fuel} = parse_expr(t, i, 0, :matched, diags, nid, fuel - 1)
+      {node, k, diags, nid, fuel} = parse_quoted_kw(t, key, j, :matched, diags, nid, fuel)
+      absorb_kw_pair_run(t, node, k, diags, nid, fuel)
+    end
+  end
+
+  # Absorb the keyword run into an already-built pair's VALUE (quoted-key pairs come pre-built
+  # from `parse_quoted_kw`), rebuilding the pair if the value grew.
+  defp absorb_kw_pair_run(t, {:node, :kw_pair, sp, [key, val], _f, d} = pair, j, diags, nid, fuel) do
+    case absorb_kw_run(t, val, j, diags, nid, fuel) do
+      {^val, ^j, diags, nid, fuel} ->
+        {pair, j, diags, nid, fuel}
+
+      {val2, k, diags, nid, fuel} ->
+        {CST.node(:kw_pair, merge(sp, cst_span(t, val2)), [key, val2], :matched, d), k, diags,
+         nid, fuel}
+    end
+  end
+
+  # Append an absorbed keyword pair to the RIGHTMOST no-parens call, rebuilding the operator
+  # spine's spans on the way down (`2 + g x: 1` growing to `2 + g(x: 1, b: 2)` widens the
+  # `binary_op` node too).
+  defp append_trailing_kw(t, {:node, :binary_op, sp, [l, op, rhs], _f, d}, pair) do
+    rhs = append_trailing_kw(t, rhs, pair)
+    CST.node(:binary_op, merge(sp, cst_span(t, pair)), [l, op, rhs], :matched, d)
+  end
+
+  defp append_trailing_kw(t, {:node, :unary_op, sp, [op, operand], _f, d}, pair) do
+    operand = append_trailing_kw(t, operand, pair)
+    CST.node(:unary_op, merge(sp, cst_span(t, pair)), [op, operand], :matched, d)
+  end
+
+  defp append_trailing_kw(t, {:node, kind, sp, children, _f, d}, pair) do
+    CST.node(kind, merge(sp, cst_span(t, pair)), Enum.concat(children, [pair]), :no_parens, d)
+  end
+
+  # A no-parens call whose args are entirely keyword pairs (`g x: 1, y: 2`) — the shape that
+  # absorbs the rest of a keyword run when used as a keyword value.
+  defp kw_only_np_call?(node) do
+    kind = ctag(node) == :node and ckind(node)
+
+    if kind in [:np_call, :remote_call] and CST.category(node) == :no_parens do
+      args = np_call_args(kind, cchildren(node))
+      args != [] and Enum.all?(args, &kw_pair_node?/1)
+    else
+      false
     end
   end
 
@@ -2142,22 +2436,47 @@ defmodule Toxic2.Parser do
   defp check_np_kw_last(val, t, j, diags, nid) do
     # A no-parens-call value ending in a `do … end` block is unambiguous, so it may be followed by
     # more keywords (`f(a: case x do … end, b: 1)`); only a bare no-parens call is keyword-last.
-    if ctag(val) == :node and ckind(val) == :np_call and not has_do_block?(val) and
-         tk(t, skip_eols(t, j)) == :"," do
-      {_id, diags, nid} =
-        Diagnostics.emit(
-          diags,
-          nid,
-          :parser,
-          :error,
-          :no_parens_kw_not_last,
-          cst_span(t, val),
-          %{}
-        )
+    # The call may sit under operator chains (`f(a: 2 + g b, c: 1)`) — same rejection upstream —
+    # hence the rightmost descent. A kw-ONLY no-parens value has already absorbed the whole
+    # trailing keyword run (`absorb_kw_run`), so whatever follows the comma is positional — that
+    # is the ordinary keyword-not-last error, diagnosed by the element loop, not here.
+    leaf = rightmost_operand(val)
 
-      {diags, nid}
-    else
-      {diags, nid}
+    cond do
+      # A value whose inner call already ABSORBED the separating comma (`[a: foo bar 1, 2]` —
+      # one pair, value `foo(bar(1, 2))`) is invalid with no comma left to see; same
+      # absorbed-comma rule as `check_container_elem_strict` / `check_map_entry_embedded_many`.
+      no_parens_expr?(leaf) and not has_do_block?(leaf) and not kw_only_np_call?(leaf) ->
+        {_id, diags, nid} =
+          Diagnostics.emit(
+            diags,
+            nid,
+            :parser,
+            :error,
+            :ambiguous_no_parens,
+            cst_span(t, val),
+            %{}
+          )
+
+        {diags, nid}
+
+      CST.category(leaf) == :no_parens and not has_do_block?(leaf) and
+        not kw_only_np_call?(leaf) and tk(t, skip_eols(t, j)) == :"," ->
+        {_id, diags, nid} =
+          Diagnostics.emit(
+            diags,
+            nid,
+            :parser,
+            :error,
+            :no_parens_kw_not_last,
+            cst_span(t, val),
+            %{}
+          )
+
+        {diags, nid}
+
+      true ->
+        {diags, nid}
     end
   end
 
@@ -2188,8 +2507,12 @@ defmodule Toxic2.Parser do
   # list/tuple/bitstring.)
   defp check_np_comma(mode, el, t, comma_i, diags, nid) when mode != :call do
     # A no-parens call ending in a `do … end` block is unambiguous, so it's a valid element even
-    # when not last (`[a, for x <- xs, into: [] do … end]`); only a bare no-parens call is ambiguous.
-    if CST.category(el) == :no_parens and not has_do_block?(el) do
+    # when not last (`[a, for x <- xs, into: [] do … end]`); only a bare no-parens call is
+    # ambiguous — including under operator chains (`[1, 2 + bar 3, 4]`), where upstream would
+    # have absorbed the comma into the call and then rejected. A kw-pair element is exempt (its
+    # value is handled by `check_np_kw_last`); a kw-only element with a REMAINING comma means the
+    # keyword-run absorption stopped (`[foo x: 1, 2]`), which upstream also rejects.
+    if trailing_np_call?(el) do
       {_id, diags, nid} =
         Diagnostics.emit(
           diags,
@@ -2209,12 +2532,34 @@ defmodule Toxic2.Parser do
 
   defp check_np_comma(_mode, _el, _t, _comma_i, diags, nid), do: {diags, nid}
 
+  # A container element may not be a no-parens MANY / ambiguous-one call even when no comma
+  # FOLLOWS it — a nested inner call may have already absorbed the separating comma
+  # (`{foo bar 1, 2}` parses as `{foo(bar(1, 2))}`), so `check_np_comma` never sees one.
+  # Upstream rejects via `error_no_parens_container_strict` (`container_expr -> no_parens_expr`).
+  # A do-block seals the call (`[for x <- a, y <- b do … end]` is fine).
+  defp check_container_elem_strict(mode, el, t, diags, nid)
+       when mode in [:list, :tuple, :bitstring] do
+    leaf = rightmost_operand(el)
+
+    if no_parens_expr?(leaf) and not has_do_block?(leaf) do
+      {_id, diags, nid} =
+        Diagnostics.emit(diags, nid, :parser, :error, :ambiguous_no_parens, cst_span(t, el), %{})
+
+      {diags, nid}
+    else
+      {diags, nid}
+    end
+  end
+
+  defp check_container_elem_strict(_mode, _el, _t, diags, nid), do: {diags, nid}
+
   # A NON-FIRST parenthesised call argument may not be a no-parens MANY / ambiguous-one call (`foo(a,
-  # bar b, c)` — `bar b, c` absorbs the comma into a `no_parens_many`). Elixir rejects it via
+  # bar b, c)` — `bar b, c` absorbs the comma into a `no_parens_many`) — including under operator
+  # chains (`f(1, 2 + bar 3, 4)`, where `bar` absorbed the comma). Elixir rejects it via
   # `error_no_parens_many_strict` on `call_args_parens_expr`. As the sole/first arg it is fine
   # (`foo(bar b, c)` = `foo(bar(b, c))`, a `call_args_parens_one`), hence the non-empty `acc` guard.
   defp check_call_arg_strict(:call, el, [_ | _] = _acc, t, diags, nid) do
-    if no_parens_expr?(el) do
+    if embedded_no_parens_many?(el) do
       {_id, diags, nid} =
         Diagnostics.emit(diags, nid, :parser, :error, :ambiguous_no_parens, cst_span(t, el), %{})
 

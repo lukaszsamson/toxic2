@@ -356,4 +356,172 @@ defmodule Toxic2.DiagnosticsConformanceTest do
       assert warnings("fn () when node() == x -> true end") == []
     end
   end
+
+  # The four validish-reachable buckets from the FUZZER_GAPS 2026-06-12 re-audit.
+  describe "FUZZER_GAPS validish-reachable fixes" do
+    # V1: a keyword VALUE that is a kw-ONLY no-parens call absorbs the rest of the keyword run
+    # into the INNER call (upstream `call_args_no_parens_kw` is greedy-innermost) — the
+    # parenthesised twin of the `defmodule Foo, do: defstruct a: 1, b: 2` fix. Was a false
+    # `:no_parens_kw_not_last` error on ordinary macro-writing code.
+    test "V1: kw-only no-parens call as a parens-call kw value absorbs the keyword run" do
+      for src <- [
+            "quote(do: defstruct a: 1, b: 2)",
+            "defmodule(Foo, do: defstruct a: 1, b: 2)",
+            "foo(x: bar a: 1, b: 2)",
+            "[x: bar a: 1, b: 2]",
+            "{1, x: bar a: 1, b: 2}",
+            "%{x: bar a: 1, b: 2}",
+            "m[x: bar a: 1, b: 2]",
+            # nested runs attach innermost
+            "foo(x: bar a: 1, y: baz b: 1, c: 2)"
+          ] do
+        assert_classified(src)
+      end
+
+      # the trailing keyword run belongs to the INNER call, exactly like the oracle
+      {ast, _} = Toxic2.parse_to_ast("quote(do: defstruct a: 1, b: 2)")
+      assert {:quote, _, [[do: {:defstruct, _, [[a: 1, b: 2]]}]]} = ast
+
+      # inner calls with a POSITIONAL arg stay keyword-last errors (oracle rejects them too),
+      # in maps just like in calls/lists
+      for src <- [
+            "f(a: g b, c: 1)",
+            "f(a: g b, c)",
+            "f(a: g x: 1, b)",
+            "f(a: if x, do: 1, else: 2)",
+            "%{a: g b, c: 1}",
+            ~S(%{"a": g b, c: 1}),
+            "%{x | a: g b, c: 1}"
+          ] do
+        assert_classified(src)
+      end
+
+      # …while a positional no-parens kw value with NO following comma stays valid
+      for src <- ["%{a: g b}", "%{a: case x do _ -> 1 end, b: 1}", "%{a: fn -> 1 end, b: 2}"] do
+        assert_classified(src)
+      end
+    end
+
+    # V2: a bare (no `=>`, no `key:`) map/struct entry must be `map_base_expr`-shaped — an entry
+    # rooted at a binary operator is a syntax error upstream (the classic `=`-for-`:` /
+    # missing-`key:` typos). Bare identifier/access/update shorthands stay valid.
+    test "V2: operator-rooted bare map/struct entries are errors" do
+      for src <- [
+            ~S(%User{name = "x", age: 1}),
+            "%{state | count + 1}",
+            "%{count + 1}",
+            ~S(%{key <> "x"}),
+            "%{0*0}",
+            "%Foo{o=t}",
+            "%{x | &b}",
+            "%{&x}",
+            "%{foo bar}",
+            "%{foo do end}"
+          ] do
+        assert_classified(src)
+        assert :invalid_map_entry in Enum.map(errors(src), &Diagnostic.code/1)
+      end
+
+      # grammar-valid bare entries (upstream `assoc_expr -> map_base_expr`) stay clean
+      for src <- [
+            "%{name}",
+            "%{user.id}",
+            "%{m | name}",
+            "%{compute(x)}",
+            "%{-x}",
+            "%{not x}",
+            "%{@x}",
+            "%{^x}",
+            "%{//x}",
+            "%{...x}",
+            "%{&1}",
+            "%{(a + b)}",
+            "%{fn -> 1 end}",
+            "%{x => 1, y}",
+            # the update BASE is a full matched_expr — no check
+            "%{a + b | x: 1}"
+          ] do
+        assert_classified(src)
+      end
+    end
+
+    # V4: `//` (ternary_op) is a valid unary struct-base prefix, like every other unary —
+    # completeness gap from the GRAMMAR_GAPS §1.1 prefix-`//` fix.
+    test "V4: %//x{} struct base parses like the other unary bases" do
+      for src <- ["%//x{}", "%!x{}", "%not x{}", "%-x{}"] do
+        assert_classified(src)
+      end
+    end
+
+    # V3: upstream absorbs a comma after an operator-embedded trailing no-parens call into the
+    # INNER call and then rejects (`error_no_parens_many_strict`) — any NON-FIRST comma-separated
+    # position is strict; first/last/rightmost positions absorb and stay valid.
+    test "V3: ambiguous comma past an operator-embedded no-parens call" do
+      for src <- [
+            # the validish embodiment: assert with a built message
+            ~S|assert x == y, "expected " <> inspect x, label: "x"|,
+            ~S|assert valid?, "got " <> describe x, y|,
+            "foo 1, 2 + bar 3, 4",
+            "f(1, 2 + bar 3, 4)",
+            "[1, 2 + bar 3, 4]",
+            "{1, 2 + bar 3, 4}",
+            "<<1, 2 + bar 3, 4>>",
+            "[2 + bar 3,]",
+            "[1, -bar 3, 4]",
+            "%{k => 2 + bar 3, k2 => 4}",
+            "%{a: 2 + bar 3, b: 4}",
+            "f(a: 2 + bar 3, b: 4)",
+            ~S|f("a": g b, c: 1)|,
+            "fn a, 1 + bar 2, c -> x end",
+            "fn a, b when bar 2, c -> x end"
+          ] do
+        assert_classified(src)
+        assert errors(src) != []
+      end
+
+      # first / last / rightmost positions absorb greedily and stay clean — as do do-block
+      # operands, sealed parens, and non-strict do-block clause heads
+      for src <- [
+            "foo 2 + bar 3, 4",
+            "f(2 + bar 3, 4)",
+            "[1, 2 + bar 3]",
+            "x = 1 + foo 2, 3",
+            "[1, 2 + (bar 3), 4]",
+            "[1, 2 + case x do _ -> 3 end, 4]",
+            "case x do y when bar 2, c -> 1 end",
+            "cond do bar 2, c -> 1 end",
+            "fn bar 2, c -> x end",
+            "fn a when bar 2, c -> x end",
+            "def f(x) when x > 0 and is_atom y, do: 1"
+          ] do
+        assert_classified(src)
+      end
+    end
+
+    # V1 follow-up (keyword-run absorption completeness): the absorption descends operator
+    # chains to the RIGHTMOST kw-only no-parens call, in kw values, assoc values, bare container
+    # elements, and access indices — matching the oracle's greedy-innermost AST exactly.
+    test "keyword-run absorption descends operator chains and covers all containers" do
+      cases = [
+        {"f(a: 2 + g x: 1, b: 2)", ~S|f(a: 2 + g(x: 1, b: 2))|},
+        {"f(a: -g x: 1, b: 2)", ~S|f(a: -g(x: 1, b: 2))|},
+        {"[render x: 1, y: 2]", ~S|[render(x: 1, y: 2)]|},
+        {"[2 + foo x: 1, y: 2]", ~S|[2 + foo(x: 1, y: 2)]|},
+        {"{1, foo x: 1, y: 2}", ~S|{1, foo(x: 1, y: 2)}|},
+        {"%{k => g x: 1, y: 2}", ~S|%{k => g(x: 1, y: 2)}|},
+        {"m[foo x: 1, y: 2]", ~S|m[foo(x: 1, y: 2)]|}
+      ]
+
+      for {src, expected} <- cases do
+        assert_classified(src)
+        {ast, _} = Toxic2.parse_to_ast(src)
+        assert Macro.to_string(ast) == expected
+      end
+
+      # …but an absorption that stops (non-kw follows) is the upstream error
+      for src <- ["[foo x: 1, 2]", "%{k => g x: 1, j => 2}"] do
+        assert_classified(src)
+      end
+    end
+  end
 end

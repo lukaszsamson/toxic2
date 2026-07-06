@@ -52,9 +52,9 @@ Honest limits:
   names the compiler treats specially. They can be classified by name without a symbol table.
   This is the only "defaultLibrary knowledge" we rely on.
 
-Also out of scope for v1: `__MODULE__`/`__ENV__`/`__CALLER__`/`__DIR__`/`__STACKTRACE__` (closed
-set — defer to TextMate, or a later `variable.defaultLibrary`), and hygiene inside
-`quote`/`unquote`.
+`__MODULE__`/`__ENV__`/`__CALLER__`/`__DIR__`/`__STACKTRACE__` are a closed set and ARE emitted as
+`variable` + `readonly.defaultLibrary` (exempt from the clean-statement gate — fixed names can't be
+mid-edit garbage). Hygiene inside `quote`/`unquote` stays out of scope for v1.
 
 ---
 
@@ -188,7 +188,7 @@ name-set:
 ```
 callee value ∈ def-family            -> emit nothing for callee;
   {def defp defmacro defmacrop          target leaf -> function|macro + definition
-   defguard defguardp}                  (spans :call AND :np_call — `def foo, do:` is no-parens;
+   defguard defguardp defdelegate}      (spans :call AND :np_call — `def foo, do:` is no-parens;
                                          skip if target is not a plain identifier leaf, e.g. `def unquote(x)(...)`)
 
 callee value ∈ module directives     -> def*module/protocol/impl: target alias -> class + definition
@@ -332,8 +332,11 @@ of truth; keep the two systems independent, joined only by the `semanticTokenSco
 
 - module aliases — `namespace` (prefix segments) / `class` (final segment)
 - `defmodule`/`defprotocol`/`defimpl` target → `class` + `definition`
-- `def`/`defp` target → `function` + `definition`; `defmacro`/`defmacrop` → `macro` + `definition`;
-  `defguard`/`defguardp` → `function`/`macro` + `definition`
+- `def`/`defp`/`defdelegate` target → `function` + `definition`;
+  `defmacro`/`defmacrop`/`defguard`/`defguardp` → `macro` + `definition`
+- `defstruct`/`defexception`/`defoverridable` — callee left to TextMate (structural), data args
+  keep lexical roles
+- `__MODULE__`-family → `variable` + `readonly.defaultLibrary`
 - local call callee → `function` (minus the stop-list)
 - remote call member → `method` / `property` (§5d)
 - keyword keys → `property`
@@ -349,7 +352,7 @@ of truth; keep the two systems independent, joined only by the `semanticTokenSco
 sigil interiors, interpolation delimiters, escapes, regex internals.
 
 **Deferred to later (symbol-aware) phases:** `parameter`, body-level variable roles, `modification`,
-`__MODULE__`-family special forms, `quote`/`unquote` hygiene.
+`quote`/`unquote` hygiene.
 
 ---
 

@@ -71,7 +71,13 @@ defmodule Toxic2.String.Tokenizer.Security do
     |> File.read!()
     |> String.split(["\r\n", "\n"], trim: true)
 
-  regex = ~r/^((?:[0-9A-F]+ )+);\t((?:[0-9A-F]+ )+);/u
+  # NOTE: build this regex with `Regex.compile!/2` rather than a `~r//u` sigil. The sigil embeds the
+  # *compiled* pattern into the module AST at compile time, and on Elixir <= 1.17 the compiled form is
+  # a non-escapable `#Reference` (`** (ArgumentError) cannot escape #Reference<...>`), which breaks
+  # compilation on 1.16/1.17. Elixir 1.18+ stores regexes lazily so the sigil works there, but this
+  # form works on all of 1.16-1.20. The regex is used only here at compile time to parse
+  # confusables.txt, so there is no runtime cost.
+  regex = Regex.compile!("^((?:[0-9A-F]+ )+);\t((?:[0-9A-F]+ )+);", "u")
   matches = Enum.map(lines, &Regex.run(regex, &1, capture: :all_but_first))
 
   confusable_prototype_lookup =

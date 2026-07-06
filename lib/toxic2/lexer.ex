@@ -720,11 +720,29 @@ defmodule Toxic2.Lexer do
   end
 
   defp emit_operator_or_kw(bin, kind, value, len, line, col, acc, w, st) do
+    # `..//` followed — across horizontal space and `\`-newline continuations — by `/` fuses
+    # into ONE `:ternary_op` token (`&..///3`, `&..//\<nl>/3`): upstream re-emits the ternary
+    # operator as a single identifier-shaped token exactly in this shape, so the parser's
+    # op-ref rule (`op` + `/arity`) sees it whole. The `..` table match (len 2) would
+    # otherwise win.
+    fused = kind == :range_op and fused_ternary_ref(bin, line, col + 4)
+
     cond do
       # `<<>>:` / `..//:` — atom-shaped operator keys whose full length the table's longest match
       # (`<<` / `..`) would shadow; `%{}`/`{}`/`%`/`::` are handled by earlier `lex/6` clauses.
       sp = atom_op_kw_len(bin) ->
         emit_op_kw(bin, sp, line, col, acc, w, st)
+
+      match?({:fused, _, _, _}, fused) ->
+        {:fused, rest, l2, c2} = fused
+        tok = {:ternary_op, line, col, line, col + 4, :..//}
+        lex(rest, l2, c2, [tok | acc], w, st)
+
+      # Adjacent `..//` in any OTHER shape (`a ..// b`) is a tokenizer error upstream — never a
+      # `..` + `//` pair — tolerated here as one 4-column `:error` token.
+      fused == :error ->
+        err = LexError.new(:unexpected_token, %{token: "..//"})
+        cont(rest_at(bin, 4), {:error, line, col, line, col + 4, err}, acc, w, st)
 
       # a table operator directly followed by a keyword colon is an operator keyword key (`+: 1`),
       # EXCEPT `//` (the ternary step op) which is never an atom/keyword (`a // b: c` is `a // (b: c)`).
@@ -774,6 +792,31 @@ defmodule Toxic2.Lexer do
   defp atom_op_kw_len(<<"<<>>", _::binary>> = bin), do: if(kw_colon_at?(bin, 4), do: 4)
   defp atom_op_kw_len(<<"..//", _::binary>> = bin), do: if(kw_colon_at?(bin, 4), do: 4)
   defp atom_op_kw_len(_), do: nil
+
+  # `..//` + horizontal space (spaces/tabs and non-EOF `\`-newline continuations, exactly
+  # upstream's `strip_horizontal_space`) + `/` → `{:fused, rest_at_slash, line, col}`. An
+  # adjacent `..//` in any other shape is `:error` (upstream's tokenizer rejects it outright);
+  # nil when the input doesn't start with `..//` at all.
+  defp fused_ternary_ref(<<"..//", rest::binary>>, line, col) do
+    case fused_ternary_ws(rest, line, col) do
+      nil -> :error
+      {rest2, l2, c2} -> {:fused, rest2, l2, c2}
+    end
+  end
+
+  defp fused_ternary_ref(_bin, _line, _col), do: nil
+
+  defp fused_ternary_ws(<<c, rest::binary>>, line, col) when c in [?\s, ?\t],
+    do: fused_ternary_ws(rest, line, col + 1)
+
+  defp fused_ternary_ws(<<"\\\r\n", rest::binary>>, line, _col) when rest != <<>>,
+    do: fused_ternary_ws(rest, line + 1, 1)
+
+  defp fused_ternary_ws(<<"\\\n", rest::binary>>, line, _col) when rest != <<>>,
+    do: fused_ternary_ws(rest, line + 1, 1)
+
+  defp fused_ternary_ws(<<?/, _::binary>> = rest, line, col), do: {rest, line, col}
+  defp fused_ternary_ws(_rest, _line, _col), do: nil
 
   # --- unicode identifier/atom tokenization (vendored Toxic2.String.Tokenizer) -----------------
   # The tokenizer returns {kind, nfc_name, rest, codepoint_len, ascii?, special}. `kind` is

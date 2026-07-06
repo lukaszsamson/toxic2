@@ -94,6 +94,56 @@ collect = fn path, calls, code_var? ->
   raw
 end
 
+# Harvest EVERY plain string literal (binaries + ~s/~S sigils, heredocs included) from one file,
+# grouped by describe. Used for Elixir's own test suites, where the corner cases are all inside
+# strings (parser_test.exs snippets, code_formatter inputs AND expected outputs) — the literal
+# call-site convention varies too much to enumerate, and harvesting everything is safe because
+# the live oracle classifies each entry (non-code prose just lands in the invalid/tolerant class).
+collect_strings = fn path ->
+  ast = path |> File.read!() |> Code.string_to_quoted!(columns: true)
+
+  {_, describes} =
+    Macro.prewalk(ast, [], fn
+      {:describe, meta, [title | _]} = node, acc when is_binary(title) ->
+        {node, [{line_of.(meta), title} | acc]}
+
+      node, acc ->
+        {node, acc}
+    end)
+
+  describes = Enum.sort_by(describes, &elem(&1, 0))
+
+  group_for = fn line ->
+    describes
+    |> Enum.take_while(fn {dl, _} -> dl <= line end)
+    |> List.last()
+    |> case do
+      nil -> "ungrouped"
+      {_, title} -> title
+    end
+  end
+
+  # Plain binaries carry no position, so track the line of the nearest enclosing metadata node.
+  {_, raw} =
+    Macro.prewalk(ast, {0, []}, fn
+      {sig, meta, [{:<<>>, _, [bin]}, _]} = node, {_line, acc}
+      when sig in [:sigil_s, :sigil_S] and is_binary(bin) ->
+        l = line_of.(meta)
+        {node, {l, [{bin, l, group_for.(l)} | acc]}}
+
+      {_, meta, _} = node, {line, acc} when is_list(meta) ->
+        {node, {max(line, line_of.(meta)), acc}}
+
+      bin, {line, acc} when is_binary(bin) ->
+        {bin, {line, [{bin, line, group_for.(line)} | acc]}}
+
+      node, acc ->
+        {node, acc}
+    end)
+
+  raw |> elem(1) |> Enum.reject(fn {s, _, _} -> s == "" end)
+end
+
 # --- systematic operator-precedence matrix (replicates systematic_operators_test.exs) ---------
 right_assoc = ~w(++ -- +++ --- .. <> = | :: when)
 
@@ -128,10 +178,36 @@ parser_files = [
   {tp.("tuple_keyword_merge_regression_test.exs"), "shrunk_repros", [], true}
 ]
 
+# Elixir's own suites (suggested by José): parser_test.exs plus ALL code_formatter tests. The
+# formatter suites matter because their corner cases never show up when parsing the test files
+# themselves — every input and expected output lives inside a string literal, so we harvest all
+# strings (see `collect_strings`). Tree location: $TOXIC2_ELIXIR_SRC, default ~/elixir.
+elixir_src = System.get_env("TOXIC2_ELIXIR_SRC") || Path.expand("~/elixir")
+elixir_test = fn rel -> Path.join([elixir_src, "lib/elixir/test/elixir", rel]) end
+
+elixir_files =
+  [
+    {elixir_test.("kernel/parser_test.exs"), "elixir_parser_test"},
+    # errors/warning suites: most snippets are parse-valid (their failures are compile-time),
+    # the rest exercise tolerant recovery — either way the oracle classifies them.
+    {elixir_test.("kernel/errors_test.exs"), "elixir_errors_test"},
+    {elixir_test.("kernel/warning_test.exs"), "elixir_warning_test"}
+  ] ++
+    (elixir_test.("code_formatter/*.exs")
+     |> Path.wildcard()
+     |> Enum.sort()
+     |> Enum.map(fn p -> {p, "elixir_formatter_#{Path.basename(p, "_test.exs")}"} end))
+
+elixir_raw =
+  Enum.flat_map(elixir_files, fn {path, ftag} ->
+    collect_strings.(path) |> Enum.map(fn {s, l, g} -> {s, l, "#{ftag}: #{g}"} end)
+  end)
+
 parser_raw =
   Enum.flat_map(parser_files, fn {path, ftag, calls, code_var?} ->
     collect.(path, calls, code_var?) |> Enum.map(fn {s, l, g} -> {s, l, "#{ftag}: #{g}"} end)
-  end) ++ Enum.map(systematic, fn {s, l, g} -> {s, l, "systematic: #{g}"} end)
+  end) ++
+    Enum.map(systematic, fn {s, l, g} -> {s, l, "systematic: #{g}"} end) ++ elixir_raw
 
 parser = Enum.uniq_by(parser_raw, fn {s, _l, _g} -> s end)
 
@@ -187,7 +263,7 @@ write.(
   "imported_parser_corpus.ex",
   render.(
     "Toxic2.Conformance.ImportedParser",
-    "toxic_parser conformance/large/operators/repros suites + systematic operator matrix",
+    "toxic_parser conformance/large/operators/repros suites + systematic operator matrix + Elixir's parser_test.exs / code_formatter tests",
     parser
   )
 )
