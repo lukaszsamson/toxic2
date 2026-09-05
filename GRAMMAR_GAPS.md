@@ -32,10 +32,12 @@ Ranked by how likely the input is to occur in valid or close-to-valid code as it
 edited (the IDE/LSP use case). Silent corruption of valid code outranks false errors, which
 outrank missed diagnostics; fuzzer token soup is bottom-tier regardless of class.
 
-> **FIX STATUS (2026-09-05): all P0 and P1 findings below are FIXED** — R3, R18, R1+R2, K1, R4,
-> R5, OX4, R17. Regression tests live in `test/toxic2/yrl_edge_cases_test.exs`,
+> **FIX STATUS (2026-09-06): all P0, P1, and P2 findings below are FIXED** — P0/P1: R3, R18,
+> R1+R2, K1, R4, R5, OX4, R17 (2026-09-05); P2: OX1, R6, R14, K4, F3+K8, K7, R16, OX2, K6
+> (2026-09-06). Regression tests live in `test/toxic2/yrl_edge_cases_test.exs`,
 > `test/toxic2/parser_test.exs`, and `test/toxic2/token_metadata_test.exs`; the review harness
-> (`grammar_review_20260905.exs`) reflects the remaining P2+ backlog.
+> (`grammar_review_20260905.exs`) reflects the remaining P3+ backlog, and the old audit harness
+> (`mix run grammar_audit.exs`) is down to the two %-soup struct-base residuals (4 rows).
 
 **P0 — silently corrupts ordinary valid code: FIXED 2026-09-05**
 
@@ -55,7 +57,7 @@ outrank missed diagnostics; fuzzer token soup is bottom-tier regardless of class
 | 7 | OX4 column drift after multi-byte escapes | Same corruption class as R18, but needs a written `\é`-style escape. |
 | 8 | R17 `unquote_splicing` block wrapper | The wrong-AST arms are rare, but the arity-one metadata mismatch hits `quote do unquote_splicing(x) end` — an extremely common macro idiom. |
 
-**P2 — close-to-valid mid-edit states an IDE must diagnose correctly:**
+**P2 — close-to-valid mid-edit states an IDE must diagnose correctly: FIXED 2026-09-06**
 
 | Rank | Finding | Notes |
 |---|---|---|
@@ -159,7 +161,7 @@ operator calls such as `Kernel.+1` are F1 rather than this tokenizer-specific sp
 **Real-code likelihood: very low.** These are legal parser inputs but highly surprising source
 spellings. This is primarily completeness work unless a generated-source corpus demonstrates use.
 
-### F3. Newline-before-comma missed-error family is broader than the original list
+### F3. FIXED 2026-09-06 — Newline-before-comma missed-error family (all containers, comment-aware)
 
 The original audit listed lists, calls, tuples, bitstrings, and keyword lists. The same unconditional
 `skip_eols/2` before comma detection also silently accepts invalid maps, structs, access arguments,
@@ -465,7 +467,7 @@ re-litigated):
 
 ---------------------------------------------------------------------------
 
-## OX1. MISSED ERROR + WRONG AST — a second `->` on a clause's body line
+## OX1. FIXED 2026-09-06 — a second `->` on a clause's body line
         silently starts a new clause
 
     fn x -> y -> z end
@@ -499,7 +501,7 @@ incomplete head per `head_expects_more?`) before a same-line second arrow.
 Severity: high for an editor/LSP consumer — a real typo class produces a clean
 looking tree and a warning about the wrong thing.
 
-## OX2. MISSED ERROR — uppercase radix prefixes `0X` / `0O` / `0B` accepted
+## OX2. FIXED 2026-09-06 — uppercase radix prefixes `0X` / `0O` / `0B` were accepted
 
     0XFF   => 255, no diagnostics      (oracle: lexer error "invalid character \"X\" after number 0")
     0O17   => 15                       (same)
@@ -732,7 +734,7 @@ this is valid code that both errors AND corrupts the rest of the line.
 
 ## B. MISSED ERRORS (invalid code silently accepted, wrong AST built)
 
-### K4. Do-block calls accepted as stab clause heads / patterns
+### K4. FIXED 2026-09-06 — Do-block calls were accepted as stab clause heads / patterns
 
     fn if x do y end -> z end            # oracle: syntax error before: '->'
     case x do if y do z end -> w end     # oracle: syntax error before: '->'
@@ -768,7 +770,7 @@ toxic2 is too LENIENT on the same `%<base>{}` production. Any fix should
 reject do-block attachment while parsing the struct base (but keep
 `map_base_expr`'s matched operands like `%f(x){}`, `%x.y{}`).
 
-### K6. `when` with a keyword guard in a non-first no-parens call argument:
+### K6. FIXED 2026-09-06 (incl. the container/assoc extension) — `when` with a keyword guard in a non-first no-parens call argument:
         `f a, b when c: d` — silent, no `:ambiguous_no_parens`
 
     f a, b when c: d
@@ -790,7 +792,7 @@ position.
 Real-code likelihood: low-medium — `assert x, y when z: w`-ish shapes are
 conceivable while drafting guards into `assert` calls.
 
-### K7. `fn a: 1, b -> c end` — keyword-then-positional in an
+### K7. FIXED 2026-09-06 — `fn a: 1, b -> c end`: keyword-then-positional in an
         unparenthesised stab head is silently accepted
 
     fn a: 1, b -> c end       # oracle: "unexpected expression after keyword
@@ -814,7 +816,7 @@ the oracle for a different reason and by toxic2 too (not this gap).
 Real-code likelihood: low (kw in fn heads is macro-DSL territory), medium for
 an editor showing a half-typed head.
 
-### K8. Newline-then-comma after a trailing COMMENT: `%{a: 1 # ,\n, b: 2}`
+### K8. FIXED 2026-09-06 (with F3) — Newline-then-comma after a trailing COMMENT
 
     %{a: 1 # ,
     , b: 2}
@@ -1122,7 +1124,7 @@ Root: `lexer.ex:661-688`, the ASCII identifier/alias clauses, and `read_name/1` 
 1962. Upstream reads the whole identifier and checks for a keyword suffix before rejecting
 `@` or invalid alias characters (`elixir_tokenizer.erl:688-715`). Quoted equivalents work.
 
-#### R6 — P2: Malformed braced Unicode escapes are silently accepted
+#### R6 — FIXED 2026-09-06: Malformed braced Unicode escapes were silently accepted
 
 **Repros:** `"\u{41"`, `"\u{41x}"`, `"\u{0000041}"`.
 
@@ -1216,7 +1218,7 @@ Upstream emits `capture_int` and then tokenizes the integer normally
 (`elixir_tokenizer.erl:483-500`; `yrl:275`). Consequently the capture token also supports
 radix forms and underscores. This concerns parser grammar, not expansion's capture validation.
 
-#### R14 — P2: A final line continuation is accepted as a complete source
+#### R14 — FIXED 2026-09-06: A final line continuation was accepted as a complete source
 
 **Repros:** the bytes `x`, `\`, LF, EOF; likewise with CRLF.
 
@@ -1239,7 +1241,7 @@ the ASCII scanner stops at `@` and prematurely recognizes `not` as a reserved op
 Upstream checks `HasAt` after the keyword suffix check (`elixir_tokenizer.erl:690-705`).
 The distinction matters: `:é@bar` and `[é@bar: 1]` are valid and must remain accepted.
 
-#### R16 — P2: A unary wrapper incorrectly makes an unmatched do-block eligible for postfixes
+#### R16 — FIXED 2026-09-06: A unary wrapper incorrectly made an unmatched do-block eligible for postfixes
 
 **Repros:** `!f do x end.foo`, `!f do x end[0]`, `@f do x end.(1)`.
 
