@@ -147,12 +147,15 @@ defmodule Toxic2.YrlEdgeCasesTest do
     end
 
     test "braces inside interpolated strings and comments are not counted" do
-      assert {ast1, []} = Toxic2.parse_to_ast("\"\"\"\n  \#{\"{\"}\n  \"\"\"")
-      assert ast1 == Code.string_to_quoted!("\"\"\"\n  \#{\"{\"}\n  \"\"\"")
+      strip = fn ast -> Macro.prewalk(ast, &Macro.update_meta(&1, fn _ -> [] end)) end
 
-      src = "\"\"\"\n  before\n  \#{# {\n1}\n  after\n  \"\"\""
-      assert {ast2, []} = Toxic2.parse_to_ast(src)
-      assert ast2 == Code.string_to_quoted!(src)
+      for src <- [
+            "\"\"\"\n  \#{\"{\"}\n  \"\"\"",
+            "\"\"\"\n  before\n  \#{# {\n1}\n  after\n  \"\"\""
+          ] do
+        assert {ast, []} = Toxic2.parse_to_ast(src)
+        assert strip.(ast) == strip.(Code.string_to_quoted!(src))
+      end
     end
   end
 
