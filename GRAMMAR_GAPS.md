@@ -26,6 +26,63 @@
 > review (2026-09-05, R1–R20; reproducer harness in `grammar_review_20260905.exs`). All of their
 > findings were verified against the tree at the date each was merged.
 
+## Consolidated priority (2026-09-05, all open findings)
+
+Ranked by how likely the input is to occur in valid or close-to-valid code as it is being
+edited (the IDE/LSP use case). Silent corruption of valid code outranks false errors, which
+outrank missed diagnostics; fuzzer token soup is bottom-tier regardless of class.
+
+**P0 — silently corrupts ordinary valid code:**
+
+| Rank | Finding | Why first |
+|---|---|---|
+| 1 | R3 heredoc indentation vs `#{`/braces | Changes string VALUES. `~S"""` bodies mentioning `#{` (docs about interpolation!) and `#{"{"}`-style braces in interpolated heredocs are normal code. |
+| 2 | R18 grapheme-cluster column drift | Any emoji/combining char in a string shifts every later column on the line — silently poisons ranges and semantic tokens; emoji in strings are everywhere. |
+| 3 | R1 + R2 spaced access / empty-remote-call re-call | `f() [0]`, `Foo [0]` falsely rejected; `a.b() [0]` and `a.b() 1` silently misparse. Space before `[` and just-completed `()` calls are routine typing states. Fix together (see R2 note). |
+
+**P1 — valid but less common code: false errors or silent wrong AST:**
+
+| Rank | Finding | Notes |
+|---|---|---|
+| 4 | K1 `unwrap_when` (`fn a when b, c -> d end`) | Ordinary valid syntax, 16 confirmed shapes, all false errors. |
+| 5 | R4 `not in` keyword ownership / strictness | Silent wrong AST (`y: 2` leaves the inner call) plus missed ambiguity errors. |
+| 6 | R5 keyword keys `[Foo!: 1]` / `[foo@bar: 1]` | Valid keys falsely rejected by the ASCII fast paths. |
+| 7 | OX4 column drift after multi-byte escapes | Same corruption class as R18, but needs a written `\é`-style escape. |
+| 8 | R17 `unquote_splicing` block wrapper | The wrong-AST arms are rare, but the arity-one metadata mismatch hits `quote do unquote_splicing(x) end` — an extremely common macro idiom. |
+
+**P2 — close-to-valid mid-edit states an IDE must diagnose correctly:**
+
+| Rank | Finding | Notes |
+|---|---|---|
+| 9 | OX1 doubled `->` splits clauses silently | Classic one-line typo; clean-looking wrong tree plus a misleading warning. |
+| 10 | R6 malformed `\u{…` accepted | Half-typed escape yields a silently wrong string value. |
+| 11 | R14 trailing `\` at EOF accepted | Explicitly an incomplete-buffer shape. |
+| 12 | K4 do-block calls as clause heads | Plausible while wrapping a body in `if … do … end`; silent nonsense tree. |
+| 13 | F3 + K8 newline-before-comma family (incl. comment-interleaved) | Comma-first editing states; fix must be comment-aware per K8. |
+| 14 | K7 kw-then-positional fn heads | Half-typed heads accepted silently. |
+| 15 | R16 postfix after unary-wrapped do-block | Admission inconsistency, mid-edit shape. |
+| 16 | OX2 uppercase radix `0XFF` | C-habit typo, clear-cut missed error. |
+| 17 | K6 + extension (`when` kw guards in restricted positions) | Missed ambiguity errors across containers/associations. |
+
+**P3 — comment-poisoned metadata anchors (formatter/LSP-grade, common comments):**
+
+| Rank | Finding | Notes |
+|---|---|---|
+| 18 | K14 `->` inside a comment hijacks the arrow anchor | Comments like `# maps a -> b` are common. |
+| 19 | K10 `not`/`in` inside a comment hijacks `not in` anchor (+ missing `newlines:`) | Same root: `:binary.match` source scans; a token-driven scan fixes both. |
+
+**P4 — rare valid spellings, metadata/warning parity:** R8/R9 (attribute `@f()(1)`, `@@f[x]`
+grouping), R11 (ellipsis newline/`not in` boundaries), R12 (`f +..`), R13 (`&0x0A`/`&1_0`),
+K3 (`?\é`), R7 (escaped raw bidi/forbidden chars), R15 (`é@bar`/`not@bar` identifiers),
+OX3 (`%{a not in b}`), K5 (`%<do-block>{}`), F4 (parenthesised fn kw guard), K13 (encoder
+suppressing nested-no-parens warning), K15 (duplicate outdent warnings), K11 (`fn\n-> 1 end`
+newlines placement), K9 (`not x in y` meta without token_metadata), K12 (`:true` `format: :atom`),
+R19 (stab-parens meta attribution).
+
+**P5 — fuzzer token soup, completeness only:** K2 (`%&1{}`/`%..{}`), R20 (`+//2`),
+F2 (`foo.//1` dot-context operator split), F7 (`fn x -> ; end`), the `%+&f/1{}`-style
+struct-base soup, and the 14 catalogued FUZZER_GAPS residuals.
+
 ## Follow-up findings (2026-07-18)
 
 ### F1. False errors on adjacent no-parens calls — FIXED 2026-07-18
