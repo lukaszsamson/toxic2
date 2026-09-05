@@ -32,9 +32,9 @@ Ranked by how likely the input is to occur in valid or close-to-valid code as it
 edited (the IDE/LSP use case). Silent corruption of valid code outranks false errors, which
 outrank missed diagnostics; fuzzer token soup is bottom-tier regardless of class.
 
-> **FIX STATUS (2026-09-06): all P0, P1, and P2 findings below are FIXED** — P0/P1: R3, R18,
-> R1+R2, K1, R4, R5, OX4, R17 (2026-09-05); P2: OX1, R6, R14, K4, F3+K8, K7, R16, OX2, K6
-> (2026-09-06). Regression tests live in `test/toxic2/yrl_edge_cases_test.exs`,
+> **FIX STATUS (2026-09-06): all P0, P1, P2, and P3 findings below are FIXED** — P0/P1: R3, R18,
+> R1+R2, K1, R4, R5, OX4, R17 (2026-09-05); P2: OX1, R6, R14, K4, F3+K8, K7, R16, OX2, K6;
+> P3: K14, K10 (2026-09-06). Regression tests live in `test/toxic2/yrl_edge_cases_test.exs`,
 > `test/toxic2/parser_test.exs`, and `test/toxic2/token_metadata_test.exs`; the review harness
 > (`grammar_review_20260905.exs`) reflects the remaining P3+ backlog, and the old audit harness
 > (`mix run grammar_audit.exs`) is down to the two %-soup struct-base residuals (4 rows).
@@ -71,7 +71,7 @@ outrank missed diagnostics; fuzzer token soup is bottom-tier regardless of class
 | 16 | OX2 uppercase radix `0XFF` | C-habit typo, clear-cut missed error. |
 | 17 | K6 + extension (`when` kw guards in restricted positions) | Missed ambiguity errors across containers/associations. |
 
-**P3 — comment-poisoned metadata anchors (formatter/LSP-grade, common comments):**
+**P3 — comment-poisoned metadata anchors: FIXED 2026-09-06** (one comment-aware `gap_op_match` in `scan_op`, also hardening the `when`/`=>`/`|` scans)
 
 | Rank | Finding | Notes |
 |---|---|---|
@@ -857,7 +857,7 @@ every neighbouring lowering (`lower_unary`, `lower_binary` use `op_meta`
 unconditionally). The deprecation warning itself IS emitted (agrees); only
 the node anchors diverge.
 
-### K10. Fused `not in` after a newline/comment: missing `newlines:` and a
+### K10. FIXED 2026-09-06 — Fused `not in` after a newline/comment: missing `newlines:` and a
          comment-poisoned anchor
 
     x
@@ -930,7 +930,7 @@ kw-value position (`[k: :true]`). Bare `true`/`false`/`nil` (no colon) match.
 An extra warning under `literal_encoder` — exactly the mode formatter-grade
 tooling uses.
 
-### K14. `fn a # ->\n -> 1 end` — comment containing "->" before the real
+### K14. FIXED 2026-09-06 — `fn a # ->\n -> 1 end`: comment containing "->" before the real
          arrow hijacks the `->` anchor
 
     fn a # ->

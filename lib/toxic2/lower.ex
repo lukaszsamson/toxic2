@@ -945,7 +945,10 @@ defmodule Toxic2.Lower do
             scan_op(opts, line + 1, 1, needle, last_line)
 
           boff ->
-            case :binary.match(text, needle, scope: {boff, byte_size(text) - boff}) do
+            # COMMENT-AWARE: the scanned region is the gap between two tokens, where any `#`
+            # starts a comment running to end of line — an operator spelled inside a comment
+            # (`fn a # ->\n -> 1 end`, `a # not\nnot in b`) must not hijack the anchor (K14/K10).
+            case gap_op_match(text, needle, boff) do
               {moff, _} -> [line: line, column: col + scan_gap(text, boff, moff, ascii)]
               :nomatch -> scan_op(opts, line + 1, 1, needle, last_line)
             end
@@ -954,6 +957,18 @@ defmodule Toxic2.Lower do
   end
 
   defp scan_op(_opts, _line, _col, _needle, _last_line), do: []
+
+  # `:binary.match` for `needle` from `boff`, unless a `#` (a gap comment) precedes it on the line.
+  defp gap_op_match(text, needle, boff) do
+    scope = {boff, byte_size(text) - boff}
+
+    with {moff, _} = m <- :binary.match(text, needle, scope: scope) do
+      case :binary.match(text, "#", scope: scope) do
+        {hoff, _} when hoff < moff -> :nomatch
+        _ -> m
+      end
+    end
+  end
 
   # Codepoint gap from byte offset `boff` to the operator at `moff`. When `boff..moff` is entirely in
   # the line's ASCII region (whole line `:all`, or the operator found within the leading-ASCII prefix)
@@ -2815,18 +2830,27 @@ defmodule Toxic2.Lower do
   defp lower_not_in([lhs, rhs], view, opts, acc, nid) do
     {l, acc, nid} = lower(lhs, view, opts, acc, nid)
     {r, acc, nid} = lower(rhs, view, opts, acc, nid)
-    {not_m, in_m} = not_in_meta(lhs, view, opts)
+    {not_m, in_m} = not_in_meta(lhs, rhs, view, opts)
     {{:not, not_m, [{:in, in_m, [l, r]}]}, acc, nid}
   end
 
   # `x not in y`: `not` and `in` are separate keywords after the lhs (`x not in …`); anchor each at
   # its keyword position, found by scanning the source just past the lhs.
-  defp not_in_meta(_lhs, _view, %{token_metadata: false}), do: {[], []}
+  defp not_in_meta(_lhs, _rhs, _view, %{token_metadata: false}), do: {[], []}
 
-  defp not_in_meta(lhs, view, opts) do
+  defp not_in_meta(lhs, rhs, view, opts) do
     with {_, _, lel, lec} <- child_span(lhs, view),
-         [line: nl, column: nc] = not_m <- scan_op(opts, lel, lec, "not", lel + 1) do
-      {not_m, scan_op(opts, nl, nc + 3, "in", nl + 1)}
+         {rsl, _, _, _} <- child_span(rhs, view),
+         [line: nl, column: nc] = not_m <- scan_op(opts, lel, lec, "not", rsl) do
+      # Upstream records the newline(s) BEFORE the fused `not` (`x\nnot in y` =>
+      # `{:not, [newlines: 1, …]}`, from the tokenizer's previous_was_eol) — comment-aware.
+      not_m =
+        case gap_newlines(opts, lel, lec) do
+          n when n > 0 -> [{:newlines, n} | not_m]
+          _ -> not_m
+        end
+
+      {not_m, scan_op(opts, nl, nc + 3, "in", rsl)}
     else
       _ -> {[], []}
     end

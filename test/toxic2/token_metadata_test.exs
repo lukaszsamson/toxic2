@@ -96,6 +96,25 @@ defmodule Toxic2.TokenMetadataTest do
   describe "from_brackets: / from_interpolation:" do
     test "access uses from_brackets:", do: Enum.each(["foo[bar]", "a[b][c]"], &assert_parity/1)
 
+    test "operator words inside gap comments never hijack anchors (K14/K10)" do
+      Enum.each(
+        [
+          # `->` in a comment before the real arrow
+          "fn a # ->\n -> 1 end",
+          "fn a # c\n -> 1 end",
+          # `not`/`in` in a comment before a fused `not in`; and its `newlines:` count
+          "a # not\nnot in b",
+          "a # in\nnot in b",
+          "x\nnot in y",
+          "x\n\nnot in y",
+          # same hazard class for `=>` and the update `|`
+          "%{:a # =>\n=> 1}",
+          "%{m # |\n| a: 1}"
+        ],
+        &assert_parity/1
+      )
+    end
+
     test "guard-comma stab heads (K1) keep oracle metadata" do
       Enum.each(
         [
