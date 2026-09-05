@@ -1668,8 +1668,10 @@ defmodule Toxic2.Parser do
           # `fn (a) when foo: 1 -> …`: a keyword-list guard, like the expression-level `when`.
           when_kw_rhs(t, guard_start, diags, nid, fuel)
         else
-          # `:no_parens` so a guard that is a no-parens call takes several args (`when baz a, b`).
-          parse_expr(t, guard_start, 0, :no_parens, diags, nid, fuel - 1)
+          # `:no_parens_arg`: a guard that is a no-parens call still takes several args
+          # (`when baz a, b`), but a do-block cannot attach — upstream stab heads derive from
+          # `call_args_no_parens_all`, which admits no block_expr (K4).
+          parse_expr(t, guard_start, 0, :no_parens_arg, diags, nid, fuel - 1)
         end
 
       jj = skip_eols(t, j)
@@ -1720,7 +1722,7 @@ defmodule Toxic2.Parser do
       if kw_data_start?(t, guard_start) do
         when_kw_rhs(t, guard_start, diags, nid, fuel)
       else
-        parse_expr(t, guard_start, 0, :no_parens, diags, nid, fuel - 1)
+        parse_expr(t, guard_start, 0, :no_parens_arg, diags, nid, fuel - 1)
       end
 
     build_stab_when(t, patterns, guard, skip_eols(t, j), diags, nid, fuel)
@@ -1747,6 +1749,12 @@ defmodule Toxic2.Parser do
     i = skip_eols(t, i)
     {pat, j, diags, nid, fuel} = head_pattern(t, i, diags, nid, fuel)
 
+    # `call_args_no_parens_many` requires a keyword run to be LAST: a positional pattern after a
+    # keyword pair (`fn a: 1, b -> c end`) is upstream's "unexpected expression after keyword
+    # list" error (K7). The kw-ness check is on the pattern node itself, so a `when`-folded
+    # binary pattern (K1) counts as positional.
+    {diags, nid} = check_kw_last(kw_pair_seen?(acc), kw_pair_node?(pat), t, pat, diags, nid)
+
     j = if j > i, do: j, else: i + 1
     jj = skip_eols(t, j)
 
@@ -1757,15 +1765,20 @@ defmodule Toxic2.Parser do
     end
   end
 
+  defp kw_pair_seen?([prev | _]), do: kw_pair_node?(prev)
+  defp kw_pair_seen?([]), do: false
+
   # One stab-head pattern: a keyword pair (`a: 1`) or an ordinary pattern (stopping before `when`).
-  # Parsed in `:no_parens` so a pattern that is a no-parens call takes several args — the whole
-  # `x 1, 2, 3` is ONE pattern (`x(1, 2, 3)`), and a keyword value may be one too (`a: b c, d`).
+  # Parsed in `:no_parens_arg` so a pattern that is a no-parens call takes several args — the
+  # whole `x 1, 2, 3` is ONE pattern (`x(1, 2, 3)`), a keyword value may be one too (`a: b c, d`)
+  # — while a do-block cannot attach to a pattern (`fn if x do y end -> z end` is upstream\'s
+  # syntax error before `->`; block_expr is never a head element, K4).
   defp head_pattern(t, i, diags, nid, fuel) do
     if tk(t, i) == :kw_identifier do
       key = ctoken(i)
 
       {val, j, diags, nid, fuel} =
-        parse_expr(t, skip_eols(t, i + 1), 0, :no_parens, diags, nid, fuel - 1)
+        parse_expr(t, skip_eols(t, i + 1), 0, :no_parens_arg, diags, nid, fuel - 1)
 
       node =
         CST.node(:kw_pair, merge_tc(t, i, val), [key, val], :matched, nil)
@@ -1773,7 +1786,7 @@ defmodule Toxic2.Parser do
       {node, j, diags, nid, fuel}
     else
       {expr, j, diags, nid, fuel} =
-        parse_expr(t, i, @clause_pattern_bp, :no_parens, diags, nid, fuel - 1)
+        parse_expr(t, i, @clause_pattern_bp, :no_parens_arg, diags, nid, fuel - 1)
 
       # A quoted keyword key in a stab head (`('a': 1) -> …`).
       if quoted_kw?(t, j) do

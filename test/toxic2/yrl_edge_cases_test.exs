@@ -200,6 +200,39 @@ defmodule Toxic2.YrlEdgeCasesTest do
     end
   end
 
+  describe "clause-head restrictions (GRAMMAR_GAPS K4, K7)" do
+    test "do-block calls are never head patterns or guards" do
+      for src <- [
+            "fn if x do y end -> z end",
+            "case x do if y do z end -> w end",
+            "receive do a after foo do b end -> c end",
+            "fn foo a, b do c end -> d end",
+            "fn x when quote do y end -> z end"
+          ] do
+        assert_rejected(src)
+      end
+
+      assert_accepted("fn x -> if a do b end end")
+      assert_accepted("fn -> quote do x end end")
+    end
+
+    test "a keyword run must be the LAST head argument" do
+      for src <- [
+            "fn a: 1, b -> c end",
+            "fn a, b: 1, c -> d end",
+            "fn x, a: 1, b -> c end",
+            "(a: 1, b -> c)",
+            "case x do a: 1, b -> c end"
+          ] do
+        assert_rejected(src)
+      end
+
+      assert_accepted("fn a: 1 -> b end")
+      assert_accepted("fn a, b: 1, c: 2 -> d end")
+      assert_accepted("fn a when b, c: 1 -> d end")
+    end
+  end
+
   describe "doubled `->` and unmatched-unary postfix (GRAMMAR_GAPS OX1, R16)" do
     test "a second -> without a `;` boundary is an error" do
       for src <- [
