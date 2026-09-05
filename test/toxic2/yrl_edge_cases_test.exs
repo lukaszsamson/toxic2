@@ -176,6 +176,40 @@ defmodule Toxic2.YrlEdgeCasesTest do
     end
   end
 
+  describe "unwrap_when: comma after a stab-head guard (GRAMMAR_GAPS K1)" do
+    test "a non-trailing `when` binds one pattern; more patterns follow" do
+      for src <- [
+            "fn a when b, c -> d end",
+            "fn a when b, c, d -> e end",
+            "fn a when f(b), c -> d end",
+            "fn a, b when c, d -> e end",
+            "fn a when b when c, d -> e end",
+            "fn a when b, c when d, e -> f end",
+            "fn a when b, c: 1 -> d end",
+            "fn (a) when b, c -> d end",
+            "fn (a when b, c) -> d end",
+            "case x do a when b, c -> d end",
+            "try do x rescue e when b, c -> d end",
+            "try do x catch k, v when g, h -> i end",
+            "(a when b, c -> d)"
+          ] do
+        assert_accepted(src)
+      end
+
+      assert {{:fn, _, [{:->, _, [[{:when, _, [{:a, _, nil}, {:b, _, nil}]}, {:c, _, nil}], _]}]},
+              []} = Toxic2.parse_to_ast("fn a when b, c -> d end")
+
+      # trailing `when` still guards ALL patterns
+      assert {{:fn, _, [{:->, _, [[{:when, _, [{:a, _, nil}, {:b, _, nil}, {:c, _, nil}]}], _]}]},
+              []} = Toxic2.parse_to_ast("fn a, b when c -> d end")
+    end
+
+    test "the outer parenthesised-head guard still admits no comma" do
+      assert_accepted("fn (a, b) when c -> d end")
+      assert_rejected("fn (a, b) when c, d -> e end")
+    end
+  end
+
   describe "`not in` keyword ownership and strictness (GRAMMAR_GAPS R4)" do
     test "a trailing keyword run belongs to the call under `not in`" do
       assert {[{:not, _, [{:in, _, [{:a, _, nil}, {:f, _, [[x: 1, y: 2]]}]}]}], []} =

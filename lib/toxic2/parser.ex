@@ -1569,17 +1569,28 @@ defmodule Toxic2.Parser do
 
       # A parenthesised multi-arg head — `(a, b) -> …`, `(x, a: 1) when g -> …`: the parens wrap
       # the comma-separated arg list (`stab_parens_many`), so parse the interior as the patterns.
+      # A guard may also sit INSIDE the parens (`(a when b, c) -> …` — the interior is ordinary
+      # no-parens args, K1); the OUTER `stab_parens_many when_op expr` guard admits no comma.
       stab_parens_head?(t, i) ->
-        {patterns, j, diags, nid, fuel} = head_patterns(t, i + 1, [], diags, nid, fuel)
+        {head, j, diags, nid, fuel} = head_with_guards(t, i + 1, diags, nid, fuel)
         close = skip_eols(t, j)
         after_close = if tk(t, close) == :")", do: close + 1, else: close
-        clause_head_guard(t, skip_eols(t, after_close), patterns, diags, nid, fuel)
+        k = skip_eols(t, after_close)
+
+        if tk(t, k) == :when_op do
+          clause_outer_guard(t, k, cchildren(head), diags, nid, fuel)
+        else
+          {head, k, diags, nid, fuel}
+        end
 
       true ->
-        {patterns, j, diags, nid, fuel} = head_patterns(t, i, [], diags, nid, fuel)
-        jj = skip_eols(t, j)
-        clause_head_guard(t, jj, patterns, diags, nid, fuel)
+        head_with_guards(t, i, diags, nid, fuel)
     end
+  end
+
+  defp head_with_guards(t, i, diags, nid, fuel) do
+    {patterns, j, diags, nid, fuel} = head_patterns(t, i, [], diags, nid, fuel)
+    clause_head_guard(t, skip_eols(t, j), :lists.reverse(patterns), diags, nid, fuel)
   end
 
   # Is the head a single parenthesised arg list (`(a, b) ->`, `(a: 1) ->`)? True when a `(` opens,
@@ -1624,7 +1635,9 @@ defmodule Toxic2.Parser do
     end
   end
 
-  defp clause_head_guard(t, i, patterns, diags, nid, fuel) do
+  # `rev_patterns` arrives REVERSED (most recent first) so the `unwrap_when` fold below can pop
+  # the last pattern and splice continuations with `:lists.reverse/2` prepends — no appends.
+  defp clause_head_guard(t, i, rev_patterns, diags, nid, fuel) do
     if tk(t, i) == :when_op do
       guard_start = skip_eols(t, i + 1)
 
@@ -1637,21 +1650,72 @@ defmodule Toxic2.Parser do
           parse_expr(t, guard_start, 0, :no_parens, diags, nid, fuel - 1)
         end
 
-      when_node =
-        CST.node(
-          :stab_when,
-          head_span(t, patterns, guard),
-          Enum.concat(patterns, [guard]),
-          :matched,
-          nil
-        )
+      jj = skip_eols(t, j)
 
-      {CST.node(:stab_args, cst_span(t, when_node), [when_node], :matched, nil), skip_eols(t, j),
-       diags, nid, fuel}
+      # `a when b, c -> …` (yrl `unwrap_when`): the head is ordinary no-parens args, so a comma
+      # after the guard means this `when` is NOT trailing — it binds only the pattern before it
+      # (`{:when, _, [a, b]}` stays a plain first arg) and more patterns follow. Only a TRAILING
+      # `when` becomes the multi-arg clause guard (`a, b when c` => `when(a, b, c)`).
+      if tk(t, jj) == :"," and rev_patterns != [] do
+        [last | rev_init] = rev_patterns
+
+        when_pat =
+          CST.node(
+            :binary_op,
+            merge(cst_span(t, last), cst_span(t, guard)),
+            [last, ctoken(i), guard],
+            :matched,
+            nil
+          )
+
+        {more, j2, diags, nid, fuel} = head_patterns(t, jj + 1, [], diags, nid, fuel)
+
+        clause_head_guard(
+          t,
+          skip_eols(t, j2),
+          :lists.reverse(more, [when_pat | rev_init]),
+          diags,
+          nid,
+          fuel
+        )
+      else
+        build_stab_when(t, :lists.reverse(rev_patterns), guard, jj, diags, nid, fuel)
+      end
     else
+      patterns = :lists.reverse(rev_patterns)
+
       {CST.node(:stab_args, head_span(t, patterns, nil), patterns, :matched, nil), i, diags, nid,
        fuel}
     end
+  end
+
+  # The outer guard of a parenthesised head (`(a, b) when g -> …`, `stab_parens_many when_op
+  # expr`) — no comma continuation exists in that production.
+  defp clause_outer_guard(t, i, patterns, diags, nid, fuel) do
+    guard_start = skip_eols(t, i + 1)
+
+    {guard, j, diags, nid, fuel} =
+      if kw_data_start?(t, guard_start) do
+        when_kw_rhs(t, guard_start, diags, nid, fuel)
+      else
+        parse_expr(t, guard_start, 0, :no_parens, diags, nid, fuel - 1)
+      end
+
+    build_stab_when(t, patterns, guard, skip_eols(t, j), diags, nid, fuel)
+  end
+
+  defp build_stab_when(t, patterns, guard, next_i, diags, nid, fuel) do
+    when_node =
+      CST.node(
+        :stab_when,
+        head_span(t, patterns, guard),
+        Enum.concat(patterns, [guard]),
+        :matched,
+        nil
+      )
+
+    {CST.node(:stab_args, cst_span(t, when_node), [when_node], :matched, nil), next_i, diags, nid,
+     fuel}
   end
 
   # Comma-separated patterns, each parsed stopping before `when` (50) and `->` (not infix). A

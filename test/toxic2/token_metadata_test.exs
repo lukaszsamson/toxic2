@@ -96,6 +96,19 @@ defmodule Toxic2.TokenMetadataTest do
   describe "from_brackets: / from_interpolation:" do
     test "access uses from_brackets:", do: Enum.each(["foo[bar]", "a[b][c]"], &assert_parity/1)
 
+    test "guard-comma stab heads (K1) keep oracle metadata" do
+      Enum.each(
+        [
+          "fn a when b, c -> d end",
+          "fn a, b when c, d -> e end",
+          "fn a when b, c when d, e -> f end",
+          "fn (a) when b, c -> d end",
+          "case x do a when b, c -> d end"
+        ],
+        &assert_parity/1
+      )
+    end
+
     test "a sole splice in a do body keeps the do meta on the wrapper (R17)" do
       Enum.each(
         ["quote do unquote_splicing(x) end", "unquote_splicing(x, y)", "unquote_splicing()"],
