@@ -100,6 +100,20 @@ defmodule Toxic2.ParserTest do
       assert CST.node_kind(child(e, 0)) == :unary_op
     end
 
+    test "unquote_splicing block wrapping is arity-one only (R17)" do
+      assert {{:__block__, [], [{:unquote_splicing, _, [{:x, _, nil}]}]}, []} =
+               Toxic2.parse_to_ast("(unquote_splicing(x))")
+
+      # zero / two args and do-block calls stay ordinary calls
+      assert {{:unquote_splicing, _, []}, []} = Toxic2.parse_to_ast("unquote_splicing()")
+
+      assert {{:unquote_splicing, _, [{:x, _, nil}, {:y, _, nil}]}, []} =
+               Toxic2.parse_to_ast("unquote_splicing(x, y)")
+
+      assert {{:unquote_splicing, _, [{:x, _, nil}, [do: {:__block__, _, []}]]}, []} =
+               Toxic2.parse_to_ast("unquote_splicing(x) do end")
+    end
+
     # Ported from elixir@2e9ce85e9 ("Fix precedence when parsing unary ops with do-end blocks"):
     # a do-block operand no longer makes the unary greedy — trailing binary ops attach per the
     # unary's own precedence (`!`/`not`/`-`/`@` beat `||`/`and`/`+`; capture `&`/`...` lose to

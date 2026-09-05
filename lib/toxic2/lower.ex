@@ -2565,7 +2565,17 @@ defmodule Toxic2.Lower do
 
       [one] ->
         {ast, acc, nid} = lower(one, view, opts, acc, nid)
-        {section_parens(wrap_splice(attach_eoe(ast, one, view, opts)), block_meta), acc, nid}
+
+        # A sole arity-one splice takes the block meta ON the `__block__` wrapper (upstream
+        # `build_block`'s splice case receives BlockMeta directly); everything else gets the
+        # single-expression `parens:` treatment.
+        case wrap_splice(attach_eoe(ast, one, view, opts), block_meta) do
+          {:__block__, ^block_meta, [{:unquote_splicing, _, [_]}]} = wrapped ->
+            {wrapped, acc, nid}
+
+          other ->
+            {section_parens(other, block_meta), acc, nid}
+        end
 
       many ->
         {{:__block__, _m, asts}, acc, nid} = wrap_block(lower_stmts(many, view, opts, acc, nid))
@@ -2793,8 +2803,12 @@ defmodule Toxic2.Lower do
   # `unquote_splicing(x)` as the SOLE statement of a block / paren / clause body is wrapped in a
   # `__block__` (it is only valid in a list/block context) — `(unquote_splicing(x))` => `{:__block__,
   # [], [it]}`. As a list element (`[unquote_splicing(x)]`) it is NOT wrapped (a different path).
-  defp wrap_splice({:unquote_splicing, _, _} = ast), do: {:__block__, [], [ast]}
-  defp wrap_splice(ast), do: ast
+  # Upstream's `build_block` special case matches EXACTLY ONE argument: `unquote_splicing()` and
+  # `unquote_splicing(x, y)` stay ordinary calls, and a do-block call is never a splice.
+  defp wrap_splice(ast), do: wrap_splice(ast, [])
+
+  defp wrap_splice({:unquote_splicing, _, [_]} = ast, meta), do: {:__block__, meta, [ast]}
+  defp wrap_splice(ast, _meta), do: ast
 
   # `a not in b` => `{:not, [], [{:in, [], [a, b]}]}` (the canonical Elixir shape; the rewrite
   # lives here, not in the parser — P5).

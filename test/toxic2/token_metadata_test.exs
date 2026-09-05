@@ -96,6 +96,13 @@ defmodule Toxic2.TokenMetadataTest do
   describe "from_brackets: / from_interpolation:" do
     test "access uses from_brackets:", do: Enum.each(["foo[bar]", "a[b][c]"], &assert_parity/1)
 
+    test "a sole splice in a do body keeps the do meta on the wrapper (R17)" do
+      Enum.each(
+        ["quote do unquote_splicing(x) end", "unquote_splicing(x, y)", "unquote_splicing()"],
+        &assert_parity/1
+      )
+    end
+
     test "grapheme clusters and multi-byte escapes are one column (R18/OX4)" do
       Enum.each(
         [
