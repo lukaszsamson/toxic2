@@ -68,9 +68,11 @@ defmodule Toxic2.YrlEdgeCasesTest do
   end
 
   describe "uppercase radix / malformed \\u{} / trailing continuation (OX2, R6, R14)" do
-    test "uppercase radix prefixes are invalid-character errors" do
-      Enum.each(["0XFF", "0O17", "0B101", "x = 0XFF + 1"], &assert_lex_rejected/1)
-      Enum.each(["0xFF", "0o17", "0b101"], &assert_lex_ok/1)
+    test "uppercase radix prefixes are errors (upstream: invalid character after number)" do
+      # toxic2 tolerantly lexes `0` + alias and errors in the parser; upstream errors in the
+      # tokenizer — status parity is what's pinned here (diagnostic codes for numbers may differ).
+      Enum.each(["0XFF", "0O17", "0B101", "x = 0XFF + 1"], &assert_rejected/1)
+      Enum.each(["0xFF", "0o17", "0b101"], &assert_accepted/1)
     end
 
     test "braced unicode escapes need 1-6 hex digits immediately closed by }" do
