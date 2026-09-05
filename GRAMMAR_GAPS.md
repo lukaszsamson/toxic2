@@ -32,7 +32,12 @@ Ranked by how likely the input is to occur in valid or close-to-valid code as it
 edited (the IDE/LSP use case). Silent corruption of valid code outranks false errors, which
 outrank missed diagnostics; fuzzer token soup is bottom-tier regardless of class.
 
-**P0 — silently corrupts ordinary valid code:**
+> **FIX STATUS (2026-09-05): all P0 and P1 findings below are FIXED** — R3, R18, R1+R2, K1, R4,
+> R5, OX4, R17. Regression tests live in `test/toxic2/yrl_edge_cases_test.exs`,
+> `test/toxic2/parser_test.exs`, and `test/toxic2/token_metadata_test.exs`; the review harness
+> (`grammar_review_20260905.exs`) reflects the remaining P2+ backlog.
+
+**P0 — silently corrupts ordinary valid code: FIXED 2026-09-05**
 
 | Rank | Finding | Why first |
 |---|---|---|
@@ -40,7 +45,7 @@ outrank missed diagnostics; fuzzer token soup is bottom-tier regardless of class
 | 2 | R18 grapheme-cluster column drift | Any emoji/combining char in a string shifts every later column on the line — silently poisons ranges and semantic tokens; emoji in strings are everywhere. |
 | 3 | R1 + R2 spaced access / empty-remote-call re-call | `f() [0]`, `Foo [0]` falsely rejected; `a.b() [0]` and `a.b() 1` silently misparse. Space before `[` and just-completed `()` calls are routine typing states. Fix together (see R2 note). |
 
-**P1 — valid but less common code: false errors or silent wrong AST:**
+**P1 — valid but less common code: FIXED 2026-09-05**
 
 | Rank | Finding | Notes |
 |---|---|---|
@@ -528,7 +533,7 @@ one-kind hole in an otherwise complete grouped rule. Fix: add `:not_in_op` to
 the rejected roots in `map_base_entry?/2` (both the bare-entry and update-entry
 paths flow through the same predicate).
 
-## OX4. INVALID METADATA — columns drift right after a multi-byte escape
+## OX4. FIXED 2026-09-05 — columns drifted right after a multi-byte escape
         sequence inside strings / charlists / heredocs
 
     s = "a\é" ; x
@@ -617,7 +622,7 @@ lists (50+ shapes); operator adjacency matrix (`a -1`/`a - 1`/`a--b`/`a**b`
 
 ## A. FALSE ERRORS on valid code (worst class)
 
-### K1. `unwrap_when` missing — a comma after a `when` guard in an
+### K1. FIXED 2026-09-05 — `unwrap_when` was missing: a comma after a `when` guard in an
         unparenthesised stab head is a FALSE ERROR
 
     fn a when b, c -> d end
@@ -1031,7 +1036,7 @@ claim that every macro-oriented or unusual expression passes expansion or evalua
 
 ### Findings
 
-#### R1 — P2: Access wrongly requires adjacency for every base
+#### R1 — FIXED 2026-09-05: Access wrongly required adjacency for every base
 
 **Repros:** `f() [0]`, `(x) [0]`, `Foo [0]`, `%{} [0]`, `a.b() [0]`.
 
@@ -1045,7 +1050,7 @@ the separate `bracket_expr -> access_expr bracket_arg` production (`yrl:313`).
 The converse restriction is also missing: `..[0]` is accepted although a bare nullary range
 is not an `access_expr`; `(..)[0]` is legal. Access needs the grammar's base classification.
 
-#### R2 — P2: An empty parenthesized remote call can be called again without parentheses
+#### R2 — FIXED 2026-09-05: An empty parenthesized remote call could be called again without parentheses
 
 **Repros:** `a.b() 1`, `a.b() x: 1`, `a."b"() x`.
 
@@ -1058,7 +1063,7 @@ when `build_np_call/4` adds arguments. Upstream only allows `dot_identifier`/`do
 as no-parens callees (`yrl:252-261`), not a completed `parens_call`.
 Nonempty calls such as `a.b(1) 2` correctly report an error.
 
-#### R3 — P2: Heredoc indentation scanning changes valid string contents
+#### R3 — FIXED 2026-09-05: Heredoc indentation scanning changed valid string contents
 
 **Minimal raw-sigil repro:**
 
@@ -1090,7 +1095,7 @@ without lexical string/comment state. Upstream extracts interpolation with the t
 stripping indentation (`elixir_interpolation.erl:60-78` and the heredoc extraction helpers).
 This is independent of K15's duplicate outdent warnings.
 
-#### R4 — P2: `not in` loses keyword ownership and bypasses ambiguity checks
+#### R4 — FIXED 2026-09-05: `not in` lost keyword ownership and bypassed ambiguity checks
 
 **Repro:** `[a not in f x: 1, y: 2]`.
 
@@ -1105,7 +1110,7 @@ and strictness checks. The rewrite helpers used when appending absorbed keywords
 same support. This is distinct from OX3 (bare map entry admission), K10 (metadata), and K6
 (`when` keyword guards). Ordinary `in` passes the corresponding controls.
 
-#### R5 — P2: Legal unquoted keyword names are rejected by ASCII fast paths
+#### R5 — FIXED 2026-09-05: Legal unquoted keyword names were rejected by ASCII fast paths
 
 **Repros:** `[foo@bar: 1]`, `[Foo!: 1]`, `[Foo?: 1]`.
 
@@ -1246,7 +1251,7 @@ The outer postfix pass then accepts dot/access operations. The grammar keeps
 `unary_op_eol unmatched_expr` unmatched (`yrl:167-170`), and dot productions require a matched
 left operand (`yrl:478-498`). This is separate from K4's clause-head and K5's struct-base holes.
 
-#### R17 — P2: `unquote_splicing` block construction is not restricted to arity one
+#### R17 — FIXED 2026-09-05: `unquote_splicing` block construction was not restricted to arity one
 
 **Repros:** `unquote_splicing()`, `unquote_splicing(x, y)`, `unquote_splicing(x) do end`.
 
@@ -1261,7 +1266,7 @@ Toxic2 changes it to `parens: [line: 1, column: 7]`. The block-special case must
 section metadata rather than taking the general single-expression metadata path.
 These differ from the fixed §2.2, which concerns unwrapping a splice in a clause head.
 
-#### R18 — P2: Grapheme clusters shift source columns even without escapes
+#### R18 — FIXED 2026-09-05: Grapheme clusters shifted source columns even without escapes
 
 **Repro:** source `"é"; x`, where the accent is a separate U+0301 codepoint.
 
