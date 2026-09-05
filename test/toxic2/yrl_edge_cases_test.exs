@@ -200,6 +200,44 @@ defmodule Toxic2.YrlEdgeCasesTest do
     end
   end
 
+  describe "newline before comma (GRAMMAR_GAPS F3 + K8)" do
+    test "an eol between an element and its comma is an error in every container" do
+      for src <- [
+            "[1\n, 2]",
+            "{1\n, 2}",
+            "<<1\n, 2>>",
+            "f(1\n, 2)",
+            "[a: 1\n, b: 2]",
+            "%{a: 1\n, b: 2}",
+            "%{1 => 2\n, 3 => 4}",
+            "%{m | a: 1\n, b: 2}",
+            "%Foo{a: 1\n, b: 2}",
+            "a[b: 1\n, c: 2]",
+            "fn a\n, b -> 1 end"
+          ] do
+        assert_rejected(src)
+      end
+    end
+
+    test "a trailing comment before the newline-comma is caught too (K8)" do
+      assert_rejected("%{a: 1 # ,\n, b: 2}")
+      assert_rejected("[1 # ,\n, 2]")
+    end
+
+    test "newline AFTER a comma or before a close stays valid" do
+      for src <- [
+            "[1,\n2]",
+            "f(1,\n2)",
+            "%{a: 1,\nb: 2}",
+            "fn a,\nb -> 1 end",
+            "[1\n]",
+            "foo[1,]"
+          ] do
+        assert_accepted(src)
+      end
+    end
+  end
+
   describe "`when` with keyword RHS in restricted positions (GRAMMAR_GAPS K6)" do
     test "containers, brackets, map values, and non-first args reject `x when k: v`" do
       for src <- [

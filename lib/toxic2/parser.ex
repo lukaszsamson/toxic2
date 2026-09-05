@@ -883,6 +883,9 @@ defmodule Toxic2.Parser do
     # A single trailing comma is allowed (`foo[1,]`); `foo[a, b]` (a real second index) is not.
     jj0 = skip_eols(t, j)
 
+    {diags, nid} =
+      if tk(t, jj0) == :",", do: check_eol_comma(t, j, jj0, diags, nid), else: {diags, nid}
+
     jj =
       if tk(t, jj0) == :"," and tk(t, skip_eols(t, jj0 + 1)) == :"]",
         do: skip_eols(t, jj0 + 1),
@@ -1772,6 +1775,7 @@ defmodule Toxic2.Parser do
     jj = skip_eols(t, j)
 
     if tk(t, jj) == :"," do
+      {diags, nid} = check_eol_comma(t, j, jj, diags, nid)
       head_patterns(t, jj + 1, [pat | acc], diags, nid, fuel)
     else
       {:lists.reverse([pat | acc]), j, diags, nid, fuel}
@@ -1849,6 +1853,24 @@ defmodule Toxic2.Parser do
   end
 
   defp prev_non_eol(_t, i), do: i
+
+  # The yrl admits newlines after open delimiters, before close delimiters, and after commas —
+  # never between a completed element and its `,`: `[1\n, 2]`, `%{a: 1\n, b: 2}`, `f(1\n, 2)`,
+  # `fn a\n, b -> …` are all syntax errors (F3). Comments are dropped at lexing but their `:eol`
+  # tokens remain, so the comment-interleaved variant (`%{a: 1 # ,\n, b: 2}`, K8) is caught by
+  # the same token-level test.
+  defp check_eol_comma(t, pre, at_comma, diags, nid) do
+    if at_comma > pre do
+      {_id, diags, nid} =
+        Diagnostics.emit(diags, nid, :parser, :error, :unexpected_token, tok_span(t, at_comma), %{
+          kind: :","
+        })
+
+      {diags, nid}
+    else
+      {diags, nid}
+    end
+  end
 
   defp empty_stmt(t, i), do: CST.node(:empty_stmt, tok_span(t, i), [], :matched, nil)
 
@@ -2246,6 +2268,7 @@ defmodule Toxic2.Parser do
         {:lists.reverse(acc), i2 + 1, diags, nid, fuel}
 
       tk(t, i2) == :"," ->
+        {diags, nid} = check_eol_comma(t, i, i2, diags, nid)
         {diags, nid} = check_map_entry_np_comma(t, hd(acc), i2, diags, nid)
         map_entries(t, skip_eols(t, i2 + 1), acc, seen_kw, diags, nid, fuel)
 
@@ -2516,6 +2539,7 @@ defmodule Toxic2.Parser do
         {:lists.reverse(acc), i2 + 1, diags, nid, fuel}
 
       tk(t, i2) == :"," ->
+        {diags, nid} = check_eol_comma(t, i, i2, diags, nid)
         {diags, nid} = check_np_comma(mode, el, t, i2, diags, nid)
         seq_after_comma(t, i2, acc, seen_kw or is_kw, close, mode, diags, nid, fuel)
 
