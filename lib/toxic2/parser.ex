@@ -218,7 +218,7 @@ defmodule Toxic2.Parser do
   end
 
   defp parse_expr_np(t, i, lhs, min_bp, ctx, diags, nid, fuel) do
-    if np_callee?(lhs, t) and np_arg_start?(t, lhs, i) do
+    if np_callee?(lhs, t) and np_arg_start?(t, lhs, i, ctx) do
       {lhs, i, diags, nid, fuel} = maybe_no_parens(t, i, lhs, ctx, diags, nid, fuel)
       parse_expr_do(t, i, lhs, min_bp, ctx, diags, nid, fuel)
     else
@@ -292,7 +292,7 @@ defmodule Toxic2.Parser do
   # themselves parsed in `:no_parens`, so `f g a, b` makes the inner call absorb the commas
   # (`f(g(a, b))`, outer arity 1).
   defp maybe_no_parens(t, i, lhs, ctx, diags, nid, fuel) do
-    if np_callee?(lhs, t) and np_arg_start?(t, lhs, i) do
+    if np_callee?(lhs, t) and np_arg_start?(t, lhs, i, ctx) do
       {arg, j, is_kw, diags, nid, fuel} = parse_np_arg(t, i, diags, nid, fuel)
 
       # `:matched` normally caps a no-parens call at one arg, but a trailing `do` block makes a
@@ -529,14 +529,14 @@ defmodule Toxic2.Parser do
   defp np_callee?({:node, :remote_call, _sp, [_base, _name], _f, _d}, _t), do: true
   defp np_callee?(_lhs, _t), do: false
 
-  # Can a no-parens argument start at `i`, given the callee `lhs`? Generally requires a space after
-  # the callee (same line): `f -1` is a call (op adjacent to operand), `f - 1` is subtraction. A
-  # string/charlist/heredoc is unambiguous, so it may be ADJACENT — `foo"bar"` => `foo("bar")`,
-  # `Mix.shell().info"""…"""` => the heredoc is the argument.
-  defp np_arg_start?(t, lhs, i) do
+  # Can a no-parens argument start at `i`, given the callee `lhs`? Once the tokenizer has emitted a
+  # separate primary/prefix token, the yrl does not require whitespace (`f{1}`, `f%{}`, `f~s(x)`,
+  # `f!x`, `Kernel.+1`). Leading adjacent `+`/`-` remain infix (`f-1`), while `(` and `[` have
+  # already been reserved for paren-call/access postfixes.
+  defp np_arg_start?(t, lhs, i, ctx) do
     case {cst_span(t, lhs), tspan(t, i)} do
       {{_, _, el, ec}, {sl, sc, _, _}} when el == sl and ec <= sc ->
-        np_same_line_arg?(t, i, ec == sc)
+        np_same_line_arg?(t, i, ec == sc, ctx, lhs)
 
       # The arg sits on a LATER line than the callee yet the cursor reached it with no `:eol` token
       # between — only a `\`-newline line continuation does that, which joins them into one logical
@@ -559,16 +559,47 @@ defmodule Toxic2.Parser do
     end
   end
 
-  # Same-line argument start. `adjacent?` = no space between callee and token: only a
-  # string/charlist (`foo"bar"`) or an op-ref may start there — `f+/2`, `f|/2` (upstream's
-  # identifier+dual-op adjacency rule explicitly exempts a following `/`).
-  defp np_same_line_arg?(t, i, adjacent?) do
+  # Same-line argument start. `adjacent?` = no space between callee and token. Any separate
+  # primary/prefix token may begin the argument; the tokenizer has already resolved identifier
+  # suffixes and dot-context operator names. `+`/`-` are the exception: adjacent they remain infix
+  # unless followed by `/arity` (`f+/2`). Paren/access openers are handled by `postfix/8`.
+  defp np_same_line_arg?(t, i, adjacent?, ctx, lhs) do
     case tk(t, i) do
-      k when k in [:string_start, :charlist_start] -> true
-      k when adjacent? -> k in @op_ref_kinds and op_ref_slash?(t, i + 1)
+      k when adjacent? -> np_adjacent_arg_kind?(t, i, k, ctx, lhs)
       k -> np_arg_kind?(t, i, k)
     end
   end
+
+  defp np_adjacent_arg_kind?(_t, _i, :"{", :struct_name, _lhs), do: false
+
+  defp np_adjacent_arg_kind?(_t, _i, k, _ctx, _lhs) when k in [:"(", :"["],
+    do: false
+
+  defp np_adjacent_arg_kind?(t, i, :dual_op, _ctx, _lhs), do: op_ref_slash?(t, i + 1)
+  defp np_adjacent_arg_kind?(t, _i, :at_op, _ctx, lhs), do: adjacent_at_arg?(lhs, t)
+  defp np_adjacent_arg_kind?(t, i, k, _ctx, _lhs), do: np_arg_kind?(t, i, k)
+
+  # `foo@bar` is one invalid identifier upstream, while a suffix/operator boundary makes `@` a
+  # separate adjacent arg (`foo!@bar`, `Kernel.+@bar`). Toxic2 deliberately keeps source-derived
+  # names unatomized in the lexer, so reproduce that tokenizer boundary here.
+  defp adjacent_at_arg?({:token, idx, _f, _d}, t), do: bang_or_question_name?(tv(t, idx))
+
+  defp adjacent_at_arg?({:node, :remote_call, _sp, [_base, name], _f, _d}, t) do
+    case name do
+      {:token, idx, _tf, _td} ->
+        tk(t, idx) in @op_ref_kinds or bang_or_question_name?(tv(t, idx))
+
+      _ ->
+        false
+    end
+  end
+
+  defp adjacent_at_arg?(_lhs, _t), do: false
+
+  defp bang_or_question_name?(name) when is_binary(name),
+    do: String.ends_with?(name, "!") or String.ends_with?(name, "?")
+
+  defp bang_or_question_name?(_name), do: false
 
   # The operand may itself be a stacked `+`/`-` (`f +-var` => `f(+(-var))`) — only the FIRST
   # dual op needs the space-before/adjacent-after shape; the rest is an ordinary unary chain
@@ -618,6 +649,7 @@ defmodule Toxic2.Parser do
       :charlist_start,
       :sigil_start,
       :quoted_atom,
+      :ellipsis_op,
       :fn
     ]
   end
@@ -1860,7 +1892,7 @@ defmodule Toxic2.Parser do
 
   defp parse_struct(t, pct, diags, nid, fuel) do
     {name, j0, diags, nid, fuel} =
-      parse_expr(t, pct + 1, @struct_name_bp, :matched, diags, nid, fuel - 1)
+      parse_expr(t, pct + 1, @struct_name_bp, :struct_name, diags, nid, fuel - 1)
 
     # `map -> '%' map_base_expr eol map_args` admits an eol between the base and `{` (the lexer
     # collapses consecutive newlines into one eol token, so `%Foo\n{}` and `%Foo\n\n{}` both work).
@@ -2607,10 +2639,14 @@ defmodule Toxic2.Parser do
   # `..` / `...` in prefix (nud) position. `...` takes a low-precedence operand when one follows
   # (`...a + b` => `...(a + b)`); otherwise — and always for `..` — it's nullary (`{:.., [], []}`).
   @ellipsis_operand_bp 90
+
+  defp prefix_operand_ctx(ctx) when ctx in [:no_parens, :no_parens_arg, :struct_name], do: ctx
+  defp prefix_operand_ctx(_ctx), do: :matched
+
   defp parse_dotdot(t, i, kind, ctx, diags, nid, fuel) do
     op_leaf = ctoken(i)
     operand_start = skip_eols(t, i + 1)
-    op_ctx = if ctx in [:no_parens, :no_parens_arg], do: ctx, else: :matched
+    op_ctx = prefix_operand_ctx(ctx)
 
     if kind == :ellipsis_op and dotdot_operand?(t, operand_start) do
       {operand, k, diags, nid, fuel} =
@@ -2639,8 +2675,9 @@ defmodule Toxic2.Parser do
     operand_start = skip_eols(t, i + 1)
     # In a no-parens context the operand may itself be a multi-arg no-parens call: `@foo 1, 2`,
     # `-foo 1, 2`, `not bar :a, :b`. Inside brackets/parens it stays a single-arg `matched_expr`.
-    # Context is preserved (`:no_parens_arg` keeps a `do` attaching to the enclosing call).
-    op_ctx = if ctx in [:no_parens, :no_parens_arg], do: ctx, else: :matched
+    # Context is preserved (`:no_parens_arg` keeps a `do` attaching to the enclosing call;
+    # `:struct_name` keeps the following `{` as the struct-body delimiter through unary chains).
+    op_ctx = prefix_operand_ctx(ctx)
 
     {operand, k, diags, nid, fuel} =
       parse_unary_operand(prefix_bp, t, operand_start, op_ctx, diags, nid, fuel)
@@ -2676,7 +2713,8 @@ defmodule Toxic2.Parser do
   # then a no-parens call, then a do-block. Lower unaries (`!`/`^`/`+`/`-`/`not`, 300) bind LOOSER
   # than postfix — their operand is a full matched_expr (`!x.y` => `!(x.y)`).
   defp parse_unary_operand(prefix_bp, t, i, op_ctx, diags, nid, fuel) when prefix_bp >= 310 do
-    {lhs, j, diags, nid, fuel} = parse_prefix(t, i, :matched, diags, nid, fuel)
+    prefix_ctx = if op_ctx == :struct_name, do: :struct_name, else: :matched
+    {lhs, j, diags, nid, fuel} = parse_prefix(t, i, prefix_ctx, diags, nid, fuel)
     {lhs, j, diags, nid, fuel} = maybe_paren_call(t, j, lhs, diags, nid, fuel)
     {lhs, j, diags, nid, fuel} = maybe_no_parens(t, j, lhs, op_ctx, diags, nid, fuel)
     maybe_do_block(t, j, lhs, op_ctx, diags, nid, fuel)

@@ -403,6 +403,26 @@ defmodule Toxic2.ParserTest do
       assert {{:-, _, [{:f, _, nil}, 1]}, []} = Toxic2.parse_to_ast("f - 1")
     end
 
+    test "adjacent no-parens args preserve binary and postfix boundaries" do
+      assert {{:+, _, [{:f, _, nil}, 1]}, []} = Toxic2.parse_to_ast("f+1")
+      assert {{:-, _, [{:f, _, nil}, 1]}, []} = Toxic2.parse_to_ast("f-1")
+      assert {{:.., _, [{:f, _, nil}, {:x, _, nil}]}, []} = Toxic2.parse_to_ast("f..x")
+
+      assert {{{:., _, [Access, :get]}, _, [{:f, _, nil}, 1]}, []} =
+               Toxic2.parse_to_ast("f[1]")
+
+      assert {{:f, _, [1]}, []} = Toxic2.parse_to_ast("f(1)")
+
+      # The first `+` is the remote member; the adjacent `-` still starts binary subtraction.
+      assert {{:-, _, [{{:., _, [{:__aliases__, _, [:Kernel]}, :+]}, _, []}, 1]}, []} =
+               Toxic2.parse_to_ast("Kernel.+-1")
+
+      assert {{:foo!, _, [{:@, _, [{:x, _, nil}]}]}, []} = Toxic2.parse_to_ast("foo!@x")
+
+      {_ast, diags} = Toxic2.parse_to_ast("foo@bar")
+      assert Enum.any?(diags, &(elem(&1, 3) == :unexpected_token))
+    end
+
     test "a `\\`-newline joins a no-parens callee with an arg on the next line" do
       assert {{:@, _, [{:x, _, [{{:., _, [{:__aliases__, _, [:File]}, :foo]}, _, []}]}]}, []} =
                Toxic2.parse_to_ast("@x \\\nFile.foo()")
@@ -839,6 +859,9 @@ defmodule Toxic2.ParserTest do
                Toxic2.parse_to_ast("%mod{a: 1}")
 
       assert {{:%, _, [nil, {:%{}, _, []}]}, []} = Toxic2.parse_to_ast("%nil{}")
+
+      assert {{:%, _, [{:@, _, [{:+, _, [_]}]}, {:%{}, _, []}]}, []} =
+               Toxic2.parse_to_ast("%@+a.i{}")
     end
 
     test "@ binds tighter than dot/access: @x.y == (@x).y" do

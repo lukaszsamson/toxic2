@@ -96,6 +96,12 @@ defmodule Toxic2.TokenMetadataTest do
   describe "from_brackets: / from_interpolation:" do
     test "access uses from_brackets:", do: Enum.each(["foo[bar]", "a[b][c]"], &assert_parity/1)
 
+    test "multiline access records comment-aware newlines after [" do
+      assert_parity("a[\n  key\n]")
+      assert_parity("a[\n  b: 1\n]")
+      assert_parity("a[\n  # choose the key\n  key\n]")
+    end
+
     test "string interpolation uses from_interpolation:",
       do: Enum.each([~S("a#{b}c"), ~S(:"x#{y}")], &assert_parity/1)
   end
@@ -167,6 +173,31 @@ end|)
       assert_parity("not x in y")
     end
 
+    test "adjacent no-parens arguments match the tokenizer/yrl boundary" do
+      Enum.each(
+        [
+          "f{1}",
+          "f<<1>>",
+          "f%{}",
+          "f%Foo{}",
+          "f~s(x)",
+          "f&1",
+          "f^x",
+          "f~~~x",
+          "f...x",
+          "f!x",
+          "f?x",
+          "Kernel.+1",
+          "Kernel.-1",
+          "Kernel.++1",
+          "Kernel.+@x",
+          "Kernel.+foo: 1",
+          "Bitwise.~~~x"
+        ],
+        &assert_parity/1
+      )
+    end
+
     test "parenthesised multi-statement blocks carry closing: + anchor" do
       assert_parity("(\n a\n b\n)")
       assert_parity("(a; b)")
@@ -232,6 +263,9 @@ end|)
       assert_parity("fn (a, b) -> a end")
       assert_parity("fn () -> 1 end")
       assert_parity("fn({a, b}) -> x end")
+      assert_parity("fn (\n  a, b\n) -> a end")
+      assert_parity("fn (\n  [a], {b, c}\n) -> a end")
+      assert_parity("fn (\n  key: value\n) -> value end")
     end
 
     test "stab -> newlines count before OR after the arrow" do
@@ -276,6 +310,8 @@ end|)
       assert_parity("fn () when x -> y end")
       assert_parity("fn (a, b) when g -> y end")
       assert_parity("fn (a, b, c: 1) when g -> y end")
+      assert_parity("fn (\n  a, b\n)\nwhen g -> y end")
+      assert_parity("fn ()\nwhen g -> y end")
     end
 
     test "uppercase sigil names with digits scan the delimiter past the digits" do
@@ -382,6 +418,10 @@ end|)
 
     test "single-line call with a do-block: no spurious newlines key" do
       assert_key_order("foo(a) do\n  b\nend\n")
+    end
+
+    test "multiline access: from_brackets precedes newlines and closing" do
+      assert_key_order("a[\n  key\n]")
     end
   end
 end

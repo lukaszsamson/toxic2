@@ -140,6 +140,39 @@ defmodule Toxic2.YrlEdgeCasesTest do
     end
   end
 
+  describe "adjacent no-parens arguments (GRAMMAR_GAPS F1)" do
+    test "separate primary/prefix tokens do not require whitespace after a local callee" do
+      for src <- [
+            "f{1}",
+            "f<<1>>",
+            "f%{}",
+            "f%Foo{}",
+            "f~s(x)",
+            "f&1",
+            "f^x",
+            "f~~~x",
+            "f...x",
+            "f!x",
+            "f?x"
+          ] do
+        assert_accepted(src)
+      end
+    end
+
+    test "remote operator callees accept an adjacent argument token" do
+      for src <- [
+            "Kernel.+1",
+            "Kernel.-1",
+            "Kernel.++1",
+            "Kernel.+@x",
+            "Kernel.+foo: 1",
+            "Bitwise.~~~x"
+          ] do
+        assert_accepted(src)
+      end
+    end
+  end
+
   describe "container keyword lead (already enforced, pinned here)" do
     test "all-keyword tuple / bitstring rejected; lists allow it" do
       assert_rejected("{a: 1}")

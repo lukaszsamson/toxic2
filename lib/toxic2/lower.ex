@@ -767,8 +767,14 @@ defmodule Toxic2.Lower do
   # A parenthesised clause head (`fn (a, b) -> …`, `fn () -> …`, and the guarded `fn () when g -> …`)
   # records `parens: [line, column, closing: …]` on the `->` (the `(`…`)` span). The patterns are the
   # head children — unwrapped from a `stab_when` (which appends the guard) when a guard is present.
-  defp stab_parens_meta(args_node, view, opts) do
-    args_node |> stab_head_patterns() |> patterns_parens_meta(view, opts)
+  defp stab_parens_meta(args_node, view, _opts) do
+    case stab_parens_bounds(args_node, view) do
+      {{sl, sc, _, _}, {el, ec, _, _}} ->
+        [parens: [closing: [line: el, column: ec], line: sl, column: sc]]
+
+      nil ->
+        []
+    end
   end
 
   defp stab_head_patterns(args_node) do
@@ -778,23 +784,97 @@ defmodule Toxic2.Lower do
     end
   end
 
-  # An empty `()` head is a single empty `:paren` node; a non-empty parenthesised head is the bare
-  # patterns with a `(` just before the first and a `)` just after the last.
-  defp patterns_parens_meta([{:node, :paren, {sl, sc, el, ec}, [], _f, _d}], _view, _opts),
-    do: [parens: [closing: [line: el, column: ec - 1], line: sl, column: sc]]
+  # An empty `()` head is a single empty `:paren` node. A parenthesised multi/keyword-arg head is
+  # stored as bare patterns, so recover its delimiters from the token immediately outside the full
+  # first/last pattern spans. Using tokens (rather than same-line source slices) also handles
+  # newlines/comments and nested first/last patterns without mistaking punctuation in comments.
+  defp stab_parens_bounds(args_node, view) do
+    case stab_head_patterns(args_node) do
+      [{:node, :paren, {sl, sc, el, ec}, [], _f, _d}] ->
+        {{sl, sc, sl, sc + 1}, {el, ec - 1, el, ec}}
 
-  defp patterns_parens_meta([first | _] = pats, view, opts) do
-    with {asl, asc, _, _} when asc > 1 <- child_span(first, view),
-         {_, _, ael, aec} <- child_span(List.last(pats), view),
-         "(" <- src_slice(opts, {asl, asc - 1}, {asl, asc}),
-         ")" <- src_slice(opts, {ael, aec}, {ael, aec + 1}) do
-      [parens: [closing: [line: ael, column: aec], line: asl, column: asc - 1]]
-    else
-      _ -> []
+      [first | _] = pats ->
+        with first_i when is_integer(first_i) <- cst_first_token_index(first, view),
+             open_i when is_integer(open_i) <- previous_non_eol(view, first_i - 1),
+             :"(" <- tk(view, open_i),
+             last_i when is_integer(last_i) <- cst_last_token_index(List.last(pats), view),
+             close_i when is_integer(close_i) <- next_non_eol(view, last_i + 1),
+             :")" <- tk(view, close_i),
+             open_span when is_tuple(open_span) <- tspan(view, open_i),
+             close_span when is_tuple(close_span) <- tspan(view, close_i) do
+          {open_span, close_span}
+        else
+          _ -> nil
+        end
+
+      _ ->
+        nil
     end
   end
 
-  defp patterns_parens_meta(_pats, _view, _opts), do: []
+  defp cst_first_token_index({:token, i, _f, _d}, _view), do: i
+
+  defp cst_first_token_index({:node, _k, {sl, sc, _el, _ec}, children, _f, _d}, view) do
+    case Enum.find_value(children, &cst_first_token_index(&1, view)) do
+      i when is_integer(i) -> rewind_to_span_start(view, i, sl, sc)
+      _ -> nil
+    end
+  end
+
+  defp cst_first_token_index(_cst, _view), do: nil
+
+  defp rewind_to_span_start(view, i, sl, sc) when i >= 0 do
+    case tspan(view, i) do
+      {^sl, ^sc, _, _} ->
+        i
+
+      {tl, tc, _, _} when tl > sl or (tl == sl and tc > sc) ->
+        rewind_to_span_start(view, i - 1, sl, sc)
+
+      _ ->
+        i
+    end
+  end
+
+  defp rewind_to_span_start(_view, _i, _sl, _sc), do: nil
+
+  defp cst_last_token_index({:token, i, _f, _d}, _view), do: i
+
+  defp cst_last_token_index({:node, _k, {_sl, _sc, el, ec}, children, _f, _d}, view) do
+    case Enum.find_value(Enum.reverse(children), &cst_last_token_index(&1, view)) do
+      i when is_integer(i) -> advance_to_span_end(view, i, el, ec)
+      _ -> nil
+    end
+  end
+
+  defp cst_last_token_index(_cst, _view), do: nil
+
+  defp advance_to_span_end(view, i, el, ec) do
+    case tspan(view, i) do
+      {_, _, ^el, ^ec} ->
+        i
+
+      {_, _, tl, tc} when tl < el or (tl == el and tc < ec) ->
+        advance_to_span_end(view, i + 1, el, ec)
+
+      _ ->
+        i
+    end
+  end
+
+  defp previous_non_eol(view, i) when i >= 0 do
+    if tk(view, i) == :eol, do: previous_non_eol(view, i - 1), else: i
+  end
+
+  defp previous_non_eol(_view, _i), do: nil
+
+  defp next_non_eol(view, i) do
+    case tk(view, i) do
+      :eol -> next_non_eol(view, i + 1)
+      :eof -> nil
+      _ -> i
+    end
+  end
 
   # Where to begin scanning for the clause `->`: after the last pattern (so its text can't contain a
   # false `->`); for an empty head (`fn -> …`) there is no pattern, so start at the head's span start.
@@ -803,13 +883,28 @@ defmodule Toxic2.Lower do
       [] ->
         with({sl, sc, _, _} <- child_span(args_node, view), do: {sl, sc}, else: (_ -> nil))
 
+      # A guarded head must start after its guard, which also prevents `->` text inside the guard
+      # from being mistaken for the clause arrow.
+      [{:node, :stab_when, _sp, _ch, _f, _d}] = children ->
+        arrow_scan_start_after_last(children, view)
+
+      # For an unguarded parenthesised multi/keyword-arg or empty head, begin after `)`, not after
+      # the last pattern. Otherwise a line break before the closing delimiter becomes a false
+      # `newlines:` entry on `->`.
       children ->
-        with(
-          {_, _, el, ec} <- child_span(List.last(children), view),
-          do: {el, ec},
-          else: (_ -> nil)
-        )
+        case stab_parens_bounds(args_node, view) do
+          {_open, {_, _, el, ec}} -> {el, ec}
+          nil -> arrow_scan_start_after_last(children, view)
+        end
     end
+  end
+
+  defp arrow_scan_start_after_last(children, view) do
+    with(
+      {_, _, el, ec} <- child_span(List.last(children), view),
+      do: {el, ec},
+      else: (_ -> nil)
+    )
   end
 
   # newlines AFTER the `->` (comment-aware), scanning from just past the arrow.
@@ -2484,14 +2579,19 @@ defmodule Toxic2.Lower do
   defp child_span(child, _view), do: cspan(child)
 
   # `foo[bar]` => `{{:., dotmeta, [Access, :get]}, [], [foo, bar]}`. Under `token_metadata: true` the
-  # dot meta carries `from_brackets: true` + `closing:` (the `]` = node-span end − 1) and anchors at
-  # the opening `[` (= the base's span end).
+  # dot meta carries `from_brackets: true` + `closing:` (the `]` = node-span end − 1), anchors at
+  # the opening `[` (= the base's span end), and records comment-aware opening `newlines:`.
   defp access_dot_meta(_base, _cst, _view, %{token_metadata: false}), do: []
 
-  defp access_dot_meta(base, cst, view, _opts) do
+  defp access_dot_meta(base, cst, view, opts) do
     with {_, _, bel, bec} <- child_span(base, view),
          {_, _, el, ec} <- cspan(cst) do
-      [from_brackets: true, closing: [line: el, column: ec - 1], line: bel, column: bec]
+      tail = [closing: [line: el, column: ec - 1], line: bel, column: bec]
+
+      case gap_newlines(opts, bel, bec + 1) do
+        n when n > 0 -> [{:from_brackets, true}, {:newlines, n} | tail]
+        _ -> [{:from_brackets, true} | tail]
+      end
     else
       _ -> []
     end
@@ -2537,14 +2637,21 @@ defmodule Toxic2.Lower do
   # A trailing keyword run in the patterns is grouped into one keyword-list arg (`fn x, a: 1 -> …`
   # => `[x, [a: 1]]`), matching call/list args; the guard (always last) stays a separate element.
   # A clause-head `when` guard anchors at the `when` keyword (between the last pattern and the guard).
-  defp when_meta(pats, guard, view, opts) do
+  defp when_meta(args_node, pats, guard, view, opts) do
     with true <- tm?(opts),
          {_, _, pel, pec} <- pats |> List.last() |> then(&(&1 && child_span(&1, view))),
          {gsl, _, _, _} <- child_span(guard, view) do
       case scan_op(opts, pel, pec, "when", gsl) do
         [line: wl, column: wc] = w ->
           after_n = gap_newlines(opts, wl, wc + 4)
-          n = if after_n > 0, do: after_n, else: gap_newlines(opts, pel, pec)
+
+          n =
+            cond do
+              after_n > 0 -> after_n
+              stab_parens_bounds(args_node, view) != nil -> 0
+              true -> gap_newlines(opts, pel, pec)
+            end
+
           if n > 0, do: [{:newlines, n} | w], else: w
 
         w ->
@@ -2577,8 +2684,10 @@ defmodule Toxic2.Lower do
         {pat_asts, acc, nid} = lower_args(strip_empty_paren_head(pats), view, opts, acc, nid)
         {guard_ast, acc, nid} = lower(guard, view, opts, acc, nid)
 
-        {[{:when, when_meta(pats, guard, view, opts), Enum.concat(pat_asts, [guard_ast])}], acc,
-         nid}
+        {[
+           {:when, when_meta(args_node, pats, guard, view, opts),
+            Enum.concat(pat_asts, [guard_ast])}
+         ], acc, nid}
 
       # `fn () -> ... end`: an empty parenthesised head is ZERO args (`[]`), not one block arg.
       [{:node, :paren, _sp, [], _f, _d}] ->
