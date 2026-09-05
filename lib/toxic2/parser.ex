@@ -227,7 +227,7 @@ defmodule Toxic2.Parser do
   end
 
   defp parse_expr_do(t, i, lhs, min_bp, ctx, diags, nid, fuel) do
-    if ctx != :no_parens_arg and do_block_ahead?(t, i) do
+    if ctx not in [:no_parens_arg, :struct_name] and do_block_ahead?(t, i) do
       {lhs, i, diags, nid, fuel} = maybe_do_block(t, i, lhs, ctx, diags, nid, fuel)
       led(t, i, lhs, min_bp, ctx, diags, nid, fuel)
     else
@@ -246,7 +246,9 @@ defmodule Toxic2.Parser do
   # invalid), so a same-line `do` is needed there.
   defp maybe_do_block(t, i, lhs, ctx, diags, nid, fuel) do
     cond do
-      ctx == :no_parens_arg ->
+      # `:struct_name`: upstream's `map_base_expr` has no block member, so `%if a do b end{}`
+      # must leave the `do` unconsumed and fail the struct-body check (K5).
+      ctx in [:no_parens_arg, :struct_name] ->
         {lhs, i, diags, nid, fuel}
 
       tk(t, i) == :do and do_attachable?(lhs, t) ->
@@ -632,9 +634,10 @@ defmodule Toxic2.Parser do
   # (`f +- var` is still a call). A following `/` makes it an op-ref arg instead, where the
   # adjacency rule does NOT apply (`f +/2` and `f + / 2` are both `f(+/2)`).
   defp np_arg_kind?(t, i, :dual_op) do
+    # A signed NULLARY range is a valid operand too: `f +..` => `f(+(..))` (R12).
     op_ref_slash?(t, i + 1) or
       (Tokens.adjacent?(t, i, i + 1) and
-         (np_first_kind?(tk(t, i + 1)) or tk(t, i + 1) == :dual_op))
+         (np_first_kind?(tk(t, i + 1)) or tk(t, i + 1) in [:dual_op, :range_op]))
   end
 
   # `not` starts an arg (`f not x`) unless it is the `not in` operator (`a not in b`).
@@ -854,6 +857,13 @@ defmodule Toxic2.Parser do
   # `a[b]`. A keyword-list index (`a[k: 1, j: 2]`) is the index `[k: 1, j: 2]`: parse the bracket
   # as a list sequence and use that list node as the single index.
   defp access(t, open, lhs, ctx, diags, nid, fuel) do
+    {node, j, diags, nid, fuel} = access_node(t, open, lhs, diags, nid, fuel)
+    postfix(t, j, node, ctx, diags, nid, fuel)
+  end
+
+  # The access node itself, WITHOUT the trailing postfix pass (the `@`-operand path must not let
+  # a following `.`/`(` bind inside the `@`).
+  defp access_node(t, open, lhs, diags, nid, fuel) do
     # `a[foo: 1]` / `a['foo': 1]` — a keyword (bare or quoted key) index is a keyword-list arg.
     if kw_data_start?(t, skip_eols(t, open + 1)) do
       {elems, j, diags, nid, fuel} = parse_seq(t, open + 1, :"]", :list, diags, nid, fuel)
@@ -862,13 +872,13 @@ defmodule Toxic2.Parser do
       node =
         CST.node(:access, merge_ct(t, lhs, j - 1), [lhs, idx], :matched, nil)
 
-      postfix(t, j, node, ctx, diags, nid, fuel)
+      {node, j, diags, nid, fuel}
     else
-      access_index(t, open, lhs, ctx, diags, nid, fuel)
+      access_index(t, open, lhs, diags, nid, fuel)
     end
   end
 
-  defp access_index(t, open, lhs, ctx, diags, nid, fuel) do
+  defp access_index(t, open, lhs, diags, nid, fuel) do
     # A newline after `[` is allowed before the index (`foo[\n:bar]`).
     {idx, j, diags, nid, fuel} =
       parse_expr(t, skip_eols(t, open + 1), 0, :matched, diags, nid, fuel - 1)
@@ -895,7 +905,7 @@ defmodule Toxic2.Parser do
       node =
         CST.node(:access, merge_ct(t, lhs, jj), [lhs, idx], :matched, nil)
 
-      postfix(t, jj + 1, node, ctx, diags, nid, fuel)
+      {node, jj + 1, diags, nid, fuel}
     else
       {id, diags, nid} =
         Diagnostics.emit(diags, nid, :parser, :error, :expected_rbracket, tok_span(t, jj), %{})
@@ -1736,7 +1746,23 @@ defmodule Toxic2.Parser do
 
     {guard, j, diags, nid, fuel} =
       if kw_data_start?(t, guard_start) do
-        when_kw_rhs(t, guard_start, diags, nid, fuel)
+        # `stab_parens_many when_op expr`: a bare keyword list is NOT an `expr` here —
+        # `fn (a, b) when c: 1 -> 2 end` is upstream's syntax error (F4). Parse it anyway for a
+        # tolerant tree, but diagnose.
+        {guard, j, diags, nid, fuel} = when_kw_rhs(t, guard_start, diags, nid, fuel)
+
+        {_id, diags, nid} =
+          Diagnostics.emit(
+            diags,
+            nid,
+            :parser,
+            :error,
+            :unexpected_token,
+            tok_span(t, guard_start),
+            %{kind: tk(t, guard_start)}
+          )
+
+        {guard, j, diags, nid, fuel}
       else
         parse_expr(t, guard_start, 0, :no_parens_arg, diags, nid, fuel - 1)
       end
@@ -2467,7 +2493,7 @@ defmodule Toxic2.Parser do
   end
 
   defp map_base_entry?({:node, kind, _sp, _ch, _f, _d} = node, _t) do
-    kind not in [:binary_op, :np_call] and CST.category(node) != :no_parens and
+    kind not in [:binary_op, :np_call, :not_in_op] and CST.category(node) != :no_parens and
       not has_do_block?(node)
   end
 
@@ -2917,7 +2943,9 @@ defmodule Toxic2.Parser do
 
   defp parse_dotdot(t, i, kind, ctx, diags, nid, fuel) do
     op_leaf = ctoken(i)
-    operand_start = skip_eols(t, i + 1)
+    # NO eol skip: the grammar has no `ellipsis_op eol` production, so `...\nx` is nullary `...`
+    # followed by a new statement (R11).
+    operand_start = i + 1
     op_ctx = prefix_operand_ctx(ctx)
 
     if kind == :ellipsis_op and dotdot_operand?(t, operand_start) do
@@ -2938,6 +2966,8 @@ defmodule Toxic2.Parser do
       # binary range whose left side is the nullary `...` (`... .. 1` => `(...) .. 1`).
       :dual_op -> true
       :ellipsis_op -> true
+      # a fused `not in` is the infix operator, not a `not …` operand (`... not in x`, R11)
+      :unary_op -> not not_in?(t, i)
       k -> np_first_kind?(k)
     end
   end
@@ -2988,13 +3018,39 @@ defmodule Toxic2.Parser do
   defp parse_unary_operand(prefix_bp, t, i, op_ctx, diags, nid, fuel) when prefix_bp >= 310 do
     prefix_ctx = if op_ctx == :struct_name, do: :struct_name, else: :matched
     {lhs, j, diags, nid, fuel} = parse_prefix(t, i, prefix_ctx, diags, nid, fuel)
+    # `@@f[x]` — the inner `@f[x]` is a `bracket_at_expr` (an access_expr), so the bracket binds
+    # INSIDE the outer `@`: `@(Access.get(@f, x))` (R9). Only for an at/unary operand node; the
+    # ordinary `@f[x]` bracket attaches in the caller's postfix pass as before.
+    {lhs, j, diags, nid, fuel} = maybe_at_bracket(t, j, lhs, diags, nid, fuel)
     {lhs, j, diags, nid, fuel} = maybe_paren_call(t, j, lhs, diags, nid, fuel)
+    # `parens_call` allows a SECOND adjacent group (`@f()(1)`, `@f(1)(2)`) — R8.
+    {lhs, j, diags, nid, fuel} = maybe_second_paren_group(t, j, lhs, diags, nid, fuel)
     {lhs, j, diags, nid, fuel} = maybe_no_parens(t, j, lhs, op_ctx, diags, nid, fuel)
     maybe_do_block(t, j, lhs, op_ctx, diags, nid, fuel)
   end
 
   defp parse_unary_operand(prefix_bp, t, i, op_ctx, diags, nid, fuel),
     do: parse_expr(t, i, prefix_bp, op_ctx, diags, nid, fuel - 1)
+
+  defp maybe_at_bracket(t, i, {:node, :unary_op, _, _, _, _} = lhs, diags, nid, fuel) do
+    if tk(t, i) == :"[" and cst_ends_at_token?(t, lhs, i) do
+      access_node(t, i, lhs, diags, nid, fuel)
+    else
+      {lhs, i, diags, nid, fuel}
+    end
+  end
+
+  defp maybe_at_bracket(_t, i, lhs, diags, nid, fuel), do: {lhs, i, diags, nid, fuel}
+
+  defp maybe_second_paren_group(t, i, lhs, diags, nid, fuel) do
+    if paren_call?(t, lhs, i, 1) do
+      {args, j, diags, nid, fuel} = parse_seq(t, i + 1, :")", :call, diags, nid, fuel)
+      span = merge_ct(t, lhs, j - 1)
+      {CST.node(:call, span, [lhs | args], :matched, nil), j, diags, nid, fuel}
+    else
+      {lhs, i, diags, nid, fuel}
+    end
+  end
 
   # One adjacent paren call (`callback(spec)`), used by the `@` operand — `@foo(x)` => `@(foo(x))`.
   defp maybe_paren_call(t, i, lhs, diags, nid, fuel) do

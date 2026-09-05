@@ -200,6 +200,60 @@ defmodule Toxic2.YrlEdgeCasesTest do
     end
   end
 
+  describe "P4 parser gaps (OX3, R12, F4, K5, R8, R9, R11)" do
+    test "OX3: `not in`-rooted bare map entries are invalid" do
+      assert_rejected("%{a not in b}")
+      assert_rejected("%{m | a not in b}")
+    end
+
+    test "R12: a signed nullary range is a no-parens argument" do
+      assert {{:f, _, [{:+, _, [{:.., _, []}]}]}, []} = Toxic2.parse_to_ast("f +..")
+
+      assert {{:-, _, [{{:., _, [_, :f]}, _, []}, {:.., _, []}]}, []} =
+               Toxic2.parse_to_ast("A.f - ..")
+
+      assert_accepted("A.f -..")
+    end
+
+    test "F4: a parenthesised multi-arg head rejects a keyword-list guard" do
+      assert_rejected("fn (a, b) when c: 1 -> 2 end")
+      assert_accepted("fn (a, b) when g -> 2 end")
+      assert_accepted("fn a when c: 1 -> 2 end")
+    end
+
+    test "K5: do-block calls are not struct bases" do
+      for src <- [
+            "%if a do b end{}",
+            "%case a do b -> b end{}",
+            "%x do y end{}",
+            "%f a do b end{}"
+          ] do
+        assert_rejected(src)
+      end
+
+      assert_accepted("%f(x){}")
+      assert_accepted("%if(a, do: b){}")
+    end
+
+    test "R8/R9: attribute operands take a second paren group and inner bracket access" do
+      assert_accepted("@f()(1)")
+      assert_accepted("@f(1)(2)")
+      assert_rejected("@f(1)(2)(3)")
+
+      assert {{:@, _, [{{:., _, [Access, :get]}, _, [{:@, _, [{:f, _, nil}]}, {:x, _, nil}]}]},
+              []} = Toxic2.parse_to_ast("@@f[x]")
+    end
+
+    test "R11: ellipsis takes no eol before its operand; `not in` is not an operand" do
+      assert {{:__block__, _, [{:..., _, []}, {:x, _, nil}]}, []} = Toxic2.parse_to_ast("...\nx")
+
+      assert {{:not, _, [{:in, _, [{:..., _, []}, {:x, _, nil}]}]}, []} =
+               Toxic2.parse_to_ast("... not in x")
+
+      assert {{:..., _, [{:x, _, nil}]}, []} = Toxic2.parse_to_ast("... x")
+    end
+  end
+
   describe "newline before comma (GRAMMAR_GAPS F3 + K8)" do
     test "an eol between an element and its comma is an error in every container" do
       for src <- [
