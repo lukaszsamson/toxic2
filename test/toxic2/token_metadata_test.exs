@@ -96,6 +96,13 @@ defmodule Toxic2.TokenMetadataTest do
   describe "from_brackets: / from_interpolation:" do
     test "access uses from_brackets:", do: Enum.each(["foo[bar]", "a[b][c]"], &assert_parity/1)
 
+    test "spaced access anchors the dot at the [" do
+      Enum.each(
+        ["f() [0]", "(x) [0]", "Foo [0]", "a.b() [0]", "%{} [0]", "f() [a: 1]", "f() [\n  0\n]"],
+        &assert_parity/1
+      )
+    end
+
     test "multiline access records comment-aware newlines after [" do
       assert_parity("a[\n  key\n]")
       assert_parity("a[\n  b: 1\n]")

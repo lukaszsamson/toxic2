@@ -140,6 +140,30 @@ defmodule Toxic2.YrlEdgeCasesTest do
     end
   end
 
+  describe "spaced bracket access (GRAMMAR_GAPS R1/R2)" do
+    test "any access_expr base takes a spaced bracket_arg" do
+      for src <- ["f() [0]", "(x) [0]", "Foo [0]", "%{} [0]", "a.b() [0]", "1 [0]", "&1 [0]"] do
+        assert_accepted(src)
+      end
+    end
+
+    test "identifier-like callees keep the tokenizer's adjacency distinction" do
+      # spaced `f [0]` / `a.b [0]` stay no-parens calls with a list argument
+      assert {{:f, _, [[0]]}, []} = Toxic2.parse_to_ast("f [0]")
+
+      assert {{{:., _, [{:a, _, nil}, :b]}, _, [[0]]}, []} = Toxic2.parse_to_ast("a.b [0]")
+
+      assert {{{:., _, [Access, :get]}, _, [{:f, _, nil}, 0]}, []} = Toxic2.parse_to_ast("f[0]")
+    end
+
+    test "a nullary range is not an access base; a completed a.b() is not a no-parens callee" do
+      assert_rejected("..[0]")
+      assert_accepted("(..)[0]")
+      assert_rejected("a.b() 1")
+      assert_rejected("a.b() x: 1")
+    end
+  end
+
   describe "adjacent no-parens arguments (GRAMMAR_GAPS F1)" do
     test "separate primary/prefix tokens do not require whitespace after a local callee" do
       for src <- [

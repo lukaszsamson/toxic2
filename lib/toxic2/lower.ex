@@ -2551,7 +2551,7 @@ defmodule Toxic2.Lower do
   defp lower_access([base, idx | _missing], cst, view, opts, acc, nid) do
     {b, acc, nid} = lower(base, view, opts, acc, nid)
     {k, acc, nid} = lower_bracket_arg(idx, view, opts, acc, nid)
-    dm = access_dot_meta(base, cst, view, opts)
+    dm = access_dot_meta(base, idx, cst, view, opts)
     {{{:., dm, [Access, :get]}, dm, [b, k]}, acc, nid}
   end
 
@@ -2578,17 +2578,20 @@ defmodule Toxic2.Lower do
   defp child_span({:token, idx, _f, _d}, view), do: tspan(view, idx)
   defp child_span(child, _view), do: cspan(child)
 
-  # `foo[bar]` => `{{:., dotmeta, [Access, :get]}, [], [foo, bar]}`. Under `token_metadata: true` the
-  # dot meta carries `from_brackets: true` + `closing:` (the `]` = node-span end − 1), anchors at
-  # the opening `[` (= the base's span end), and records comment-aware opening `newlines:`.
-  defp access_dot_meta(_base, _cst, _view, %{token_metadata: false}), do: []
+  # `foo[bar]` => `{{:., dotmeta, [Access, :get]}, [], [foo, bar]}`. Under `token_metadata: true`
+  # the dot meta carries `from_brackets: true` + `closing:` (the `]` = node-span end − 1), anchors
+  # at the opening `[` (= the index list child's span start — the base may be separated from the
+  # bracket by whitespace: `f() [0]`), and records comment-aware opening `newlines:`.
+  defp access_dot_meta(_base, _idx, _cst, _view, %{token_metadata: false}), do: []
 
-  defp access_dot_meta(base, cst, view, opts) do
+  defp access_dot_meta(base, idx, cst, view, opts) do
     with {_, _, bel, bec} <- child_span(base, view),
+         {isl, _, _, _} <- child_span(idx, view),
+         [line: bl, column: bc] <- scan_op(opts, bel, bec, "[", isl),
          {_, _, el, ec} <- cspan(cst) do
-      tail = [closing: [line: el, column: ec - 1], line: bel, column: bec]
+      tail = [closing: [line: el, column: ec - 1], line: bl, column: bc]
 
-      case gap_newlines(opts, bel, bec + 1) do
+      case gap_newlines(opts, bl, bc + 1) do
         n when n > 0 -> [{:from_brackets, true}, {:newlines, n} | tail]
         _ -> [{:from_brackets, true} | tail]
       end

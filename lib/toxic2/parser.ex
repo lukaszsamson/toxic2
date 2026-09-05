@@ -526,8 +526,18 @@ defmodule Toxic2.Parser do
   defp op_ref_slash?(t, i), do: tk(t, i) == :mult_op and tv(t, i) == :/
 
   defp np_callee?({:token, idx, _f, _d}, t), do: tk(t, idx) == :identifier
-  defp np_callee?({:node, :remote_call, _sp, [_base, _name], _f, _d}, _t), do: true
+
+  # A bare `a.b` (dot_identifier) may take no-parens args; a COMPLETED zero-arg parens call
+  # `a.b()` has the same two-child shape but its span extends past the name to the `)` — the yrl
+  # only admits dot_identifier/dot_op_identifier as no-parens callees, never a parens_call, so
+  # `a.b() 1` must stay an error rather than silently become `a.b(1)`.
+  defp np_callee?({:node, :remote_call, sp, [_base, name], _f, _d}, t),
+    do: span_end(sp) != nil and span_end(sp) == span_end(cst_span(t, name))
+
   defp np_callee?(_lhs, _t), do: false
+
+  defp span_end({_, _, el, ec}), do: {el, ec}
+  defp span_end(_), do: nil
 
   # Can a no-parens argument start at `i`, given the callee `lhs`? Once the tokenizer has emitted a
   # separate primary/prefix token, the yrl does not require whitespace (`f{1}`, `f%{}`, `f~s(x)`,
@@ -721,10 +731,61 @@ defmodule Toxic2.Parser do
     :xor_op
   ]
 
-  # `a[b]` access when `[` is adjacent to the primary (spaced `a [b]` is a no-parens call, phase 8).
+  # `a[b]` access. The yrl's `bracket_expr -> access_expr bracket_arg` does not require the `[`
+  # to be adjacent — `f() [0]`, `Foo [0]`, `%{} [0]` are all access (an eol still ends the
+  # expression: `[` after `:eol` never reaches here). Adjacency only matters for identifier-like
+  # callees, where the TOKENIZER decides: `f[0]`/`a.b[0]` are bracket_identifier access while
+  # spaced `f [0]`/`a.b [0]` are no-parens calls with a list argument.
   defp access?(t, lhs, i) do
-    tk(t, i) == :"[" and cst_ends_at_token?(t, lhs, i)
+    tk(t, i) == :"[" and
+      access_base?(t, lhs, cst_ends_at_token?(t, lhs, i))
   end
+
+  # A nullary `..`/`...` (one-child unary node) is not an `access_expr`: `..[0]` is an error
+  # upstream, `(..)[0]` is fine.
+  defp access_base?(_t, {:node, :unary_op, _sp, [_op], _f, _d}, _adjacent?), do: false
+
+  defp access_base?(_t, {:node, :unary_op, _sp, _ch, _f, _d}, adjacent?), do: adjacent?
+
+  defp access_base?(t, {:token, idx, _f, _d}, adjacent?) do
+    case tk(t, idx) do
+      :identifier -> adjacent?
+      # `&1` is one atomic `capture_int` token and IS an access_expr (`&1 [0]` is access)
+      k -> k in [:int, :flt, :char, :atom, :literal, :alias, :capture_int]
+    end
+  end
+
+  defp access_base?(t, {:node, :remote_call, _sp, [_base, _name], _f, _d} = node, adjacent?) do
+    # Bare `a.b` (dot_identifier) is a no-parens callee — access needs adjacency; a completed
+    # `a.b()` parens call is an ordinary matched base.
+    if np_callee?(node, t), do: adjacent?, else: true
+  end
+
+  defp access_base?(_t, {:node, kind, _sp, _ch, _f, _d} = node, _adjacent?) do
+    not has_do_block?(node) and
+      kind in [
+        :call,
+        :anon_call,
+        :remote_call,
+        :access,
+        :alias,
+        :paren,
+        :list,
+        :tuple,
+        :map,
+        :map_update,
+        :struct,
+        :bitstring,
+        :string,
+        :charlist,
+        :heredoc,
+        :sigil,
+        :quoted_atom,
+        :fn
+      ]
+  end
+
+  defp access_base?(_t, _lhs, _adjacent?), do: false
 
   defp adjacent_after?({_, _, el, ec}, {sl, sc, _, _}), do: el == sl and ec == sc
   defp adjacent_after?(_, _), do: false
