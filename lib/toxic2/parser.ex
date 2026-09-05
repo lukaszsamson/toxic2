@@ -756,7 +756,8 @@ defmodule Toxic2.Parser do
     case tk(t, idx) do
       :identifier -> adjacent?
       # `&1` is one atomic `capture_int` token and IS an access_expr (`&1 [0]` is access)
-      k -> k in [:int, :flt, :char, :atom, :literal, :alias, :capture_int]
+      k when k in [:int, :flt, :char, :atom, :literal, :alias, :capture_int] -> true
+      _ -> false
     end
   end
 
@@ -766,28 +767,28 @@ defmodule Toxic2.Parser do
     if np_callee?(node, t), do: adjacent?, else: true
   end
 
-  defp access_base?(_t, {:node, kind, _sp, _ch, _f, _d} = node, _adjacent?) do
-    not has_do_block?(node) and
-      kind in [
-        :call,
-        :anon_call,
-        :remote_call,
-        :access,
-        :alias,
-        :paren,
-        :list,
-        :tuple,
-        :map,
-        :map_update,
-        :struct,
-        :bitstring,
-        :string,
-        :charlist,
-        :heredoc,
-        :sigil,
-        :quoted_atom,
-        :fn
-      ]
+  defp access_base?(_t, {:node, kind, _sp, _ch, _f, _d} = node, _adjacent?)
+       when kind in [
+              :call,
+              :anon_call,
+              :remote_call,
+              :access,
+              :alias,
+              :paren,
+              :list,
+              :tuple,
+              :map,
+              :map_update,
+              :struct,
+              :bitstring,
+              :string,
+              :charlist,
+              :heredoc,
+              :sigil,
+              :quoted_atom,
+              :fn
+            ] do
+    not has_do_block?(node)
   end
 
   defp access_base?(_t, _lhs, _adjacent?), do: false
