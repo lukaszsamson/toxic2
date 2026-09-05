@@ -173,6 +173,22 @@ end|)
       assert_parity("not x in y")
     end
 
+    test "unary ops over do-end blocks split per precedence (elixir@2e9ce85e9)" do
+      Enum.each(
+        [
+          "!if a do b end || c",
+          "not case x do y -> z end and w",
+          "-if a do\n  b\nend + c",
+          "@if a do b end || c",
+          "&if a do b end || c",
+          "&if a do b end when c",
+          "...if a do b end when c",
+          "!&if a do b end || c"
+        ],
+        &assert_parity/1
+      )
+    end
+
     test "adjacent no-parens arguments match the tokenizer/yrl boundary" do
       Enum.each(
         [

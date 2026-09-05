@@ -2682,14 +2682,15 @@ defmodule Toxic2.Parser do
     {operand, k, diags, nid, fuel} =
       parse_unary_operand(prefix_bp, t, operand_start, op_ctx, diags, nid, fuel)
 
-    # Elixir's `unary_op_eol expr` for an UNMATCHED operand (one ending in a `do … end` block): the
-    # unary becomes greedy and captures the whole trailing operator chain, so `not quote do x end ||
-    # b` is `not(quote(…) || b)` (not `(not quote(…)) || b`) and `@foo try do 1 end..1//2` is
-    # `@(foo(try) do 1 end .. 1 // 2)`. A MATCHED operand keeps the normal tight binding
-    # (`not a || b` => `(not a) || b`, `@x..1` => `(@x)..1`). The distinction is the do-block.
+    # Elixir's `unary_op_eol unmatched_expr` (since elixir@2e9ce85e9): an operand ending in a
+    # `do … end` block continues its trailing operator chain under the unary's own precedence,
+    # exactly like a matched operand — `!if a do b end || c` is `(!if …) || c` (`!` 300 beats `||`
+    # 130) while `&if a do b end || c` stays `&(if … || c)` (capture 90 loses to `||`). The operand
+    # parse stops at the do-block, so re-enter the led loop with `prefix_bp` to attach what binds
+    # tighter than this unary.
     {operand, k, diags, nid, fuel} =
       if has_do_block?(operand) do
-        led(t, k, operand, 0, op_ctx, diags, nid, fuel)
+        led(t, k, operand, prefix_bp, op_ctx, diags, nid, fuel)
       else
         {operand, k, diags, nid, fuel}
       end

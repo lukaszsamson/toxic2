@@ -16,6 +16,13 @@ defmodule Toxic2.ParserTest do
     {view, CST.children(cst), diags}
   end
 
+  # Meta-stripped AST for `a == b` source-equivalence assertions (upstream parser_test style).
+  defp ast!(src) do
+    {ast, diags} = Toxic2.parse_to_ast(src)
+    assert Enum.empty?(diags), "unexpected diagnostics for #{inspect(src)}: #{inspect(diags)}"
+    Macro.prewalk(ast, &Macro.update_meta(&1, fn _ -> [] end))
+  end
+
   defp child(node, n), do: Enum.at(CST.children(node), n)
   defp opv(view, node, at), do: Tokens.value(view, CST.token_index(child(node, at)))
   defp leaf_val(view, node), do: Tokens.value(view, CST.token_index(node))
@@ -91,6 +98,35 @@ defmodule Toxic2.ParserTest do
       {_view, [e], []} = exprs("-1 + 2")
       assert CST.node_kind(e) == :binary_op
       assert CST.node_kind(child(e, 0)) == :unary_op
+    end
+
+    # Ported from elixir@2e9ce85e9 ("Fix precedence when parsing unary ops with do-end blocks"):
+    # a do-block operand no longer makes the unary greedy — trailing binary ops attach per the
+    # unary's own precedence (`!`/`not`/`-`/`@` beat `||`/`and`/`+`; capture `&`/`...` lose to
+    # `||` but beat `when`).
+    test "unary ops with do-end blocks follow operator precedence" do
+      assert ast!("!if a do b end || !if b do c end") ==
+               ast!("!(if a do b end) || !(if b do c end)")
+
+      assert ast!("not case x do y -> z end and w") ==
+               ast!("not(case x do y -> z end) and w")
+
+      assert ast!("!!if a do b end || c") == ast!("!!(if a do b end) || c")
+      assert ast!("-if a do b end + c") == ast!("-(if a do b end) + c")
+      assert ast!("@if a do b end || c") == ast!("@(if a do b end) || c")
+
+      assert ast!("&if a do b end || c") == ast!("&(if a do b end || c)")
+      assert ast!("&if a do b end when c") == ast!("(&(if a do b end)) when c")
+      assert ast!("...if a do b end || c") == ast!("...(if a do b end || c)")
+      assert ast!("...if a do b end when c") == ast!("(...(if a do b end)) when c")
+
+      assert ast!("!@if a do b end || c") == ast!("!@(if a do b end) || c")
+      assert ast!("!&if a do b end || c") == ast!("!(&(if a do b end || c))")
+      assert ast!("&!if a do b end || c") == ast!("&(!(if a do b end) || c)")
+      assert ast!("...!if a do b end || c") == ast!("...(!(if a do b end) || c)")
+
+      assert ast!("!foo a, b") == ast!("!foo(a, b)")
+      assert ast!("!foo || if a do b end") == ast!("!foo || (if a do b end)")
     end
 
     test "`..`/`...` are nullary, and `...` is a low-precedence unary prefix" do
