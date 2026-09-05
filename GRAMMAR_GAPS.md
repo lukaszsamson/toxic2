@@ -22,8 +22,9 @@
 > regressions. No crashes occurred.
 
 > **AUDITS MERGED (2026-09-05):** two further independent audits are appended at the bottom of this
-> file — the OX audit (2026-08-23, OX1–OX4) and the KIMI audit (2026-08-24, K1–K15). All of their
-> findings were re-verified as still open after the F1/F5/F6 fixes.
+> file — the OX audit (2026-08-23, OX1–OX4), the KIMI audit (2026-08-24, K1–K15), and the GPT
+> review (2026-09-05, R1–R20; reproducer harness in `grammar_review_20260905.exs`). All of their
+> findings were verified against the tree at the date each was merged.
 
 ## Follow-up findings (2026-07-18)
 
@@ -919,3 +920,356 @@ identical `literal_encoder` modes; oracle invocations used the unmodified
 inputs. Harness left at
 `/var/folders/5t/z9kkxlhn4w769jqmn00xqqkw0000gn/T/opencode/kimi_probe.exs`
 (ephemeral).
+
+---------------------------------------------------------------------------
+
+## GPT review — parser and lexer audit (2026-09-05, R1–R20)
+
+**The implementation is not grammar-complete.** This review confirmed 20 additional finding
+groups beyond the entries earlier in this file and in `test/toxic2/FUZZER_GAPS.md`.
+Eighteen affect acceptance or AST structure; two are metadata-only. Some are obscure grammar
+edges, but spaced access, heredoc contents, keyword names, and incorrect keyword ownership
+are useful cases to fix independently of the older fuzzer backlog.
+
+No implementation fixes were made. The reduced, report-only reproducer is
+[`grammar_review_20260905.exs`](grammar_review_20260905.exs). It includes controls, runs both
+structural and full token-metadata comparisons, and prints differences. Add `--details` to see
+the actual oracle result, Toxic2 AST, and diagnostics for each difference:
+
+```sh
+MIX_OS_CONCURRENCY_LOCK=0 PATH=~/elixir/bin:$PATH mix run grammar_review_20260905.exs --details
+```
+
+`MIX_OS_CONCURRENCY_LOCK=0` was needed because this review environment prevents Mix's TCP lock.
+The parser oracle is the Elixir executable built from the requested checkout, not the default
+asdf executable.
+
+### Scope and evidence
+
+- Toxic2 commit: `535c3f084c730fe087479e046ae4c7760f2e20a9`.
+- Reference: `~/elixir`, commit `2e9ce85e91c8beef41dc0826c6666a44e6fa6913`, Elixir 1.21.0-dev,
+  OTP 28. Compared `elixir_parser.yrl`, `elixir_tokenizer.erl`, and `elixir_interpolation.erl`
+  with the lexer, parser, precedence table, token view, and lowerer.
+- Default tests: **1,057 passed, 2 excluded**.
+- Imported parser gate: **7,510 frozen cases preserved**; overall 7,584/7,615 green, 31 backlog.
+- Imported lexer gate: **774/774 green**.
+- Additional probes: 14,401 generated grammar combinations; 571 selected full-metadata
+  comparisons; separate targeted batches of 680 lexer cases, 257 boundary/attribute cases,
+  213 capture/ellipsis/operator/control-character cases, 56 remote-call cases, and 60
+  operator/slash cases. These batches overlap. Mismatch counts include known gaps and are
+  not counts of independent bugs.
+- No Toxic2 crash occurred in the completed differential batches. Structural comparisons
+  recursively remove metadata; metadata comparisons use identical `columns: true`,
+  `token_metadata: true`, and literal encoders. Warning-count parity was not exhaustively tested.
+- Saved reduced harness: **82 source cases / 164 comparisons**: 30 false-error comparisons,
+  30 wrong-AST comparisons, 48 missed-error comparisons, 6 metadata differences, and 50
+  agreements. This deliberately concentrates failures, includes the K6 extension, and includes
+  22 controls that agree in both modes; it is not a representative error rate.
+
+The major production families and operator precedences are present. The uncovered problems
+are chiefly restrictions and interactions between those families, lexical context, and AST
+construction. A passing finite corpus does not establish that every production combination
+or recovery edge is correct. "Valid" below means accepted by Elixir's parser; it does not
+claim that every macro-oriented or unusual expression passes expansion or evaluation.
+
+### Findings
+
+#### R1 — P2: Access wrongly requires adjacency for every base
+
+**Repros:** `f() [0]`, `(x) [0]`, `Foo [0]`, `%{} [0]`, `a.b() [0]`.
+
+Upstream parses these as `Access.get(base, 0)`. Toxic2 rejects most; for `a.b() [0]` it silently
+produces `a.b([0])`. Tabs and continued lines show the same problem. Ordinary newlines are
+expression boundaries and must not simply be skipped to fix this.
+
+`parser.ex:725-726`, `access?/3`, requires the CST to end exactly where `[` starts. That rule is
+appropriate to the tokenizer's `bracket_identifier` distinction (`f [0]` is a call), but not to
+the separate `bracket_expr -> access_expr bracket_arg` production (`yrl:313`).
+The converse restriction is also missing: `..[0]` is accepted although a bare nullary range
+is not an `access_expr`; `(..)[0]` is legal. Access needs the grammar's base classification.
+
+#### R2 — P2: An empty parenthesized remote call can be called again without parentheses
+
+**Repros:** `a.b() 1`, `a.b() x: 1`, `a."b"() x`.
+
+Elixir rejects these. Toxic2 emits no error and changes them into `a.b(1)`, `a.b(x: 1)`, and
+`a.b(x)`. This can hide a missing operator or separator after an already completed call.
+
+`parser.ex:529`, `np_callee?/2`, considers every two-child `:remote_call` a bare callee. The
+same shape also represents an explicitly parenthesized zero-argument call, so `()` is lost
+when `build_np_call/4` adds arguments. Upstream only allows `dot_identifier`/`dot_op_identifier`
+as no-parens callees (`yrl:252-261`), not a completed `parens_call`.
+Nonempty calls such as `a.b(1) 2` correctly report an error.
+
+#### R3 — P2: Heredoc indentation scanning changes valid string contents
+
+**Minimal raw-sigil repro:**
+
+```elixir
+~S"""
+  #{
+  """
+```
+
+Upstream's sigil content is `"\#{\n"`; Toxic2's is `"  \#{\n  "`. It retains both the body
+indentation and the closing line's spaces. A raw sigil does not interpolate, but the indentation
+pre-scan treats its literal `#{` as an interpolation opener and never finds a depth-zero close.
+
+The same scanner incorrectly counts braces inside quoted strings, sigils, and comments within
+a real interpolation. For example:
+
+```elixir
+"""
+  #{"{"}
+  """
+```
+
+Upstream's surrounding fragments are `""` and `"\n"`; Toxic2 retains extra spaces. This changes
+the value, not just indentation metadata or warning counts.
+
+Root: `lexer.ex:1871-1872`, `heredoc_start_body/6`, invokes `heredoc_indent/4` without the
+interpolation-enabled flag. Its `skip_to_eol/3` helper (`lexer.ex:1909-1915`) counts braces
+without lexical string/comment state. Upstream extracts interpolation with the tokenizer before
+stripping indentation (`elixir_interpolation.erl:60-78` and the heredoc extraction helpers).
+This is independent of K15's duplicate outdent warnings.
+
+#### R4 — P2: `not in` loses keyword ownership and bypasses ambiguity checks
+
+**Repro:** `[a not in f x: 1, y: 2]`.
+
+Upstream produces one list element: `not (a in f(x: 1, y: 2))`. Toxic2 produces two:
+`not (a in f(x: 1))` and `{:y, 2}`, with no error. Map values and keyword values have the same
+ownership problem. Separately, `f 0, a not in f b, c` and `[a not in f b, c]` are rejected
+upstream for ambiguous commas, but accepted by Toxic2.
+
+`parser.ex:361-367`, `rightmost_operand/1`, descends `:binary_op` and `:unary_op` only.
+The dedicated `:not_in_op` built at `parser.ex:1041` is opaque to both keyword-run absorption
+and strictness checks. The rewrite helpers used when appending absorbed keywords need the
+same support. This is distinct from OX3 (bare map entry admission), K10 (metadata), and K6
+(`when` keyword guards). Ordinary `in` passes the corresponding controls.
+
+#### R5 — P2: Legal unquoted keyword names are rejected by ASCII fast paths
+
+**Repros:** `[foo@bar: 1]`, `[Foo!: 1]`, `[Foo?: 1]`.
+
+All are accepted upstream and produce ordinary atom keys. Toxic2 emits errors. The lowercase
+scanner's `read_name/1` stops before `@`; the uppercase scanner uses `word_len/2`, stopping
+before `!`/`?`. They therefore never see the keyword colon attached to the complete name.
+
+Root: `lexer.ex:661-688`, the ASCII identifier/alias clauses, and `read_name/1` at line
+1962. Upstream reads the whole identifier and checks for a keyword suffix before rejecting
+`@` or invalid alias characters (`elixir_tokenizer.erl:688-715`). Quoted equivalents work.
+
+#### R6 — P2: Malformed braced Unicode escapes are silently accepted
+
+**Repros:** `"\u{41"`, `"\u{41x}"`, `"\u{0000041}"`.
+
+Elixir rejects all three. Toxic2 returns `"A"`, `"Ax}"`, and `"A"`, respectively, with no
+error. Quoted atoms, keyword keys, remote names, charlists, and ordinary heredocs share the bug.
+
+`lexer.ex:1368-1374`, `esc/1`, consumes any nonempty hex run and calls `drop_rbrace/1`, which
+does not require a closing brace. It also imposes no digit-count limit. Upstream requires
+exactly one to six hex digits followed immediately by `}` (`elixir_interpolation.erl:233-252`).
+Valid `"\u{41}"` and out-of-range-codepoint error controls behave correctly.
+
+#### R7 — P2: A backslash bypasses raw forbidden-character validation
+
+Construct a source string as `"\"\\" <> <<0x202E::utf8>> <> "\""`: a quote, a backslash,
+the **actual** U+202E character, and a quote. Elixir rejects this; Toxic2 accepts it. Actual
+U+2028, VT, FF, and bare CR also demonstrate missed validation in ordinary quoted strings.
+Quoted atoms/calls and applicable string/sigil/heredoc readers share variants of the issue.
+
+This is not the textual escape `"\u202E"`, which is intentionally legal on both sides.
+`lexer.ex:1127-1132` decodes an escaped codepoint before the normal `bidi?/break?` checks;
+`read_sigil/10` has a similar unchecked branch at `lexer.ex:1458-1460`. Upstream routes a
+backslash's following character through `extract_char`, preserving validation
+(`elixir_interpolation.erl:76-108`). The previously documented raw-character check does not
+cover this backslash-prefixed bypass.
+
+#### R8 — P2: Attribute operands omit the second parenthesized argument group
+
+**Repros:** `@f()(1)`, `@f(1)(2)`.
+
+Upstream accepts the nested call as the operand of `@`. Toxic2 parses the first call and reports
+the second `(` as unexpected. `parser.ex:2716-2737` uses `maybe_paren_call/6` to consume exactly
+one group, unlike the general postfix path. The `parens_call` grammar allows two groups and is
+an `access_expr`, so the attribute operand must admit it (`yrl:301-305`).
+
+#### R9 — P2: Repeated attributes put bracket access outside the wrong node
+
+**Repros:** `@@f[x]`, `@@f()[x]`.
+
+Upstream groups the first as `@(Access.get(@f, x))`. Toxic2 groups it as
+`Access.get(@(@f), x)`, without diagnostics. The specialized attribute operand path
+(`parser.ex:2716-2721`) returns the nested unary node before recognizing the inner
+`bracket_at_expr`. This is a missing interaction with the explicit `bracket_at_expr`
+productions (`yrl:315-318`), rather than an incorrect numeric precedence-table entry.
+
+#### R10 — P2: Keyword-only no-parens calls are not absorbed in map-key position
+
+**Repro:** `%{f a: 1, b: 2 => 1}`.
+
+Upstream accepts one association, with `f(a: 1, b: 2)` as its key. Toxic2 splits the keyword
+run into map entries and emits multiple errors. Unary-wrapped keys have the same problem.
+
+`parser.ex:2149-2153` checks for `=>` immediately after the first partial key expression;
+it never calls `absorb_kw_run` for the key. The value side already calls that helper at
+`parser.ex:2157`. Upstream permits a matched expression on both sides of `=>`
+(`yrl:623-626`). V1's documented fixes explicitly cover values and container elements;
+the key position is an additional hole.
+
+#### R11 — P2: Ellipsis consumes a new statement and misreads `not in`
+
+**Repros:** `...\nx`, `... # comment\n[0]`, `... not in x`.
+
+The first two are two expressions upstream, but become a single unary ellipsis in Toxic2.
+The third is accepted upstream as nullary `...` followed by the `not in` operator, but Toxic2
+tries to parse unary `not` as the ellipsis operand and reports an error.
+
+`parser.ex:2648` skips newlines before deciding whether ellipsis has an operand; the grammar
+uses `ellipsis_op matched_expr` with no eol production, unlike ordinary unary operators.
+`dotdot_operand?/2` at `parser.ex:2663` also treats every unary-op token as an operand start
+without excluding the fused `not in` case. Same-line `... x` and `(...) not in x` are controls.
+
+#### R12 — P2: Signed nullary range arguments become binary arithmetic
+
+**Repros:** `f +..`, `A.f -..`.
+
+Upstream builds `f(+(..))` / `A.f(-(..))`; Toxic2 builds `f + (..)` / `A.f() - (..)` with
+no error. The source's whitespace is significant here.
+
+`parser.ex:608-611`, `np_arg_kind?/3`, requires the token after adjacent unary `+`/`-` to be
+in `np_first_kind?`, which omits `:range_op`. The range is a valid nullary operand. This is
+not the previously fixed operator-reference AST issue: the source contains no `/arity`.
+
+#### R13 — P2: Capture integers use only an unsigned decimal digit run
+
+**Repros:** `&1_0`, `&0x0A`, `&0o12`, `&0b1010`.
+
+Upstream parses all as `{:&, meta, [10]}`. Toxic2 consumes only `&1` or `&0` and reports the
+rest as unexpected. Spaced `& 0x0A` works.
+
+`lexer.ex:594-598` uses `take_while(..., is_digit)` instead of the full integer scanner.
+Upstream emits `capture_int` and then tokenizes the integer normally
+(`elixir_tokenizer.erl:483-500`; `yrl:275`). Consequently the capture token also supports
+radix forms and underscores. This concerns parser grammar, not expansion's capture validation.
+
+#### R14 — P2: A final line continuation is accepted as a complete source
+
+**Repros:** the bytes `x`, `\`, LF, EOF; likewise with CRLF.
+
+Upstream reports `invalid escape \\ at end of file`. Toxic2 returns `x` with no error.
+The lexer continuation clauses (`lexer.ex:390-394`) also match an empty remaining buffer.
+Upstream has explicit terminal `\\\n` and `\\\r\n` error clauses before its ordinary
+continuation clauses (`elixir_tokenizer.erl:647-651`). This is relevant to incomplete editor
+buffers. A continuation followed by more source, such as `x\\\n+1`, is a passing control.
+
+#### R15 — P2: Some identifiers containing `@` are accepted outside keyword/atom position
+
+**Repros:** `é@bar`, `a.é@bar()`, `not@bar`.
+
+Upstream rejects these as invalid identifiers. Toxic2 accepts the first two as names containing
+`@`, and the last as `not (@bar)`. No error is emitted.
+
+`lexer.ex:829-830` discards the vendored identifier tokenizer's `special` flags, including
+`:at`, and `emit_unicode_name/9` admits the identifier without checking them. For `not@bar`,
+the ASCII scanner stops at `@` and prematurely recognizes `not` as a reserved operator.
+Upstream checks `HasAt` after the keyword suffix check (`elixir_tokenizer.erl:690-705`).
+The distinction matters: `:é@bar` and `[é@bar: 1]` are valid and must remain accepted.
+
+#### R16 — P2: A unary wrapper incorrectly makes an unmatched do-block eligible for postfixes
+
+**Repros:** `!f do x end.foo`, `!f do x end[0]`, `@f do x end.(1)`.
+
+Elixir rejects the unparenthesized postfix after `end`. Toxic2 emits a clean AST. The equivalent
+unwrapped `f do x end.foo` is correctly rejected, making this an admission inconsistency.
+
+`parser.ex:2699-2706` marks the unary node `:matched` even when its operand contains a do-block.
+The outer postfix pass then accepts dot/access operations. The grammar keeps
+`unary_op_eol unmatched_expr` unmatched (`yrl:167-170`), and dot productions require a matched
+left operand (`yrl:478-498`). This is separate from K4's clause-head and K5's struct-base holes.
+
+#### R17 — P2: `unquote_splicing` block construction is not restricted to arity one
+
+**Repros:** `unquote_splicing()`, `unquote_splicing(x, y)`, `unquote_splicing(x) do end`.
+
+Upstream leaves these as ordinary calls. Toxic2 adds a synthetic `__block__` wrapper. The
+same problem occurs as the sole expression in parentheses, clause bodies, and do-blocks.
+`lower.ex:2751`, `wrap_splice/1`, matches any argument shape; upstream's `build_block`
+special case matches exactly one argument (`yrl:802-803`).
+
+There is also a metadata mismatch on the correctly wrapped arity-one case:
+`quote do unquote_splicing(x) end`. Upstream puts the `do` location directly on the wrapper;
+Toxic2 changes it to `parens: [line: 1, column: 7]`. The block-special case must retain the
+section metadata rather than taking the general single-expression metadata path.
+These differ from the fixed §2.2, which concerns unwrapping a splice in a clause head.
+
+#### R18 — P2: Grapheme clusters shift source columns even without escapes
+
+**Repro:** source `"é"; x`, where the accent is a separate U+0301 codepoint.
+
+Upstream anchors `x` at column 6; Toxic2 anchors it at column 7. `~s(é); x` similarly gives
+8 versus 9. A joined emoji such as `"👩‍💻"; x` demonstrates a larger drift. The literal value
+matches, but subsequent source columns and delimiter metadata differ.
+
+`lexer.ex:1188-1203` and the corresponding sigil/heredoc scanners advance by individual
+codepoints. Upstream's string extraction uses `unicode_util:gc` and advances once per
+grapheme cluster (`elixir_interpolation.erl:93-111`). The fix needs to preserve those lexical
+column semantics throughout source slicing, not just adjust one metadata field.
+This is independent of OX4: these repros contain no backslash escape.
+
+#### R19 — P2: Parentheses around a single no-parens call are attributed to the clause head
+
+**Repro:** `fn (f a, b) -> 1 end` (also in case/parenthesized stabs).
+
+The structural AST agrees: the clause has one pattern, `f(a, b)`. Upstream puts the `parens`
+metadata on that call. Toxic2 strips it from the call and places it on `->` instead.
+
+`parser.ex:1523-1558` treats any depth-one comma inside parentheses followed by an arrow as
+`stab_parens_many`. Here the comma belongs to the nested no-parens call; the grammar instead
+has a parenthesized expression used as a single pattern. A lexical comma scan cannot decide
+this distinction. This is separate from F6: the delimiters are on one line and are found,
+but they are assigned to the wrong construct.
+
+#### R20 — P2: Operator-name lookahead fails when the next slash begins `//`
+
+**Repros:** `+//2`, `f +//2`, `%{m | //x}`.
+
+Upstream rejects these; Toxic2 accepts them. The upstream operator handlers inspect the next
+source character after horizontal whitespace. When it is `/`, the preceding operator is
+emitted as an identifier even if that slash starts the `//` token. The subsequent parse then
+rejects a misplaced range step.
+
+`parser.ex:526`, `op_ref_slash?/2`, only recognizes a `:mult_op` slash token, so it misses
+`:ternary_op` and instead admits a prefix operator over the unary `//` rewrite. The lexer
+emits operators without preserving this reference classification (`lexer.ex:752-755`). See
+`elixir_tokenizer.erl:893-947`, `handle_unary_op` / `handle_op`. This is a non-dot lexical
+context gap, distinct from F2. These spellings have very low practical likelihood.
+
+### Broader manifestations of tracked findings
+
+- K6 is not confined to a non-first call argument. `[a when b: 1]`, `{a when b: 1}`,
+  `<<a when b: 1>>`, `a[a when b: 1]`, and `%{a => a when b: 1}` are also invalid upstream
+  and silently accepted. The special `when`-keyword expression needs its proper no-parens
+  category in every restricted container/association context. These are not counted again.
+- Further struct-base/operator-soup examples, such as `%+&f/1{}`, are admitted where upstream
+  rejects them. They reinforce the existing conclusion that struct bases need recursive
+  `map_base_expr` validation; they are not counted as a separate new group here.
+- F2/F3/F4 and the applicable OX/KIMI families were encountered again. Their existence does not
+  explain the independent repros above. Earlier "FIXED" entries should not be interpreted as
+  a proof that all adjacent grammar contexts have been covered.
+
+### Suggested repair order
+
+1. Preserve valid source semantics: R1–R4, then R5/R10. Fix R1 and R2 together so restoring
+   spaced access does not leave the empty-remote-call admission hole.
+2. Restore reliable lexical errors: R6/R7/R14/R15. Preserve valid textual Unicode escapes and
+   `@`-bearing atoms/keyword keys as explicit controls.
+3. Complete the less common grammar combinations: R8/R9/R11/R12/R13/R16/R17/R20.
+4. Restore metadata parity: R18/R19 and R17's arity-one block metadata, alongside the already
+   documented metadata backlog.
+
+Regression coverage should assert error **severity**, normalized AST equality for valid inputs,
+and full AST equality with an identical literal encoder. Add paired controls that vary only the
+relevant whitespace, parentheses, keyword position, or literal mode. The current frozen gates
+can remain green while all of these new families still fail.
