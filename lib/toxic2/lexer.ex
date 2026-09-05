@@ -1206,7 +1206,8 @@ defmodule Toxic2.Lexer do
         read_quoted(rest, line, col + 1, [<<c::utf8>>], {line, col + 1}, acc, w, st, lit)
 
       true ->
-        read_quoted(rest, line, col + 1, [<<c::utf8>> | buf], fs, acc, w, st, lit)
+        {cbin, rest, dc} = gc_step(<<c::utf8, rest::binary>>, buf_last_cp(buf))
+        read_quoted(rest, line, col + dc, [cbin | buf], fs, acc, w, st, lit)
     end
   end
 
@@ -1349,7 +1350,10 @@ defmodule Toxic2.Lexer do
         {app, rest2, line + 1, 1, err}
 
       {app, rest2, :sameline, err} ->
-        {app, rest2, line, col + 1 + (byte_size(rest) - byte_size(rest2)), err}
+        # Column advance counts CODEPOINTS of the consumed escape text (`\é` is 2 columns, not
+        # 1 + the 2 UTF-8 bytes of `é`) — a byte count silently shifts every later column.
+        consumed = binary_part(rest, 0, byte_size(rest) - byte_size(rest2))
+        {app, rest2, line, col + 1 + cp_width(consumed, 0), err}
     end
   end
 
@@ -1527,7 +1531,8 @@ defmodule Toxic2.Lexer do
         acc = [{:error, line, col, line, col + 1, LexError.new(code, %{codepoint: c})} | acc]
         read_sigil(rest, line, col + 1, [<<c::utf8>>], {line, col + 1}, acc, w, st, sm)
       else
-        read_sigil(rest, line, col + 1, [<<c::utf8>> | buf], fs, acc, w, st, sm)
+        {cbin, rest, dc} = gc_step(<<c::utf8, rest::binary>>, buf_last_cp(buf))
+        read_sigil(rest, line, col + dc, [cbin | buf], fs, acc, w, st, sm)
       end
     end
   end
@@ -1772,7 +1777,8 @@ defmodule Toxic2.Lexer do
       acc = [{:error, line, col, line, col + 1, LexError.new(code, %{codepoint: c})} | acc]
       read_heredoc(rest, line, col + 1, [<<c::utf8>>], {line, col + 1}, acc, w, st, hc)
     else
-      read_heredoc(rest, line, col + 1, [<<c::utf8>> | buf], fs, acc, w, st, hc)
+      {cbin, rest, dc} = gc_step(<<c::utf8, rest::binary>>, buf_last_cp(buf))
+      read_heredoc(rest, line, col + dc, [cbin | buf], fs, acc, w, st, hc)
     end
   end
 
@@ -2032,6 +2038,55 @@ defmodule Toxic2.Lexer do
 
   defp word_len(<<c, rest::binary>>, n) when is_word(c), do: word_len(rest, n + 1)
   defp word_len(rest, n), do: {n, rest}
+
+  # Grapheme-cluster step for string/charlist/sigil/heredoc CONTENT columns. Upstream's extract
+  # walks the content with `unicode_util:gc`, so one grapheme cluster is ONE column — `"é"` as
+  # `e` + U+0301 is one column, and a ZWJ emoji sequence is one column. Returns
+  # `{cluster_bytes, rest, col_delta}` for the cluster starting (or continuing) at `bin`'s head;
+  # `col_delta` is 0 when the head codepoint extends the PREVIOUS char's cluster (`prev` = the
+  # last codepoint already emitted into the fragment buffer, or nil).
+  defp gc_step(bin, prev) do
+    with false <- prev == nil,
+         [[^prev | cont] | _] <- uu_gc(<<prev::utf8, bin::binary>>),
+         cbin when is_binary(cbin) <- :unicode.characters_to_binary(cont) do
+      {cbin, rest_at(bin, byte_size(cbin)), 0}
+    else
+      _ ->
+        case uu_gc(bin) do
+          [gc | _] ->
+            cbin = :unicode.characters_to_binary(List.wrap(gc))
+            {cbin, rest_at(bin, byte_size(cbin)), 1}
+
+          _ ->
+            <<c::utf8, rest::binary>> = bin
+            {<<c::utf8>>, rest, 1}
+        end
+    end
+  end
+
+  # `unicode_util:gc/1` raises/returns `{:error, _}` on invalid trailing bytes; treat that as a
+  # single-codepoint cluster upstream of the caller's fallback.
+  defp uu_gc(bin) do
+    :unicode_util.gc(bin)
+  rescue
+    _ -> []
+  end
+
+  # The last codepoint already flushed into the (iolist, most-recent-first) fragment buffer.
+  defp buf_last_cp([]), do: nil
+  defp buf_last_cp([<<>> | t]), do: buf_last_cp(t)
+  defp buf_last_cp([h | t]) when is_binary(h), do: bin_last_cp(h) || buf_last_cp(t)
+  defp buf_last_cp(_), do: nil
+
+  defp bin_last_cp(bin), do: bin_last_cp(bin, byte_size(bin) - 1)
+  defp bin_last_cp(_bin, n) when n < 0, do: nil
+
+  defp bin_last_cp(bin, n) do
+    case binary_part(bin, n, byte_size(bin) - n) do
+      <<c::utf8>> -> c
+      _ -> bin_last_cp(bin, n - 1)
+    end
+  end
 
   # Codepoint width of a byte slice, for column advance — total over invalid UTF-8: a UTF-8
   # continuation byte (`0x80..0xBF`) rides with its lead byte; every other byte counts as one column.

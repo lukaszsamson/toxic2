@@ -96,6 +96,22 @@ defmodule Toxic2.TokenMetadataTest do
   describe "from_brackets: / from_interpolation:" do
     test "access uses from_brackets:", do: Enum.each(["foo[bar]", "a[b][c]"], &assert_parity/1)
 
+    test "grapheme clusters and multi-byte escapes are one column (R18/OX4)" do
+      Enum.each(
+        [
+          # combining mark: `é` as e + U+0301 is ONE column
+          "\"é\"; x",
+          "~s(é); x",
+          # ZWJ emoji sequence is one column
+          "\"👩‍💻\"; x",
+          # a `\é`-style escape advances by codepoints, not UTF-8 bytes
+          "s = \"a\\é\" ; x",
+          "\"\"\"\na\\é b\n\"\"\" ; x"
+        ],
+        &assert_parity/1
+      )
+    end
+
     test "spaced access anchors the dot at the [" do
       Enum.each(
         ["f() [0]", "(x) [0]", "Foo [0]", "a.b() [0]", "%{} [0]", "f() [a: 1]", "f() [\n  0\n]"],

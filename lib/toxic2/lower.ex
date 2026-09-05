@@ -372,10 +372,18 @@ defmodule Toxic2.Lower do
     end
   end
 
-  defp line_walk(<<c, rest::binary>>, n, col) when n > 0 and c < 128,
-    do: line_walk(rest, n - 1, col)
+  # The skip phase counts GRAPHEME CLUSTERS, matching the lexer's content columns (the ASCII fast
+  # path applies only while the next byte is ASCII too, so a combining mark rides with its base).
+  defp line_walk(<<c, nb, _::binary>> = bin, n, col) when n > 0 and c < 128 and nb < 128,
+    do: line_walk(binary_part(bin, 1, byte_size(bin) - 1), n - 1, col)
 
-  defp line_walk(<<_::utf8, rest::binary>>, n, col) when n > 0, do: line_walk(rest, n - 1, col)
+  defp line_walk(<<c>>, n, col) when n > 0 and c < 128, do: line_walk(<<>>, n - 1, col)
+
+  defp line_walk(<<_::utf8, _::binary>> = bin, n, col) when n > 0 do
+    w = gc_head_bytes(bin)
+    line_walk(binary_part(bin, w, byte_size(bin) - w), n - 1, col)
+  end
+
   defp line_walk(<<_, rest::binary>>, n, col) when n > 0, do: line_walk(rest, n - 1, col)
 
   defp line_walk(<<c, rest::binary>>, 0, col) when c == ?\s or c == ?\t,
@@ -978,13 +986,21 @@ defmodule Toxic2.Lower do
   defp col_byte(_text, col, prefix) when col - 1 <= prefix, do: col - 1
   defp col_byte(text, col, _prefix), do: col_byte_walk(text, col - 1, 0)
 
-  # Non-ASCII source: walk codepoints from a non-negative count. ASCII fast-path clause (one byte =
-  # one column, no `utf8` decode / `utf8_width` call) keeps even this path tight on ASCII runs.
-  defp col_byte_walk(<<c, rest::binary>>, n, off) when n > 0 and c < 128,
-    do: col_byte_walk(rest, n - 1, off + 1)
+  # Non-ASCII source: walk GRAPHEME CLUSTERS from a non-negative count — one cluster is one
+  # column (matching the lexer's content scanners and upstream's `unicode_util:gc` walk: `é` as
+  # `e` + U+0301 is one column). The ASCII fast path is taken only while the NEXT byte is ASCII
+  # too, so a trailing combining mark still rides with its base.
+  defp col_byte_walk(<<c, nb, _::binary>> = bin, n, off) when n > 0 and c < 128 and nb < 128,
+    do: col_byte_walk(binary_part(bin, 1, byte_size(bin) - 1), n - 1, off + 1)
 
-  defp col_byte_walk(<<cp::utf8, rest::binary>>, n, off) when n > 0,
-    do: col_byte_walk(rest, n - 1, off + utf8_width(cp))
+  defp col_byte_walk(<<c>>, n, off) when n > 0 and c < 128,
+    do: col_byte_walk(<<>>, n - 1, off + 1)
+
+  defp col_byte_walk(<<c, _::binary>> = bin, n, off) when n > 0 and c < 0x80,
+    do: col_byte_walk_gc(bin, n, off)
+
+  defp col_byte_walk(<<_::utf8, _::binary>> = bin, n, off) when n > 0,
+    do: col_byte_walk_gc(bin, n, off)
 
   defp col_byte_walk(<<_, rest::binary>>, n, off) when n > 0,
     do: col_byte_walk(rest, n - 1, off + 1)
@@ -992,18 +1008,37 @@ defmodule Toxic2.Lower do
   defp col_byte_walk(<<>>, n, _off) when n > 0, do: :past
   defp col_byte_walk(<<_::binary>>, _n, off), do: off
 
-  defp utf8_width(cp) when cp < 0x80, do: 1
-  defp utf8_width(cp) when cp < 0x800, do: 2
-  defp utf8_width(cp) when cp < 0x10000, do: 3
-  defp utf8_width(_cp), do: 4
+  defp col_byte_walk_gc(bin, n, off) do
+    w = gc_head_bytes(bin)
+    col_byte_walk(binary_part(bin, w, byte_size(bin) - w), n - 1, off + w)
+  end
 
-  # Codepoints in the byte range `text[lo..hi)` — the gap between a span end and the operator the
-  # scan found. Almost always pure-ASCII whitespace (so `hi - lo`), but counted for exactness.
-  defp cp_between(text, lo, hi), do: count_cp(binary_part(text, lo, hi - lo))
+  # Byte width of the grapheme cluster at `bin`'s head (>= 1, total over invalid UTF-8).
+  defp gc_head_bytes(bin) do
+    case :unicode_util.gc(bin) do
+      [gc | _] -> max(byte_size(:unicode.characters_to_binary(List.wrap(gc))), 1)
+      _ -> 1
+    end
+  rescue
+    _ -> 1
+  end
 
-  defp count_cp(<<>>), do: 0
-  defp count_cp(<<_::utf8, rest::binary>>), do: 1 + count_cp(rest)
-  defp count_cp(<<_, rest::binary>>), do: 1 + count_cp(rest)
+  # Grapheme clusters in the byte range `text[lo..hi)` — the gap between a span end and the
+  # operator the scan found. Almost always pure-ASCII whitespace (so `hi - lo`), but counted for
+  # exactness in the same one-cluster-one-column model as `col_byte_walk`.
+  defp cp_between(text, lo, hi), do: count_gc(binary_part(text, lo, hi - lo))
+
+  defp count_gc(<<>>), do: 0
+
+  defp count_gc(<<c, nb, _::binary>> = bin) when c < 128 and nb < 128,
+    do: 1 + count_gc(binary_part(bin, 1, byte_size(bin) - 1))
+
+  defp count_gc(<<c>>) when c < 128, do: 1
+
+  defp count_gc(bin) do
+    w = gc_head_bytes(bin)
+    1 + count_gc(binary_part(bin, w, byte_size(bin) - w))
+  end
 
   # `delimiter:` — the opening string/charlist/sigil delimiter, read from the source: at the node
   # span start for strings/charlists, after the leading `:` for quoted atoms, and after `~` + the
@@ -1148,13 +1183,20 @@ defmodule Toxic2.Lower do
   # terminal) so the match context threads with zero per-step allocation.
   defp last_char_col(<<>>, _ch, _col, _from, _upto, last), do: last
 
-  defp last_char_col(<<c, rest::binary>>, ch, col, from, upto, last) when c < 128 do
+  defp last_char_col(<<c, nb, _::binary>> = bin, ch, col, from, upto, last)
+       when c < 128 and nb < 128 do
     last = if c == ch and col >= from and col <= upto, do: col, else: last
-    last_char_col(rest, ch, col + 1, from, upto, last)
+    last_char_col(binary_part(bin, 1, byte_size(bin) - 1), ch, col + 1, from, upto, last)
   end
 
-  defp last_char_col(<<_::utf8, rest::binary>>, ch, col, from, upto, last),
-    do: last_char_col(rest, ch, col + 1, from, upto, last)
+  defp last_char_col(<<c>>, ch, col, from, upto, last) when c < 128 do
+    if c == ch and col >= from and col <= upto, do: col, else: last
+  end
+
+  defp last_char_col(<<_::utf8, _::binary>> = bin, ch, col, from, upto, last) do
+    w = gc_head_bytes(bin)
+    last_char_col(binary_part(bin, w, byte_size(bin) - w), ch, col + 1, from, upto, last)
+  end
 
   defp last_char_col(<<_, rest::binary>>, ch, col, from, upto, last),
     do: last_char_col(rest, ch, col + 1, from, upto, last)
