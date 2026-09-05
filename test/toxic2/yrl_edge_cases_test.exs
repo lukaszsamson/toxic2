@@ -200,6 +200,38 @@ defmodule Toxic2.YrlEdgeCasesTest do
     end
   end
 
+  describe "`when` with keyword RHS in restricted positions (GRAMMAR_GAPS K6)" do
+    test "containers, brackets, map values, and non-first args reject `x when k: v`" do
+      for src <- [
+            "f x, a when b: 1",
+            "f a, b when c: d",
+            "f(x, a when b: 1)",
+            "f(k: a when b: 1)",
+            "[a when b: 1]",
+            "[k: a when b: 1]",
+            "{a when b: 1}",
+            "<<a when b: 1>>",
+            "m[a when b: 1]",
+            "%{a => a when b: 1}",
+            "%{k: a when b: 1}"
+          ] do
+        assert_rejected(src)
+      end
+    end
+
+    test "statement, paren, sole-arg, and no-parens kw-value positions stay valid" do
+      for src <- [
+            "x = y when a: 1",
+            "(y when a: 1)",
+            "f(a when b: 1)",
+            "f a when b: 1",
+            "g k: a when b: 1"
+          ] do
+        assert_accepted(src)
+      end
+    end
+  end
+
   describe "clause-head restrictions (GRAMMAR_GAPS K4, K7)" do
     test "do-block calls are never head patterns or guards" do
       for src <- [

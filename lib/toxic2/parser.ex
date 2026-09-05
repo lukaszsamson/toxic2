@@ -382,8 +382,18 @@ defmodule Toxic2.Parser do
 
   # Does the expression END in a no-parens MANY / ambiguous-one call? In an absorbing position
   # (parens-call / no-parens-call argument, fn head) the inner call has already taken the commas,
-  # so a multi-arg inner call marks upstream's `error_no_parens_many_strict`.
-  defp embedded_no_parens_many?(node), do: no_parens_expr?(rightmost_operand(node))
+  # so a multi-arg inner call marks upstream's `error_no_parens_many_strict`. A `when` with a bare
+  # keyword RHS is itself a `no_parens_expr` (`no_parens_expr -> matched_expr when_op
+  # call_args_no_parens_kw`), and `when` binds loosest, so it can only sit at the ROOT (K6).
+  defp embedded_no_parens_many?(node),
+    do: when_kw_root?(node) or no_parens_expr?(rightmost_operand(node))
+
+  # The `x when a: 1` shape — a binary node whose RHS is the synthesized bare-keyword `:kw_list`
+  # (built only by `when_kw_rhs`).
+  defp when_kw_root?({:node, :binary_op, _sp, [_l, _op, {:node, :kw_list, _, _, _, _}], _f, _d}),
+    do: true
+
+  defp when_kw_root?(_node), do: false
 
   # A `no_parens_expr` in the grammar: a no-parens call with several args (`a, b` → no_parens_many)
   # or a single argument that is itself a no-parens expr (`g a, b` → no_parens_one_ambig). A plain
@@ -866,6 +876,9 @@ defmodule Toxic2.Parser do
     # An index ending in a kw-only no-parens call absorbs the trailing keyword run
     # (`m[foo x: 1, y: 2]` => `m[foo(x: 1, y: 2)]`).
     {idx, j, diags, nid, fuel} = absorb_kw_run(t, idx, j, diags, nid, fuel)
+
+    # A bracket_arg is a container position: `m[a when b: 1]` is invalid upstream (K6).
+    {diags, nid} = check_assoc_value_when(t, idx, diags, nid)
 
     # A single trailing comma is allowed (`foo[1,]`); `foo[a, b]` (a real second index) is not.
     jj0 = skip_eols(t, j)
@@ -2179,6 +2192,7 @@ defmodule Toxic2.Parser do
           parse_expr(t, skip_eols(t, jj + 1), 0, :matched, diags, nid, fuel - 1)
 
         {val, k, diags, nid, fuel} = absorb_kw_run(t, val, k, diags, nid, fuel)
+        {diags, nid} = check_assoc_value_when(t, val, diags, nid)
 
         first =
           CST.node(:assoc, merge(cst_span(t, key), cst_span(t, val)), [key, val], :matched, nil)
@@ -2332,6 +2346,34 @@ defmodule Toxic2.Parser do
     end
   end
 
+  # A `x when a: 1` keyword-pair VALUE is invalid in bracketed keyword lists, paren-call keyword
+  # args, and map keyword entries (upstream: kw values there are not `no_parens_expr`); a
+  # NO-PARENS call keyword value (`g k: a when b: 1`) is valid and never comes through here.
+  defp check_kw_value_when({:node, :kw_pair, _sp, [_key, val], _f, _d} = el, t, diags, nid) do
+    if when_kw_root?(val) do
+      {_id, diags, nid} =
+        Diagnostics.emit(diags, nid, :parser, :error, :ambiguous_no_parens, cst_span(t, el), %{})
+
+      {diags, nid}
+    else
+      {diags, nid}
+    end
+  end
+
+  defp check_kw_value_when(_el, _t, diags, nid), do: {diags, nid}
+
+  # A map association VALUE may not be `x when a: 1` either (`%{a => a when b: 1}` errors).
+  defp check_assoc_value_when(t, val, diags, nid) do
+    if when_kw_root?(val) do
+      {_id, diags, nid} =
+        Diagnostics.emit(diags, nid, :parser, :error, :ambiguous_no_parens, cst_span(t, val), %{})
+
+      {diags, nid}
+    else
+      {diags, nid}
+    end
+  end
+
   defp parse_map_entry(t, i, diags, nid, fuel) do
     if tk(t, i) == :kw_identifier do
       key = ctoken(i)
@@ -2340,8 +2382,10 @@ defmodule Toxic2.Parser do
         parse_expr(t, skip_eols(t, i + 1), 0, :matched, diags, nid, fuel - 1)
 
       {val, j, diags, nid, fuel} = absorb_kw_run(t, val, j, diags, nid, fuel)
+      node = CST.node(:kw_pair, merge_tc(t, i, val), [key, val], :matched, nil)
+      {diags, nid} = check_kw_value_when(node, t, diags, nid)
 
-      {CST.node(:kw_pair, merge_tc(t, i, val), [key, val], :matched, nil), j, diags, nid, fuel}
+      {node, j, diags, nid, fuel}
     else
       {key, j, diags, nid, fuel} = parse_expr(t, i, @map_key_bp, :matched, diags, nid, fuel - 1)
       jj = skip_eols(t, j)
@@ -2352,6 +2396,7 @@ defmodule Toxic2.Parser do
             parse_expr(t, skip_eols(t, jj + 1), 0, :matched, diags, nid, fuel - 1)
 
           {val, k, diags, nid, fuel} = absorb_kw_run(t, val, k, diags, nid, fuel)
+          {diags, nid} = check_assoc_value_when(t, val, diags, nid)
 
           {CST.node(:assoc, merge(cst_span(t, key), cst_span(t, val)), [key, val], :matched, nil),
            k, diags, nid, fuel}
@@ -2460,6 +2505,7 @@ defmodule Toxic2.Parser do
   defp seq_elems(t, i, acc, seen_kw, close, mode, diags, nid, fuel) do
     {el, i, is_kw, diags, nid, fuel} = parse_element(t, i, mode, diags, nid, fuel)
     {diags, nid} = check_kw_last(seen_kw, is_kw, t, el, diags, nid)
+    {diags, nid} = check_kw_value_when(el, t, diags, nid)
     {diags, nid} = check_call_arg_strict(mode, el, acc, t, diags, nid)
     {diags, nid} = check_container_elem_strict(mode, el, t, diags, nid)
     acc = [el | acc]
@@ -2775,7 +2821,7 @@ defmodule Toxic2.Parser do
        when mode in [:list, :tuple, :bitstring] do
     leaf = rightmost_operand(el)
 
-    if no_parens_expr?(leaf) and not has_do_block?(leaf) do
+    if when_kw_root?(el) or (no_parens_expr?(leaf) and not has_do_block?(leaf)) do
       {_id, diags, nid} =
         Diagnostics.emit(diags, nid, :parser, :error, :ambiguous_no_parens, cst_span(t, el), %{})
 
