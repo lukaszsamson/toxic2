@@ -269,8 +269,9 @@ defmodule Toxic2.Parser do
   defp do_attachable?(lhs, _t), do: do_attachable_node?(lhs)
 
   # A call NODE (has args / parens) — the only form that takes a `do` on a following line.
-  defp do_attachable_node?({:node, k, _sp, _ch, _f, _d}),
-    do: k in [:call, :np_call, :remote_call, :anon_call]
+  defp do_attachable_node?({:node, k, _sp, _ch, _f, _d})
+       when k in [:call, :np_call, :remote_call, :anon_call],
+       do: true
 
   defp do_attachable_node?(_lhs), do: false
 
@@ -641,33 +642,35 @@ defmodule Toxic2.Parser do
     tk(t, i) == :unary_op and tv(t, i) == :not and tk(t, i + 1) == :in_op
   end
 
-  defp np_first_kind?(kind) do
-    kind in [
-      :int,
-      :flt,
-      :char,
-      :atom,
-      :literal,
-      :identifier,
-      :alias,
-      :"(",
-      :"[",
-      :"{",
-      :"<<",
-      :percent,
-      :at_op,
-      :capture_op,
-      :capture_int,
-      :unary_op,
-      :kw_identifier,
-      :string_start,
-      :charlist_start,
-      :sigil_start,
-      :quoted_atom,
-      :ellipsis_op,
-      :fn
-    ]
-  end
+  defp np_first_kind?(kind)
+       when kind in [
+              :int,
+              :flt,
+              :char,
+              :atom,
+              :literal,
+              :identifier,
+              :alias,
+              :"(",
+              :"[",
+              :"{",
+              :"<<",
+              :percent,
+              :at_op,
+              :capture_op,
+              :capture_int,
+              :unary_op,
+              :kw_identifier,
+              :string_start,
+              :charlist_start,
+              :sigil_start,
+              :quoted_atom,
+              :ellipsis_op,
+              :fn
+            ],
+       do: true
+
+  defp np_first_kind?(_kind), do: false
 
   # Postfix operations bind tightest (yecc 310): a paren call `f(...)` (adjacent `(`), and dot
   # forms `a.b` / `a.b(...)` / `a.(...)` / `Foo.Bar` (alias chain). `pdepth` counts paren-call
@@ -888,8 +891,9 @@ defmodule Toxic2.Parser do
   defp paren_callee?(t, lhs, 0),
     do: ctag(lhs) == :token and tk(t, ctoki(lhs)) == :identifier
 
-  defp paren_callee?(_t, lhs, 1),
-    do: ctag(lhs) == :node and ckind(lhs) in [:call, :remote_call, :anon_call]
+  defp paren_callee?(_t, {:node, k, _sp, _ch, _f, _d}, 1)
+       when k in [:call, :remote_call, :anon_call],
+       do: true
 
   defp paren_callee?(_t, _lhs, _pdepth), do: false
 
@@ -1998,28 +2002,30 @@ defmodule Toxic2.Parser do
   # `%(...)`/`%[...]`/`%&x` are NOT valid struct bases (Elixir rejects them), so `(`/`[`/capture
   # are excluded. `map_base_expr` admits the same unary chains as bare map entries, incl. the
   # prefix `//` (`ternary_op`).
-  defp struct_base_start?(kind) do
-    kind in [
-      :alias,
-      :identifier,
-      :int,
-      :flt,
-      :char,
-      :atom,
-      :literal,
-      :quoted_atom,
-      :string_start,
-      :charlist_start,
-      :sigil_start,
-      :at_op,
-      :unary_op,
-      :dual_op,
-      :ternary_op,
-      :ellipsis_op,
-      :"<<",
-      :percent
-    ]
-  end
+  defp struct_base_start?(kind)
+       when kind in [
+              :alias,
+              :identifier,
+              :int,
+              :flt,
+              :char,
+              :atom,
+              :literal,
+              :quoted_atom,
+              :string_start,
+              :charlist_start,
+              :sigil_start,
+              :at_op,
+              :unary_op,
+              :dual_op,
+              :ternary_op,
+              :ellipsis_op,
+              :"<<",
+              :percent
+            ],
+       do: true
+
+  defp struct_base_start?(_kind), do: false
 
   defp parse_struct(t, pct, diags, nid, fuel) do
     {name, j0, diags, nid, fuel} =

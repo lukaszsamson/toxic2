@@ -947,8 +947,9 @@ defmodule Toxic2.Lexer do
   # on EVERY operator token just to inspect one or two bytes.
   defp kw_colon_at?(bin, len) do
     case bin do
-      <<_::binary-size(^len), ?:, c, _::binary>> ->
-        c in [?\s, ?\t, ?\n, ?\r, ?\f, ?\v, ?], ?}, ?), ?,, ?;]
+      <<_::binary-size(^len), ?:, c, _::binary>>
+      when c in [?\s, ?\t, ?\n, ?\r, ?\f, ?\v, ?], ?}, ?), ?,, ?;] ->
+        true
 
       <<_::binary-size(^len), ?:>> ->
         true
