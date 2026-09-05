@@ -666,13 +666,10 @@ defmodule Toxic2.Lexer do
         lex_unicode(bin, line, col, acc, w, st)
 
       _ ->
-        case kw_suffix(after_name) do
-          {:kw, rest} ->
-            cont(rest, {:kw_identifier, line, col, line, col + len + 1, name}, acc, w, st)
-
-          {:kw_nospace, rest} ->
-            acc = kw_nospace_error(name, line, col, len, acc)
-            cont(rest, {:kw_identifier, line, col, line, col + len + 1, name}, acc, w, st)
+        case kw_name(bin) do
+          {:kw, klen, kname, rest, nospace?} ->
+            acc = if nospace?, do: kw_nospace_error(kname, line, col, klen, acc), else: acc
+            cont(rest, {:kw_identifier, line, col, line, col + klen + 1, kname}, acc, w, st)
 
           :no ->
             w = bang_before_eq_notice(name, after_name, line, col, len, w)
@@ -691,13 +688,10 @@ defmodule Toxic2.Lexer do
         lex_unicode(bin, line, col, acc, w, st)
 
       _ ->
-        case kw_suffix(after_name) do
-          {:kw, rest} ->
-            cont(rest, {:kw_identifier, line, col, line, col + len + 1, name}, acc, w, st)
-
-          {:kw_nospace, rest} ->
-            acc = kw_nospace_error(name, line, col, len, acc)
-            cont(rest, {:kw_identifier, line, col, line, col + len + 1, name}, acc, w, st)
+        case kw_name(bin) do
+          {:kw, klen, kname, rest, nospace?} ->
+            acc = if nospace?, do: kw_nospace_error(kname, line, col, klen, acc), else: acc
+            cont(rest, {:kw_identifier, line, col, line, col + klen + 1, kname}, acc, w, st)
 
           :no ->
             cont(after_name, {:alias, line, col, line, col + len, name}, acc, w, st)
@@ -1064,6 +1058,19 @@ defmodule Toxic2.Lexer do
 
   defp kw_suffix(<<?:, _::binary>> = bin), do: {:kw_nospace, rest_at(bin, 1)}
   defp kw_suffix(_), do: :no
+
+  # A keyword key reads the FULL atom-shaped name — word chars and `@`, then an optional trailing
+  # `?`/`!` — before checking for the colon, mirroring upstream's suffix check ordering: `foo@bar:`
+  # and `Foo!:` are ordinary keyword keys even though `foo@bar` / `Foo!` are invalid bare names.
+  defp kw_name(bin) do
+    {klen, after_name} = read_atom_name(bin)
+
+    case kw_suffix(after_name) do
+      {:kw, rest} -> {:kw, klen, binary_part(bin, 0, klen), rest, false}
+      {:kw_nospace, rest} -> {:kw, klen, binary_part(bin, 0, klen), rest, true}
+      :no -> :no
+    end
+  end
 
   # `foo:bar` — keep the keyword interpretation (tolerant: the tree stays `[foo: bar]`) but record
   # the missing-space error so strict mode rejects it, matching the oracle.

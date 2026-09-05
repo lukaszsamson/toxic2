@@ -140,6 +140,23 @@ defmodule Toxic2.YrlEdgeCasesTest do
     end
   end
 
+  describe "atom-shaped keyword keys (GRAMMAR_GAPS R5)" do
+    test "keyword keys read the full atom name before the colon" do
+      for src <- ["[foo@bar: 1]", "[Foo!: 1]", "[Foo?: 1]", "[x@: 1]", "[Foo@bar: 1]"] do
+        assert_accepted(src)
+      end
+
+      assert {[foo@bar: 1], []} = Toxic2.parse_to_ast("[foo@bar: 1]")
+      assert {[Foo!: 1], []} = Toxic2.parse_to_ast("[Foo!: 1]")
+    end
+
+    test "the bare names stay invalid and :: stays the type operator" do
+      assert_rejected("foo@bar")
+      assert_accepted("a :: b")
+      assert_accepted("foo::bar")
+    end
+  end
+
   describe "spaced bracket access (GRAMMAR_GAPS R1/R2)" do
     test "any access_expr base takes a spaced bracket_arg" do
       for src <- ["f() [0]", "(x) [0]", "Foo [0]", "%{} [0]", "a.b() [0]", "1 [0]", "&1 [0]"] do
