@@ -67,6 +67,28 @@ defmodule Toxic2.YrlEdgeCasesTest do
     end
   end
 
+  describe "uppercase radix / malformed \\u{} / trailing continuation (OX2, R6, R14)" do
+    test "uppercase radix prefixes are invalid-character errors" do
+      Enum.each(["0XFF", "0O17", "0B101", "x = 0XFF + 1"], &assert_lex_rejected/1)
+      Enum.each(["0xFF", "0o17", "0b101"], &assert_lex_ok/1)
+    end
+
+    test "braced unicode escapes need 1-6 hex digits immediately closed by }" do
+      assert_lex_rejected("\"\\u{41\"")
+      assert_lex_rejected("\"\\u{41x}\"")
+      assert_lex_rejected("\"\\u{0000041}\"")
+      assert_lex_rejected(":\"\\u{41\"")
+      assert_lex_ok("\"\\u{41}\"")
+      assert_lex_ok("\"\\u{10FFFF}\"")
+    end
+
+    test "a line continuation at EOF is an invalid escape" do
+      assert_lex_rejected("x\\\n")
+      assert_lex_rejected("x\\\r\n")
+      assert_lex_ok("x\\\n+1")
+    end
+  end
+
   describe "invalid sigil names (elixir_tokenizer.erl)" do
     test "rejected names" do
       assert_lex_rejected("~foo(bar)")

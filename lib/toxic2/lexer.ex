@@ -387,6 +387,14 @@ defmodule Toxic2.Lexer do
   # the two forms have identical token spans, so we emit a zero-width `:cont` marker for the
   # space-preceded form; `Tokens.from_list/1` partitions it out of the stream into a side-set the
   # parser's no-parens-arg check consults (it never reaches the parser as a token).
+  # A continuation with NOTHING after it (`x\⏎<eof>`) is upstream's hard "invalid escape \\ at
+  # end of file" error (R14) — the terminal clauses come first, mirroring elixir_tokenizer.
+  defp lex(<<?\\, ?\r, ?\n>>, line, col, acc, w, st),
+    do: lex(<<>>, line, col, cont_eof_error(acc, line, col), w, st)
+
+  defp lex(<<?\\, ?\n>>, line, col, acc, w, st),
+    do: lex(<<>>, line, col, cont_eof_error(acc, line, col), w, st)
+
   defp lex(<<?\\, ?\r, ?\n, rest::binary>>, line, col, acc, w, st),
     do: lex(rest, line + 1, 1, cont_marker(acc, line, col), w, st)
 
@@ -468,8 +476,10 @@ defmodule Toxic2.Lexer do
   # --- numbers: 0x / 0o / 0b ---------------------------------------------
   # `digit_run/4` fuses the old run_len + valid_underscores? double pass (each a captured-fun call
   # per byte, plus a validation-only `binary_part` slice) into ONE direct-guard pass per radix.
+  # Only LOWERCASE radix prefixes exist upstream — `0XFF`/`0O17`/`0B101` hit the invalid
+  # character-after-number error, so uppercase falls through to the decimal clause (OX2).
   defp lex(<<?0, b, rest::binary>> = bin, line, col, acc, w, st)
-       when b in [?x, ?X, ?o, ?O, ?b, ?B] do
+       when b in [?x, ?o, ?b] do
     {class, base} = radix(b)
     {rlen, ok, after_digits} = digit_run(rest, class, 0, :start)
 
@@ -1376,14 +1386,18 @@ defmodule Toxic2.Lexer do
   # `\x` not followed by a hex digit or `{` (e.g. `\xG`) — invalid (Elixir rejects it).
   defp esc(<<?x, rest::binary>>), do: {<<?x>>, rest, :sameline, {:invalid_hex_escape, %{}}}
 
-  # `\u{H..}` — a codepoint. Empty braces / out-of-range / surrogate are invalid.
+  # `\u{H..}` — a codepoint: upstream requires ONE TO SIX hex digits IMMEDIATELY followed by `}`
+  # (R6) — `\u{41`, `\u{41x}`, and `\u{0000041}` are all errors, not a silent "A".
   defp esc(<<?u, ?{, rest::binary>>) do
     {hex, rest2} = take_hex(rest, <<>>)
-    rest3 = drop_rbrace(rest2)
 
-    if hex == <<>>,
-      do: {<<>>, rest3, :sameline, {:invalid_unicode_escape, %{}}},
-      else: wrap_cp(cp_to_utf8(hex), rest3)
+    case rest2 do
+      <<?}, rest3::binary>> when hex != <<>> and byte_size(hex) <= 6 ->
+        wrap_cp(cp_to_utf8(hex), rest3)
+
+      _ ->
+        {<<>>, drop_rbrace(rest2), :sameline, {:invalid_unicode_escape, %{}}}
+    end
   end
 
   defp esc(<<?u, a, b, c, d, rest::binary>>)
@@ -2238,6 +2252,10 @@ defmodule Toxic2.Lexer do
 
   defp cont_marker(acc, _line, _col), do: acc
 
+  # `x\⏎<eof>`: upstream's "invalid escape \\ at end of file" (an incomplete editor buffer).
+  defp cont_eof_error(acc, line, col),
+    do: [{:error, line, col, line, col + 1, LexError.new(:invalid_eof_escape, %{})} | acc]
+
   # `String.to_float/1` raises on an out-of-range magnitude (e.g. `1.0e309`); keep the lexer total.
   defp safe_to_float(bin) do
     {:ok, String.to_float(bin)}
@@ -2246,9 +2264,9 @@ defmodule Toxic2.Lexer do
   end
 
   # `{digit_run class, base}` — the class is `:hex` or the highest digit byte of the radix.
-  defp radix(b) when b in [?x, ?X], do: {:hex, 16}
-  defp radix(b) when b in [?o, ?O], do: {?7, 8}
-  defp radix(b) when b in [?b, ?B], do: {?1, 2}
+  defp radix(?x), do: {:hex, 16}
+  defp radix(?o), do: {?7, 8}
+  defp radix(?b), do: {?1, 2}
 
   defp delim_kind(?(), do: :"("
   defp delim_kind(?)), do: :")"
