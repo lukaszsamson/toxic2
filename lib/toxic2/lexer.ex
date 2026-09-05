@@ -1882,7 +1882,7 @@ defmodule Toxic2.Lexer do
   end
 
   defp heredoc_start_body(body, line, acc, w, st, {delim, mode, interp?, end_kind}) do
-    strip = heredoc_indent(body, delim, 0, heredoc_sig_pattern())
+    strip = heredoc_indent(body, delim, interp?, heredoc_sig_pattern())
     hc = {delim, mode, interp?, strip, end_kind}
 
     # Seed an empty fragment: a heredoc always opens with a fragment, so an immediate `#{…}` keeps
@@ -1891,55 +1891,103 @@ defmodule Toxic2.Lexer do
     heredoc_line_start(body, line + 1, [<<>>], {line + 1, 1}, acc, w, st, hc)
   end
 
-  # Pre-scan the body for the closing delimiter's indentation. `depth` tracks `#{...}` nesting so a
-  # `"""` inside an interpolation isn't mistaken for the terminator. Returns 0 if none is found.
+  # Pre-scan the body for the closing delimiter's indentation. Interpolation-aware (R3): `#{...}`
+  # opens a code region ONLY when the heredoc interpolates (a raw `~S`/`~W` heredoc's literal `#{`
+  # is plain text), and inside a real interpolation the brace count ignores braces that sit in
+  # nested strings, charlists, comments, and `?{`-style char literals — upstream extracts the
+  # interpolation with the tokenizer before stripping indentation. Returns 0 if no terminator.
   # `pat` is the compiled `heredoc_sig_pattern/0` (the `\n`/`\`/`#{` needle), fetched ONCE by the
   # caller and threaded through so the per-line scan never re-reads it from `:persistent_term`.
-  defp heredoc_indent(bin, delim, depth, pat) do
+  defp heredoc_indent(bin, delim, interp?, pat) do
     {ws, after_ws} = take_hspace(bin, 0)
 
     cond do
-      depth == 0 and heredoc_delim3?(after_ws, delim) -> ws
-      true -> heredoc_indent_skip(after_ws, delim, depth, pat)
+      heredoc_delim3?(after_ws, delim) -> ws
+      true -> heredoc_indent_skip(after_ws, delim, interp?, pat)
     end
   end
 
-  defp heredoc_indent_skip(bin, delim, depth, pat) do
-    case skip_to_eol(bin, depth, pat) do
+  defp heredoc_indent_skip(bin, delim, interp?, pat) do
+    case skip_to_eol(bin, interp?, pat) do
       :eof -> 0
-      {rest, depth2} -> heredoc_indent(rest, delim, depth2, pat)
+      {rest} -> heredoc_indent(rest, delim, interp?, pat)
     end
   end
 
-  # Scan to the next newline (consumed), tracking `#{`/brace depth and skipping escaped chars.
-  defp skip_to_eol(<<>>, _depth, _pat), do: :eof
-  defp skip_to_eol(<<?\n, rest::binary>>, depth, _pat), do: {rest, depth}
+  # Scan to the next newline (consumed), entering `#{…}` code regions when interpolation is on.
+  defp skip_to_eol(<<>>, _interp?, _pat), do: :eof
+  defp skip_to_eol(<<?\n, rest::binary>>, _interp?, _pat), do: {rest}
   # A `\`-newline is a content line continuation, but the closing `"""` still lives on its own
   # physical line — so for the indentation pre-scan it counts as a line boundary, not an escape.
-  defp skip_to_eol(<<?\\, ?\r, ?\n, rest::binary>>, depth, _pat), do: {rest, depth}
-  defp skip_to_eol(<<?\\, ?\n, rest::binary>>, depth, _pat), do: {rest, depth}
-  defp skip_to_eol(<<?\\, _c, rest::binary>>, depth, pat), do: skip_to_eol(rest, depth, pat)
-  defp skip_to_eol(<<?#, ?{, rest::binary>>, depth, pat), do: skip_to_eol(rest, depth + 1, pat)
+  defp skip_to_eol(<<?\\, ?\r, ?\n, rest::binary>>, _interp?, _pat), do: {rest}
+  defp skip_to_eol(<<?\\, ?\n, rest::binary>>, _interp?, _pat), do: {rest}
+  defp skip_to_eol(<<?\\, _c, rest::binary>>, interp?, pat), do: skip_to_eol(rest, interp?, pat)
 
-  defp skip_to_eol(<<?{, rest::binary>>, depth, pat) when depth > 0,
-    do: skip_to_eol(rest, depth + 1, pat)
-
-  defp skip_to_eol(<<?}, rest::binary>>, depth, pat) when depth > 0,
-    do: skip_to_eol(rest, depth - 1, pat)
-
-  # Depth-0 fast path: outside interpolation the only bytes that matter are `\n` / `\` / `#{`, so
-  # jump straight to the next one with a C-level `:binary.match` instead of byte-recursing the whole
-  # line. The 2-byte `#{` needle means lone `#`s (common in markdown heredocs) are skipped for free.
-  # The matched byte is re-dispatched through the specific clauses above. (depth > 0 — inside `#{…}`,
-  # where `{`/`}` also matter — stays on the byte path below; interpolation bodies are short.)
-  defp skip_to_eol(<<c, _::binary>> = bin, 0, pat) when c != ?\n and c != ?\\ and c != ?# do
-    case :binary.match(bin, pat) do
-      :nomatch -> :eof
-      {pos, _} -> skip_to_eol(rest_at(bin, pos), 0, pat)
+  defp skip_to_eol(<<?#, ?{, rest::binary>>, true, pat) do
+    case skip_interp(rest, 1, pat) do
+      :eof -> :eof
+      {rest2} -> skip_to_eol(rest2, true, pat)
     end
   end
 
-  defp skip_to_eol(<<_c, rest::binary>>, depth, pat), do: skip_to_eol(rest, depth, pat)
+  # Fast path: outside interpolation the only bytes that matter are `\n` / `\` / `#{`, so jump
+  # straight to the next one with a C-level `:binary.match` instead of byte-recursing the whole
+  # line. The 2-byte `#{` needle means lone `#`s (common in markdown heredocs) are skipped for
+  # free; in a RAW heredoc the `#{` clause above doesn't match and the fallback steps past it.
+  defp skip_to_eol(<<c, _::binary>> = bin, interp?, pat) when c != ?\n and c != ?\\ and c != ?# do
+    case :binary.match(bin, pat) do
+      :nomatch -> :eof
+      {pos, _} -> skip_to_eol(rest_at(bin, pos), interp?, pat)
+    end
+  end
+
+  defp skip_to_eol(<<_c, rest::binary>>, interp?, pat), do: skip_to_eol(rest, interp?, pat)
+
+  # Skip a `#{…}` interpolation body during the indentation pre-scan, brace-counting only braces
+  # that are CODE: nested strings/charlists (with their own escapes and nested interpolations),
+  # comments, and `?{` / `?\{` char literals are consumed without counting. Newlines inside the
+  # interpolation are part of it, not heredoc line boundaries. (A sigil or nested heredoc inside
+  # the interpolation is not modeled — upstream fully tokenizes here; those stay approximate.)
+  defp skip_interp(<<>>, _depth, _pat), do: :eof
+  defp skip_interp(<<?}, rest::binary>>, 1, _pat), do: {rest}
+  defp skip_interp(<<?}, rest::binary>>, depth, pat), do: skip_interp(rest, depth - 1, pat)
+  defp skip_interp(<<?{, rest::binary>>, depth, pat), do: skip_interp(rest, depth + 1, pat)
+
+  defp skip_interp(<<??, ?\\, _c, rest::binary>>, depth, pat), do: skip_interp(rest, depth, pat)
+
+  defp skip_interp(<<??, c, rest::binary>>, depth, pat) when c in [?{, ?}, ?", ?', ?#],
+    do: skip_interp(rest, depth, pat)
+
+  defp skip_interp(<<q, rest::binary>>, depth, pat) when q in [?", ?'] do
+    case skip_interp_str(rest, q, pat) do
+      :eof -> :eof
+      {rest2} -> skip_interp(rest2, depth, pat)
+    end
+  end
+
+  defp skip_interp(<<?#, rest::binary>>, depth, pat) do
+    case :binary.match(rest, "\n") do
+      :nomatch -> :eof
+      {pos, _} -> skip_interp(rest_at(rest, pos + 1), depth, pat)
+    end
+  end
+
+  defp skip_interp(<<_c, rest::binary>>, depth, pat), do: skip_interp(rest, depth, pat)
+
+  # A string/charlist inside the interpolation: escapes are skipped and a nested `#{…}` recurses.
+  defp skip_interp_str(<<>>, _q, _pat), do: :eof
+  defp skip_interp_str(<<q, rest::binary>>, q, _pat), do: {rest}
+
+  defp skip_interp_str(<<?\\, _c, rest::binary>>, q, pat), do: skip_interp_str(rest, q, pat)
+
+  defp skip_interp_str(<<?#, ?{, rest::binary>>, q, pat) do
+    case skip_interp(rest, 1, pat) do
+      :eof -> :eof
+      {rest2} -> skip_interp_str(rest2, q, pat)
+    end
+  end
+
+  defp skip_interp_str(<<_c, rest::binary>>, q, pat), do: skip_interp_str(rest, q, pat)
 
   defp frag_of(:string_end), do: :string_fragment
   defp frag_of(:charlist_end), do: :charlist_fragment

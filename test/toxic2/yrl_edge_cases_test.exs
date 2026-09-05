@@ -140,6 +140,22 @@ defmodule Toxic2.YrlEdgeCasesTest do
     end
   end
 
+  describe "heredoc indentation pre-scan is interpolation-aware (GRAMMAR_GAPS R3)" do
+    test "a raw sigil's literal \#{ does not derail indentation stripping" do
+      assert {{:sigil_S, _, [{:<<>>, _, ["\#{\n"]}, []]}, []} =
+               Toxic2.parse_to_ast("~S\"\"\"\n  \#{\n  \"\"\"")
+    end
+
+    test "braces inside interpolated strings and comments are not counted" do
+      assert {ast1, []} = Toxic2.parse_to_ast("\"\"\"\n  \#{\"{\"}\n  \"\"\"")
+      assert ast1 == Code.string_to_quoted!("\"\"\"\n  \#{\"{\"}\n  \"\"\"")
+
+      src = "\"\"\"\n  before\n  \#{# {\n1}\n  after\n  \"\"\""
+      assert {ast2, []} = Toxic2.parse_to_ast(src)
+      assert ast2 == Code.string_to_quoted!(src)
+    end
+  end
+
   describe "atom-shaped keyword keys (GRAMMAR_GAPS R5)" do
     test "keyword keys read the full atom name before the colon" do
       for src <- ["[foo@bar: 1]", "[Foo!: 1]", "[Foo?: 1]", "[x@: 1]", "[Foo@bar: 1]"] do
