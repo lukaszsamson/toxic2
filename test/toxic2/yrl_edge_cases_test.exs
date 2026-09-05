@@ -176,6 +176,19 @@ defmodule Toxic2.YrlEdgeCasesTest do
     end
   end
 
+  describe "`not in` keyword ownership and strictness (GRAMMAR_GAPS R4)" do
+    test "a trailing keyword run belongs to the call under `not in`" do
+      assert {[{:not, _, [{:in, _, [{:a, _, nil}, {:f, _, [[x: 1, y: 2]]}]}]}], []} =
+               Toxic2.parse_to_ast("[a not in f x: 1, y: 2]")
+    end
+
+    test "ambiguous commas after `not in` no-parens calls are rejected" do
+      assert_rejected("f 0, a not in f b, c")
+      assert_rejected("[a not in f b, c]")
+      assert_accepted("[a in f x: 1, y: 2]")
+    end
+  end
+
   describe "spaced bracket access (GRAMMAR_GAPS R1/R2)" do
     test "any access_expr base takes a spaced bracket_arg" do
       for src <- ["f() [0]", "(x) [0]", "Foo [0]", "%{} [0]", "a.b() [0]", "1 [0]", "&1 [0]"] do

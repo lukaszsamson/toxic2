@@ -364,6 +364,11 @@ defmodule Toxic2.Parser do
   defp rightmost_operand({:node, :unary_op, _sp, [_op, operand], _f, _d}),
     do: rightmost_operand(operand)
 
+  # The fused `not in` comparison is a binary op with its own CST kind — descend like one, so
+  # keyword absorption and the strict ambiguity checks see through `a not in f x: 1`.
+  defp rightmost_operand({:node, :not_in_op, _sp, [_l, rhs], _f, _d}),
+    do: rightmost_operand(rhs)
+
   defp rightmost_operand(node), do: node
 
   # Does the expression END in a bare no-parens call (any arity)? In a `:matched` position
@@ -2504,6 +2509,11 @@ defmodule Toxic2.Parser do
   defp append_trailing_kw(t, {:node, :unary_op, sp, [op, operand], _f, d}, pair) do
     operand = append_trailing_kw(t, operand, pair)
     CST.node(:unary_op, merge(sp, cst_span(t, pair)), [op, operand], :matched, d)
+  end
+
+  defp append_trailing_kw(t, {:node, :not_in_op, sp, [l, rhs], _f, d}, pair) do
+    rhs = append_trailing_kw(t, rhs, pair)
+    CST.node(:not_in_op, merge(sp, cst_span(t, pair)), [l, rhs], :matched, d)
   end
 
   defp append_trailing_kw(t, {:node, kind, sp, children, _f, d}, pair) do
