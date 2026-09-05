@@ -200,6 +200,40 @@ defmodule Toxic2.YrlEdgeCasesTest do
     end
   end
 
+  describe "doubled `->` and unmatched-unary postfix (GRAMMAR_GAPS OX1, R16)" do
+    test "a second -> without a `;` boundary is an error" do
+      for src <- [
+            "fn x -> y -> z end",
+            "case x do 1 -> 2 -> 3 end",
+            "cond do true -> 1 -> 2 end",
+            "receive do msg -> msg -> :other end",
+            "fn x -> y\n-> z end",
+            "case x do 1 -> 2\n-> 3 end"
+          ] do
+        assert_rejected(src)
+      end
+    end
+
+    test "`;`-separated zero-pattern clauses and multi-line heads stay valid" do
+      for src <- [
+            "fn x -> y; -> z end",
+            "fn x -> y\nz -> w end",
+            "fn\n-> 1 end",
+            "case x do a when b\n-> c end"
+          ] do
+        assert_accepted(src)
+      end
+    end
+
+    test "postfix after a unary-wrapped do-block is rejected like the unwrapped form" do
+      assert_rejected("!f do x end.foo")
+      assert_rejected("!f do x end[0]")
+      assert_rejected("@f do x end.(1)")
+      assert_accepted("!(f do x end).foo")
+      assert_accepted("!f do x end |> g")
+    end
+  end
+
   describe "unwrap_when: comma after a stab-head guard (GRAMMAR_GAPS K1)" do
     test "a non-trailing `when` binds one pattern; more patterns follow" do
       for src <- [

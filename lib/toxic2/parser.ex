@@ -681,6 +681,13 @@ defmodule Toxic2.Parser do
 
   defp postfix(t, i, lhs, ctx, diags, nid, fuel, pdepth) do
     cond do
+      # A unary node whose operand (chain) carries a do-block is an UNMATCHED expr (yrl keeps
+      # `unary_op_eol unmatched_expr` unmatched); dot/access/paren postfixes need a matched lhs,
+      # so `!f do x end.foo` / `@f do x end.(1)` must error like the unwrapped forms (R16).
+      # `@x.y` (no do-block) keeps its postfix chain.
+      unmatched_unary?(lhs) ->
+        {lhs, i, diags, nid, fuel}
+
       paren_call?(t, lhs, i, pdepth) ->
         {args, j, diags, nid, fuel} = parse_seq(t, i + 1, :")", :call, diags, nid, fuel)
 
@@ -708,6 +715,16 @@ defmodule Toxic2.Parser do
   end
 
   defp dot_continuation?(t, i), do: tk(t, skip_eols(t, i)) == :dot
+
+  defp unmatched_unary?({:node, :unary_op, _sp, [_op, operand], _f, _d}),
+    do: unmatched_operand?(operand)
+
+  defp unmatched_unary?(_lhs), do: false
+
+  defp unmatched_operand?({:node, :unary_op, _sp, [_op, operand], _f, _d}),
+    do: unmatched_operand?(operand)
+
+  defp unmatched_operand?(node), do: has_do_block?(node)
 
   # Token kinds that may name a remote-call member after a `.` (besides identifier/alias/quoted):
   # the reserved words (`true`/`false`/`nil`, `do`/`end`/`fn`, block labels, `when`/`and`/`or`/
@@ -1778,15 +1795,45 @@ defmodule Toxic2.Parser do
       semi = skip_eols(t, i)
       parse_clause_body(t, semi + 1, [empty_stmt(t, semi)], stop, diags, nid, fuel)
     else
-      parse_clause_body_cont(t, skip_eoe(t, i), acc, stop, diags, nid, fuel)
+      j = skip_eoe(t, i)
+      {diags, nid} = check_bare_arrow(t, j, diags, nid)
+      parse_clause_body_cont(t, j, acc, stop, j > i, diags, nid, fuel)
     end
   end
 
+  # A `->` where a body statement should start is only a NEW zero-pattern clause after an explicit
+  # `;` (`fn x -> y; -> z end` is valid). Reached across nothing (`1 -> 2 -> 3`, the classic
+  # doubled-arrow typo, OX1) or only newlines (`fn x -> y\n-> z end`), it is upstream's syntax
+  # error before `->`; the tolerant clause split still happens, but with a diagnostic.
+  defp check_bare_arrow(t, j, diags, nid) do
+    if tk(t, j) == :stab_op and tk(t, prev_non_eol(t, j - 1)) != :";" do
+      {_id, diags, nid} =
+        Diagnostics.emit(diags, nid, :parser, :error, :unexpected_token, tok_span(t, j), %{
+          kind: :stab_op
+        })
+
+      {diags, nid}
+    else
+      {diags, nid}
+    end
+  end
+
+  defp prev_non_eol(t, i) when i > 0 do
+    if tk(t, i) == :eol, do: prev_non_eol(t, i - 1), else: i
+  end
+
+  defp prev_non_eol(_t, i), do: i
+
   defp empty_stmt(t, i), do: CST.node(:empty_stmt, tok_span(t, i), [], :matched, nil)
 
-  defp parse_clause_body_cont(t, i, acc, stop, diags, nid, fuel) do
+  # `crossed?` = an EOE (newline / `;`) was crossed to reach `i`. A NEW clause head on the SAME
+  # line as the previous arrow/statement is upstream's doubled-arrow error (OX1): without a
+  # boundary, `y -> z` after `fn x -> ` is body content whose trailing `->` then errors in
+  # `check_bare_arrow` — only a bare `->` (already diagnosed unless after `;`) still splits.
+  defp parse_clause_body_cont(t, i, acc, stop, crossed?, diags, nid, fuel) do
     cond do
-      clause_section_end?(t, i, stop) or clause_head_ahead?(t, i, 0, stop) ->
+      clause_section_end?(t, i, stop) or tk(t, i) == :stab_op or
+          (crossed? and clause_head_ahead?(t, i, 0, stop)) ->
         {CST.node(
            :stab_body,
            list_span(t, :lists.reverse(acc)),
