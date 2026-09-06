@@ -750,6 +750,30 @@ defmodule Toxic2.Lexer do
   end
 
   defp emit_operator_or_kw(bin, kind, value, len, line, col, acc, w, st) do
+    case dot_member_split(kind, acc) do
+      # DOT CONTEXT (F2): right after a `.`, only operators legal as remote member names are one
+      # token — `//`, `->`, `=>` are not, so upstream's handle_dot emits their FIRST char as the
+      # member and re-lexes the rest (`foo.//1` => `(foo./()) / 1`, `foo.->1` => `(foo.-()) > 1`).
+      {k1, v1} ->
+        cont(rest_at(bin, 1), {k1, line, col, line, col + 1, v1}, acc, w, st)
+
+      nil ->
+        emit_operator_or_kw_free(bin, kind, value, len, line, col, acc, w, st)
+    end
+  end
+
+  defp dot_member_split(kind, [{:dot, _, _, _, _, _} | _acc])
+       when kind in [:ternary_op, :stab_op, :assoc_op] do
+    case kind do
+      :ternary_op -> {:mult_op, :/}
+      :stab_op -> {:dual_op, :-}
+      :assoc_op -> {:match_op, :=}
+    end
+  end
+
+  defp dot_member_split(_kind, _acc), do: nil
+
+  defp emit_operator_or_kw_free(bin, kind, value, len, line, col, acc, w, st) do
     # `..//` followed — across horizontal space and `\`-newline continuations — by `/` fuses
     # into ONE `:ternary_op` token (`&..///3`, `&..//\<nl>/3`): upstream re-emits the ternary
     # operator as a single identifier-shaped token exactly in this shape, so the parser's

@@ -1587,8 +1587,10 @@ defmodule Toxic2.Parser do
 
   # `1 ->` with no expression after the `->` (`case x do 1 -> end`, `fn -> end`) — Elixir warns an
   # expression is always required on the right side of `->`. The body is an empty `:stab_body`.
+  # Fires for a fully empty body AND for a leading `;` (`fn x -> ; end`, `fn x -> ; 1 end`) —
+  # upstream warns for the implicit-nil first expression in both shapes (F7).
   defp maybe_empty_stab_warn(t, arrow_i, body, diags, nid) do
-    if ctag(body) == :node and ckind(body) == :stab_body and cchildren(body) == [] do
+    if ctag(body) == :node and ckind(body) == :stab_body and empty_or_semi_body?(cchildren(body)) do
       {_id, diags, nid} =
         Diagnostics.emit(
           diags,
@@ -1916,6 +1918,10 @@ defmodule Toxic2.Parser do
   end
 
   defp empty_stmt(t, i), do: CST.node(:empty_stmt, tok_span(t, i), [], :matched, nil)
+
+  defp empty_or_semi_body?([]), do: true
+  defp empty_or_semi_body?([{:node, :empty_stmt, _sp, _ch, _f, _d} | _rest]), do: true
+  defp empty_or_semi_body?(_children), do: false
 
   # `crossed?` = an EOE (newline / `;`) was crossed to reach `i`. A NEW clause head on the SAME
   # line as the previous arrow/statement is upstream's doubled-arrow error (OX1): without a

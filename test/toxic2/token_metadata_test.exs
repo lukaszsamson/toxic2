@@ -96,6 +96,24 @@ defmodule Toxic2.TokenMetadataTest do
   describe "from_brackets: / from_interpolation:" do
     test "access uses from_brackets:", do: Enum.each(["foo[bar]", "a[b][c]"], &assert_parity/1)
 
+    test "dot-context operator split and leading-semicolon stab bodies (F2, F7)" do
+      Enum.each(
+        [
+          # F2: `//`/`->`/`=>` split after a dot — the first char is the member
+          "foo.//1",
+          "foo.->1",
+          "foo.=>1",
+          "foo. // 1",
+          "foo.->x",
+          # F7: a leading `;` is the implicit-nil first body expression
+          "fn x -> ; end",
+          "fn x -> ; 1 end",
+          "fn x -> ;\n1 end"
+        ],
+        &assert_parity/1
+      )
+    end
+
     test "P4 metadata parity: K11, K12, R10, R19" do
       Enum.each(
         [

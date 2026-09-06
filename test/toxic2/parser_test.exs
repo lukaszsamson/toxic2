@@ -560,9 +560,14 @@ defmodule Toxic2.ParserTest do
       assert {{{:., _, [{:foo, _, nil}, :++]}, _, [1, 2]}, []} =
                Toxic2.parse_to_ast("foo.++(1, 2)")
 
-      # `->` / `=>` / `//` are NOT valid members
+      # `->` / `=>` / `//` are NOT valid members — the dot context SPLITS them (F2): the first
+      # char becomes the member, the rest re-lexes (`a.->1` => `(a.-()) > 1`), so the bare form
+      # errors on the missing right operand instead.
       {_a, diags} = Toxic2.parse_to_ast("a.->")
-      assert Enum.any?(diags, &(elem(&1, 3) == :unexpected_after_dot))
+      assert Enum.any?(diags, &(elem(&1, 3) == :expected_expression))
+
+      assert {{:>, _, [{{:., _, [{:a, _, nil}, :-]}, _, []}, 1]}, []} =
+               Toxic2.parse_to_ast("a.->1")
     end
 
     test "operator function references (`op/arity`) — bare and captured" do

@@ -2823,6 +2823,24 @@ defmodule Toxic2.Lower do
         # (when an encoder is set; bare `nil` otherwise).
         encode_implicit_nil(args_node, body_node, view, opts, acc, nid)
 
+      # A LEADING `;` (`fn x -> ; end`, `fn x -> ; 1 end`) is an empty first body expression:
+      # the same implicit nil as an empty body — anchored at the `->`, with the semicolon as its
+      # `end_of_expression` (F7). Any following statements join it in a `__block__`.
+      [{:node, :empty_stmt, _sp, _ch, _f, _d} = semi | rest] ->
+        {nil_ast, acc, nid} = encode_implicit_nil(args_node, body_node, view, opts, acc, nid)
+        nil_ast = attach_semi_eoe(nil_ast, semi, opts)
+
+        case rest do
+          [] ->
+            {nil_ast, acc, nid}
+
+          rest ->
+            {{:__block__, _m, asts}, acc, nid} =
+              wrap_block(lower_stmts(rest, view, opts, acc, nid))
+
+            {{:__block__, [], [nil_ast | asts]}, acc, nid}
+        end
+
       [one] ->
         {ast, acc, nid} = lower(one, view, opts, acc, nid)
         {wrap_splice(attach_eoe(ast, one, view, opts)), acc, nid}
@@ -2831,6 +2849,20 @@ defmodule Toxic2.Lower do
         wrap_block(lower_stmts(many, view, opts, acc, nid))
     end
   end
+
+  # `end_of_expression` for the implicit nil of a leading `;` body: the eoe scan starts AT the
+  # semicolon (the nil is zero-width just before it), so the `;` itself becomes the terminator.
+  defp attach_semi_eoe({f, meta, a}, semi, opts) do
+    with true <- tm?(opts),
+         {sl, sc, _, _} <- cspan(semi),
+         [_ | _] = kw <- scan_eoe(opts, sl, sc, 0, false, nil) do
+      {f, Enum.concat(kw, meta), a}
+    else
+      _ -> {f, meta, a}
+    end
+  end
+
+  defp attach_semi_eoe(ast, _semi, _opts), do: ast
 
   # The implicit `nil` body of an empty stab clause is encoded through the literal_encoder (if any),
   # anchored at the `->` token — matching `handle_literal(nil, StabToken)` upstream. With no encoder
