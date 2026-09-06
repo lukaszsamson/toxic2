@@ -200,6 +200,47 @@ defmodule Toxic2.YrlEdgeCasesTest do
     end
   end
 
+  describe "P4 lexer gaps (R13, K3, R7, R15, K15)" do
+    test "R13: capture ints use the full integer scanner" do
+      assert {{:&, _, [10]}, []} = Toxic2.parse_to_ast("&1_0")
+      assert {{:&, _, [10]}, []} = Toxic2.parse_to_ast("&0x0A")
+      assert {{:&, _, [10]}, []} = Toxic2.parse_to_ast("&0o12")
+      assert {{:&, _, [10]}, []} = Toxic2.parse_to_ast("&0b1010")
+      assert_lex_rejected("&1_")
+      assert_lex_rejected("&0x")
+    end
+
+    test "K3: ?\\ takes a full codepoint" do
+      assert {233, []} = Toxic2.parse_to_ast("?\\é")
+      assert {{:+, _, [233, 1]}, []} = Toxic2.parse_to_ast("?\\é + 1")
+      assert {233, []} = Toxic2.parse_to_ast("?é")
+    end
+
+    test "R7: raw bidi/break controls stay forbidden behind a backslash" do
+      assert_lex_rejected("\"\\" <> <<0x202E::utf8>> <> "\"")
+      assert_lex_rejected("~s(\\" <> <<0x2028::utf8>> <> ")")
+      assert_lex_rejected("\"\\" <> <<11>> <> "\"")
+      # the TEXTUAL escape is legal
+      assert_lex_ok("\"\\u202E\"")
+    end
+
+    test "R15: @-bearing names are only atoms or keyword keys" do
+      assert_lex_rejected("é@bar")
+      assert_lex_rejected("a.é@bar()")
+      assert_lex_rejected("not@bar")
+      assert_lex_rejected("foo@bar")
+      assert_lex_ok(":é@bar")
+      assert_lex_ok("[é@bar: 1]")
+      assert_lex_ok("foo!@x")
+    end
+
+    test "K15: an outdented heredoc warns ONCE, at the first outdented line" do
+      {_ast, d} = Toxic2.parse_to_ast("\"\"\"\n  a\n b\n c\n  \"\"\"")
+      assert [w] = Enum.filter(d, &(elem(&1, 3) == :outdented_heredoc))
+      assert {elem(w, 4), elem(w, 5)} == {3, 1}
+    end
+  end
+
   describe "P4 parser gaps (OX3, R12, F4, K5, R8, R9, R11)" do
     test "OX3: `not in`-rooted bare map entries are invalid" do
       assert_rejected("%{a not in b}")

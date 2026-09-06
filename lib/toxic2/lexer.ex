@@ -462,9 +462,26 @@ defmodule Toxic2.Lexer do
         st
       )
 
-  defp lex(<<??, ?\\, e, rest::binary>>, line, col, acc, w, st) do
-    value = char_escape_value(e)
-    w = char_escape_notice(e, line, col, 3, w)
+  # The escaped char is a full CODEPOINT (`?\é` is 233, not the first UTF-8 byte of `é`; K3),
+  # and the column advances by 3 codepoints. A raw bidi control / line break after `?\` is
+  # rejected like in strings (R7). The byte fallback keeps invalid UTF-8 tolerant.
+  defp lex(<<??, ?\\, e::utf8, rest::binary>>, line, col, acc, w, st) do
+    cond do
+      bidi?(e) or break?(e) ->
+        code = if bidi?(e), do: :invalid_bidi, else: :invalid_break
+        err = {:error, line, col, line, col + 3, LexError.new(code, %{codepoint: e})}
+        cont(rest, err, acc, w, st)
+
+      true ->
+        value = char_escape_value(e)
+        w = char_escape_notice(e, line, col, 3, w)
+        cont(rest, {:char, line, col, line, col + 3, value}, acc, w, st)
+    end
+  end
+
+  defp lex(<<??, ?\\, b, rest::binary>>, line, col, acc, w, st) do
+    value = char_escape_value(b)
+    w = char_escape_notice(b, line, col, 3, w)
     cont(rest, {:char, line, col, line, col + 3, value}, acc, w, st)
   end
 
@@ -601,11 +618,17 @@ defmodule Toxic2.Lexer do
   end
 
   # --- capture int &1 (before the `&` operator in the table) -------------
+  # Upstream emits `capture_int` then tokenizes the integer NORMALLY, so radix forms and
+  # underscores are valid capture arguments: `&0x0A`, `&0o12`, `&0b1010`, `&1_0` (R13).
   defp lex(<<?&, d, _::binary>> = bin, line, col, acc, w, st) when is_digit(d) do
-    {dlen, _} = take_while(rest_at(bin, 1), 0, &is_digit/1)
-    total = 1 + dlen
-    value = bin |> binary_part(1, dlen) |> String.to_integer()
-    cont(rest_at(bin, total), {:capture_int, line, col, line, col + total, value}, acc, w, st)
+    case capture_int_scan(rest_at(bin, 1)) do
+      {:ok, nlen, value} ->
+        tok = {:capture_int, line, col, line, col + 1 + nlen, value}
+        cont(rest_at(bin, 1 + nlen), tok, acc, w, st)
+
+      {:error, nlen} ->
+        num_error(bin, 1 + nlen, line, col, acc, w, st)
+    end
   end
 
   # --- percent (parser combines with `{`/alias for maps/structs) ---------
@@ -682,6 +705,9 @@ defmodule Toxic2.Lexer do
             cont(rest, {:kw_identifier, line, col, line, col + klen + 1, kname}, acc, w, st)
 
           :no ->
+            # `foo@bar` / `not@bar` — upstream reads the whole word and rejects the `@` (R15);
+            # a `!`/`?` suffix is a real token boundary (`foo!@x` is a call with an `@x` arg).
+            acc = at_in_name_error(name, after_name, line, col, len, acc)
             w = bang_before_eq_notice(name, after_name, line, col, len, w)
             cont(after_name, lower_token(name, line, col, len), acc, w, st)
         end
@@ -830,8 +856,8 @@ defmodule Toxic2.Lexer do
   # Identifier position (start of a word). `:atom`-kind words and tokenizer errors are rejected.
   defp lex_unicode(bin, line, col, acc, w, st) do
     case Toxic2.String.Tokenizer.tokenize(bin) do
-      {:identifier, name, rest, len, _ascii?, _special} ->
-        emit_unicode_name(:identifier, name, rest, len, line, col, acc, w, st)
+      {:identifier, name, rest, len, _ascii?, special} ->
+        emit_unicode_name(:identifier, name, rest, len, special, line, col, acc, w, st)
 
       {:alias, name, rest, len, _ascii?, _special} ->
         emit_unicode_alias(name, rest, len, line, col, acc, w, st)
@@ -880,7 +906,7 @@ defmodule Toxic2.Lexer do
     end
   end
 
-  defp emit_unicode_name(kind, name, rest, len, line, col, acc, w, st) do
+  defp emit_unicode_name(kind, name, rest, len, special, line, col, acc, w, st) do
     case kw_suffix(rest) do
       {:kw, r} ->
         cont(r, {:kw_identifier, line, col, line, col + len + 1, name}, acc, w, st)
@@ -890,6 +916,15 @@ defmodule Toxic2.Lexer do
         cont(r, {:kw_identifier, line, col, line, col + len + 1, name}, acc, w, st)
 
       :no ->
+        # `é@bar` — upstream checks HasAt after the keyword-suffix check: an `@`-bearing name is
+        # valid only as an atom or keyword key (R15). Keep the token for a tolerant tree.
+        acc =
+          if :at in special do
+            [{:error, line, col, line, col + len, LexError.new(:invalid_identifier, %{})} | acc]
+          else
+            acc
+          end
+
         cont(rest, {kind, line, col, line, col + len, name}, acc, w, st)
     end
   end
@@ -1082,6 +1117,16 @@ defmodule Toxic2.Lexer do
       :no -> :no
     end
   end
+
+  defp at_in_name_error(name, <<?@, _::binary>>, line, col, len, acc) do
+    if String.ends_with?(name, "!") or String.ends_with?(name, "?") do
+      acc
+    else
+      [{:error, line, col, line, col + len + 1, LexError.new(:invalid_identifier, %{})} | acc]
+    end
+  end
+
+  defp at_in_name_error(_name, _after, _line, _col, _len, acc), do: acc
 
   # `foo:bar` — keep the keyword interpretation (tolerant: the tree stays `[foo: bar]`) but record
   # the missing-space error so strict mode rejects it, matching the oracle.
@@ -1418,8 +1463,16 @@ defmodule Toxic2.Lexer do
     defp esc(<<unquote(e), rest::binary>>), do: {unquote(<<v>>), rest, :sameline, nil}
   end
 
-  # Any other codepoint after `\` is kept as itself (no escape processing).
-  defp esc(<<e::utf8, rest::binary>>), do: {<<e::utf8>>, rest, :sameline, nil}
+  # Any other codepoint after `\` is kept as itself (no escape processing) — but a RAW bidi
+  # control or unsupported line break stays forbidden even behind a backslash (R7); the textual
+  # `\u202E` escape is unaffected.
+  defp esc(<<e::utf8, rest::binary>>) do
+    cond do
+      bidi?(e) -> {<<e::utf8>>, rest, :sameline, {:invalid_bidi, %{codepoint: e}}}
+      break?(e) -> {<<e::utf8>>, rest, :sameline, {:invalid_break, %{codepoint: e}}}
+      true -> {<<e::utf8>>, rest, :sameline, nil}
+    end
+  end
 
   # Tolerant (totality): `\` before an invalid UTF-8 byte keeps that byte literally (never raise).
   defp esc(<<byte, rest::binary>>), do: {<<byte>>, rest, :sameline, nil}
@@ -1482,8 +1535,17 @@ defmodule Toxic2.Lexer do
   # full CODEPOINT (`~s/\é/` keeps `é`'s bytes as-is — re-encoding its lead byte with `::utf8`
   # would corrupt the content); a `\` before an invalid UTF-8 byte keeps that byte verbatim.
   defp read_sigil(<<?\\, c::utf8, rest::binary>>, line, col, buf, fs, acc, w, st, sm)
-       when c != ?\n and c != ?\r,
-       do: read_sigil(rest, line, col + 2, [<<c::utf8>>, <<?\\>> | buf], fs, acc, w, st, sm)
+       when c != ?\n and c != ?\r do
+    acc =
+      if bidi?(c) or break?(c) do
+        code = if bidi?(c), do: :invalid_bidi, else: :invalid_break
+        [{:error, line, col, line, col + 2, LexError.new(code, %{codepoint: c})} | acc]
+      else
+        acc
+      end
+
+    read_sigil(rest, line, col + 2, [<<c::utf8>>, <<?\\>> | buf], fs, acc, w, st, sm)
+  end
 
   defp read_sigil(<<?\\, b, rest::binary>>, line, col, buf, fs, acc, w, st, sm)
        when b != ?\n and b != ?\r,
@@ -1652,7 +1714,7 @@ defmodule Toxic2.Lexer do
 
   # --- heredocs (phase 10): triple-quoted, indentation-stripped ----------
   # `read_heredoc` scans a `"""` / `'''` body emitting the SAME linear tokens as a string/charlist
-  # (so lowering is shared). `hc = {delim_char, mode, interp?, strip, end_kind}`: `mode` is
+  # (so lowering is shared). `hc = {delim_char, mode, interp?, strip, end_kind, outdent_warned?}`: `mode` is
   # `:full` (unescape via @char_escapes, like a string) or `:raw` (keep verbatim, for uppercase
   # sigil heredocs); `strip` is the closing delimiter's indentation, removed from each line's
   # start. The opener and `strip` are computed in `open_heredoc`. A line `\s*<delim>x3` terminates.
@@ -1670,7 +1732,7 @@ defmodule Toxic2.Lexer do
          acc,
          w,
          st,
-         {_d, :full, _i, _s, _ek} = hc
+         {_d, :full, _i, _s, _ek, _ow} = hc
        ),
        do: heredoc_line_start(rest, line + 1, [<<>> | buf], fs, acc, w, st, hc)
 
@@ -1683,7 +1745,7 @@ defmodule Toxic2.Lexer do
          acc,
          w,
          st,
-         {_d, :full, _i, _s, _ek} = hc
+         {_d, :full, _i, _s, _ek, _ow} = hc
        ),
        do: heredoc_line_start(rest, line + 1, [<<>> | buf], fs, acc, w, st, hc)
 
@@ -1696,7 +1758,7 @@ defmodule Toxic2.Lexer do
          acc,
          w,
          st,
-         {_d, :full, _i, _s, ek} = hc
+         {_d, :full, _i, _s, ek, _ow} = hc
        ) do
     {app, rest2, line2, col2, err} = decode_escape(rest, line, col)
 
@@ -1730,7 +1792,7 @@ defmodule Toxic2.Lexer do
          acc,
          w,
          st,
-         {_d, :raw, _i, _s, _ek} = hc
+         {_d, :raw, _i, _s, _ek, _ow} = hc
        ),
        do: read_heredoc(rest, line, col + 3, [<<?\\, ?#, ?{>> | buf], fs, acc, w, st, hc)
 
@@ -1743,7 +1805,7 @@ defmodule Toxic2.Lexer do
          acc,
          w,
          st,
-         {_d, _m, true, _s, ek} = hc
+         {_d, _m, true, _s, ek, _ow} = hc
        ) do
     acc = flush_fragment(buf, fs, line, col, acc, frag_of(ek))
     acc = [{:begin_interpolation, line, col, line, col + 2, nil} | acc]
@@ -1757,7 +1819,7 @@ defmodule Toxic2.Lexer do
   defp read_heredoc(<<?\n, rest::binary>>, line, _col, buf, fs, acc, w, st, hc),
     do: heredoc_line_start(rest, line + 1, [<<?\n>> | buf], fs, acc, w, st, hc)
 
-  defp read_heredoc(<<>>, line, col, buf, fs, acc, w, _st, {_d, _m, _i, _s, ek}) do
+  defp read_heredoc(<<>>, line, col, buf, fs, acc, w, _st, {_d, _m, _i, _s, ek, _ow}) do
     acc = flush_fragment(buf, fs, line, col, acc, frag_of(ek))
     err = {:error, line, col, line, col, LexError.new(:heredoc_missing_terminator, %{})}
     {[{ek, line, col, line, col, nil}, err | acc], w}
@@ -1786,7 +1848,7 @@ defmodule Toxic2.Lexer do
 
   defp read_heredoc(<<c::utf8, rest::binary>>, line, col, buf, fs, acc, w, st, hc) do
     if bidi?(c) or break?(c) do
-      {_d, _m, _i, _s, ek} = hc
+      {_d, _m, _i, _s, ek, _ow} = hc
       code = if bidi?(c), do: :invalid_bidi, else: :invalid_break
       acc = flush_fragment(buf, fs, line, col, acc, frag_of(ek))
       acc = [{:error, line, col, line, col + 1, LexError.new(code, %{codepoint: c})} | acc]
@@ -1802,20 +1864,22 @@ defmodule Toxic2.Lexer do
 
   # At the start of a body line: the terminator ends the heredoc, otherwise strip the (shared)
   # indentation and keep scanning. Shared by the opener (first line) and the `\n` clause.
-  defp heredoc_line_start(rest, line, buf, fs, acc, w, st, {d, _m, _i, strip, _ek} = hc) do
+  defp heredoc_line_start(rest, line, buf, fs, acc, w, st, {d, _m, _i, strip, _ek, warned?} = hc) do
     if heredoc_terminator?(rest, d) do
       heredoc_close(rest, line, buf, fs, acc, w, st, hc)
     else
       {dropped, rest2} = drop_indent(rest, strip)
-      w = outdented_notice(dropped, strip, rest2, line, w)
-      read_heredoc(rest2, line, 1 + dropped, buf, fs, acc, w, st, hc)
+      w2 = outdented_notice(dropped, strip, rest2, line, warned?, w)
+      # Upstream warns ONCE per heredoc, at the first outdented line (K15) — latch the flag.
+      hc = if w2 != w, do: put_elem(hc, 5, true), else: hc
+      read_heredoc(rest2, line, 1 + dropped, buf, fs, acc, w2, st, hc)
     end
   end
 
   # A content line indented LESS than the closing delimiter (`dropped < strip`, and it isn't a blank
   # line) is an outdented heredoc line — Elixir warns; contents should be indented at least as much
   # as the closing `"""`.
-  defp outdented_notice(dropped, strip, rest2, line, w) when dropped < strip do
+  defp outdented_notice(dropped, strip, rest2, line, false, w) when dropped < strip do
     case rest2 do
       <<?\n, _::binary>> -> w
       <<?\r, _::binary>> -> w
@@ -1824,10 +1888,10 @@ defmodule Toxic2.Lexer do
     end
   end
 
-  defp outdented_notice(_dropped, _strip, _rest2, _line, w), do: w
+  defp outdented_notice(_dropped, _strip, _rest2, _line, _warned?, w), do: w
 
   # The closer is `\s*<delim>x3` at the start of a line; consume it and emit the end token.
-  defp heredoc_close(rest, line, buf, fs, acc, w, st, {_d, _m, _i, _strip, ek}) do
+  defp heredoc_close(rest, line, buf, fs, acc, w, st, {_d, _m, _i, _strip, ek, _ow}) do
     {ws, rest2} = take_hspace(rest, 0)
     <<_::binary-size(3), rest3::binary>> = rest2
     col = 1 + ws
@@ -1891,14 +1955,14 @@ defmodule Toxic2.Lexer do
       _ ->
         # content on the opening line is invalid — tolerant: flag it, scan from here, strip 0.
         err = {:error, line, col, line, col, LexError.new(:heredoc_start_line, %{})}
-        hc = {delim, mode, interp?, 0, end_kind}
+        hc = {delim, mode, interp?, 0, end_kind, false}
         read_heredoc(rest, line, col + ows, [], {line, col}, [err | acc], w, st, hc)
     end
   end
 
   defp heredoc_start_body(body, line, acc, w, st, {delim, mode, interp?, end_kind}) do
     strip = heredoc_indent(body, delim, interp?, heredoc_sig_pattern())
-    hc = {delim, mode, interp?, strip, end_kind}
+    hc = {delim, mode, interp?, strip, end_kind, false}
 
     # Seed an empty fragment: a heredoc always opens with a fragment, so an immediate `#{…}` keeps
     # the leading `""` the reference emits (`\"\"\"\n#{x}…` => `["", interp, …]`); for ordinary
@@ -2157,12 +2221,6 @@ defmodule Toxic2.Lexer do
   defp cp_width(<<_, rest::binary>>, n), do: cp_width(rest, n + 1)
   defp cp_width(<<>>, n), do: n
 
-  defp take_while(<<c, rest::binary>> = bin, n, pred) do
-    if pred.(c), do: take_while(rest, n + 1, pred), else: {n, bin}
-  end
-
-  defp take_while(<<>>, n, _pred), do: {n, <<>>}
-
   # Specialized `take_while`s for the two hot fixed predicates — a direct inline guard avoids the
   # per-byte captured-fun call. Both return `{count, rest}` like `take_while/3`.
   defp take_hspace(<<c, rest::binary>>, n) when c in [?\s, ?\t], do: take_hspace(rest, n + 1)
@@ -2264,6 +2322,28 @@ defmodule Toxic2.Lexer do
   end
 
   # `{digit_run class, base}` — the class is `:hex` or the highest digit byte of the radix.
+  defp capture_int_scan(<<?0, b, rest::binary>> = num) when b in [?x, ?o, ?b] do
+    {class, base} = radix(b)
+    {rlen, ok, _after} = digit_run(rest, class, 0, :start)
+
+    if ok and rlen > 0 do
+      value = num |> binary_part(2, rlen) |> strip_underscores() |> String.to_integer(base)
+      {:ok, 2 + rlen, value}
+    else
+      {:error, 2 + rlen}
+    end
+  end
+
+  defp capture_int_scan(num) do
+    {ilen, ok, _after} = digit_run(num, ?9, 0, :start)
+
+    if ok do
+      {:ok, ilen, num |> binary_part(0, ilen) |> strip_underscores() |> String.to_integer()}
+    else
+      {:error, ilen}
+    end
+  end
+
   defp radix(?x), do: {:hex, 16}
   defp radix(?o), do: {?7, 8}
   defp radix(?b), do: {?1, 2}
