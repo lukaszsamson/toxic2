@@ -513,6 +513,46 @@ end|)
     end
   end
 
+  describe "mixed-unicode long lines (sparse grapheme index)" do
+    # A line with a non-ASCII char near the start and a long tail goes through the lowerer's
+    # per-line sparse grapheme index instead of re-walking the line for every column query. The
+    # index must land on the same cluster boundaries the plain walk would: an ASCII base plus a
+    # combining mark is ONE cluster, so an index anchored at the leading-ASCII prefix is wrong.
+    test "wide chars and combining marks on a long line, vs oracle" do
+      for head <- ["é", "漢", "aé"] do
+        assert_parity(head <> " = 1; " <> String.duplicate("x; ", 150))
+        assert_parity("f(" <> head <> ", " <> String.duplicate("a, ", 120) <> "b)")
+        assert_parity("\"" <> head <> "\" # " <> String.duplicate("c", 300) <> "\ny = 2")
+      end
+
+      for head <- ["e\u0301", "👩\u200d💻"] do
+        assert_parity("\"" <> head <> "\" # " <> String.duplicate("c", 300) <> "\ny = 2")
+      end
+    end
+
+    # Invalid UTF-8 has no oracle (upstream refuses the source), so pin the index against the
+    # unindexed walk instead: the same prefix, once on a SHORT line (bare integer descriptor, full
+    # walk) and once on a line long enough to build the index, must give identical metadata.
+    test "index and plain walk agree (incl. invalid UTF-8)" do
+      for head <- ["é", "e\u0301", "漢", "👩\u200d💻", <<0xFF>>, "a" <> <<0xFF>>] do
+        prefix = "\"" <> head <> "\"; a; b; c"
+        short = mine(prefix <> "\n")
+        long = mine(prefix <> "; " <> String.duplicate("d; ", 150) <> "\n")
+        {:__block__, _, short_stmts} = short
+        {:__block__, _, long_stmts} = long
+
+        assert length(short_stmts) == 4
+
+        for {sh, lo} <-
+              Enum.zip(Enum.drop(short_stmts, 1), Enum.take(long_stmts, 4) |> Enum.drop(1)) do
+          {_, sm, _} = sh
+          {_, lm, _} = lo
+          assert Keyword.take(sm, [:line, :column]) == Keyword.take(lm, [:line, :column])
+        end
+      end
+    end
+  end
+
   describe "meta key ORDER (order-sensitive, vs oracle)" do
     # `assert_parity` normalises key order, so it cannot catch an ordering regression. The oracle's
     # encoder emits keys in a fixed order and downstream tools (formatter / Sourceror) consume the

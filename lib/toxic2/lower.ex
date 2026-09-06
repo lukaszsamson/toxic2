@@ -19,8 +19,16 @@ defmodule Toxic2.Lower do
 
   alias Toxic2.{CST, Diagnostics, Tokens}
 
+  # Process-dictionary key for the default-mode source line index memo (see `lazy_index/1`).
+  @src_index_key {__MODULE__, :src_index}
+
+  # Sparse grapheme index (see `gc_index/1`): one entry per `@gc_index_step` columns, built only for
+  # mixed lines whose non-ASCII tail exceeds `@gc_index_min` bytes.
+  @gc_index_step 32
+  @gc_index_min 256
+
   # Narrow inlining of tiny LOCAL meta builders on the hot per-node path (A/B-measured).
-  @compile {:inline, tmeta: 2, op_atom: 2, op_meta: 2, span_meta: 1}
+  @compile {:inline, tmeta: 2, op_atom: 2, op_meta: 2, span_meta: 1, token_meta: 3}
 
   # Lower-LOCAL token-view and CST reads (the perf-pass-6 parser pattern): `Tokens.kind/value/
   # token` and `CST.tag/token_index/node_kind/children/span` are cross-module — a callee-module
@@ -86,6 +94,8 @@ defmodule Toxic2.Lower do
   def to_ast(cst, view, source, opts, start_id)
       when is_binary(source) and is_list(opts) and is_integer(start_id) do
     {ast, acc, _nid} = lower(cst, view, resolve_opts(opts, source), [], start_id)
+    # Drop the default-mode line-index memo (see `lazy_index/1`) so it can't outlive this call.
+    :erlang.erase(@src_index_key)
     {ast, Diagnostics.to_list(acc)}
   end
 
@@ -137,11 +147,40 @@ defmodule Toxic2.Lower do
   defp line_prefix(line) do
     case :binary.match(line, high_byte_pattern()) do
       :nomatch -> :all
-      {pos, _} -> pos
+      {pos, _} when byte_size(line) - pos <= @gc_index_min -> pos
+      {pos, _} -> {pos, gc_index(line)}
     end
   end
 
-  # ASCII descriptor for line `n` — `:all`, an integer prefix length, or `0` (out-of-range: walk all).
+  # Sparse cluster→byte-offset index for a long mixed line: entry `i` is the byte offset of column
+  # `i * @gc_index_step + 1`. Without it, N metadata queries at increasing columns on the same line
+  # each re-walk it from the start — O(N × col), quadratic (the `opts` map is immutable, so nothing
+  # can be carried from one query to the next). With it a query walks at most `@gc_index_step`
+  # clusters. Built once per mixed line, in O(line), and only for lines whose non-ASCII tail exceeds
+  # `@gc_index_min` bytes so short unicode lines (the common case) stay a bare integer prefix.
+  #
+  # It walks from byte 0, NOT from the ASCII prefix: an ASCII byte followed by a combining mark is
+  # one cluster with it, so `prefix` is not necessarily a cluster boundary and an index anchored
+  # there would report columns the full walk never produces.
+  defp gc_index(line), do: line |> gc_index_offsets(0, byte_size(line), [0]) |> rev_tuple()
+
+  defp gc_index_offsets(text, off, size, acc) when off < size do
+    case col_byte_walk(binary_part(text, off, size - off), @gc_index_step, 0) do
+      :past -> acc
+      o -> gc_index_offsets(text, off + o, size, [off + o | acc])
+    end
+  end
+
+  defp gc_index_offsets(_text, _off, _size, acc), do: acc
+
+  defp rev_tuple(rev), do: rev |> :lists.reverse() |> List.to_tuple()
+
+  # The leading-ASCII byte count of a line descriptor (`:all` is handled by the callers' own clause).
+  defp ascii_prefix({prefix, _index}), do: prefix
+  defp ascii_prefix(prefix), do: prefix
+
+  # ASCII descriptor for line `n` — `:all`, an integer prefix length, a `{prefix, index}` pair, or
+  # `0` (out-of-range: walk all).
   defp line_ascii_prefix(%{ascii_lines: :all}, _n), do: :all
 
   defp line_ascii_prefix(%{ascii_lines: t}, n) when n >= 1 and n <= tuple_size(t),
@@ -190,13 +229,33 @@ defmodule Toxic2.Lower do
 
   defp chomp_cr(line), do: line
 
+  # `opts` is an immutable value threaded DOWNWARD through the traversal: an index resolved inside
+  # this call can never reach the SIBLING nodes that need it next, so every `(;)`/empty-paren check
+  # re-split and re-scanned the whole source — quadratic (8 000 `(;)` lines: 1.66 s). Threading the
+  # resolved opts back up would mean returning it from every one of ~200 lowering functions.
+  # The index is a pure function of `source`, so memoize it in the process dictionary — the one
+  # mutable cell available without that refactor — for the duration of one `to_ast/5`, which erases
+  # it on the way out. Keying on `source` keeps a stale entry (a raising literal_encoder, a nested
+  # `to_ast`) merely a cache miss, never a wrong answer.
+  defp lazy_index(source) do
+    case :erlang.get(@src_index_key) do
+      {^source, lines, ascii} ->
+        {lines, ascii}
+
+      _ ->
+        lines = source_lines(source)
+        ascii = ascii_lines(source, lines)
+        :erlang.put(@src_index_key, {source, lines, ascii})
+        {lines, ascii}
+    end
+  end
+
   # Default lowering stored a `{:lazy, source}` marker instead of splitting (the lines/ascii are only
-  # needed here, for the rare empty-paren `;` check). Build them once, then recurse with eager opts so
-  # every downstream read (`col_byte`, `line_ascii_prefix`) sees the real tuple. Rare in default mode,
-  # so the on-demand split is not a hot path.
+  # needed here, for the rare empty-paren `;` check). Resolve it, then recurse with eager opts so
+  # every downstream read (`col_byte`, `line_ascii_prefix`) sees the real tuple.
   defp src_slice(%{source_lines: {:lazy, source}} = opts, from, to) do
-    lines = source_lines(source)
-    src_slice(%{opts | source_lines: lines, ascii_lines: ascii_lines(source, lines)}, from, to)
+    {lines, ascii} = lazy_index(source)
+    src_slice(%{opts | source_lines: lines, ascii_lines: ascii}, from, to)
   end
 
   # Raw source text spanning `{sl,sc}`..`{el,ec}` (codepoint columns, end-exclusive), or `nil`.
@@ -334,65 +393,33 @@ defmodule Toxic2.Lower do
 
   defp finalize_eoe(_nls, _semi, _pos), do: []
 
-  # Walk `text` from codepoint column `col`: skip the leading `col - 1` codepoints to reach the
-  # start column (`n > 0` phase), skip any space/tab (`n == 0` phase, advancing the column), then
-  # classify the first significant char. Returns `{:eol | :hash | :semi | :other, tok_col}` — ONLY
-  # scalars cross the boundary, never a sub-binary.
+  # Probe `text` at codepoint column `col`: position at that column, skip any space/tab (advancing
+  # the column), then classify the first significant char. Returns `{:eol | :hash | :semi | :other,
+  # tok_col}` — ONLY scalars cross the boundary, never a sub-binary.
   #
-  # EVERY clause begins with a binary match (no bare-variable head), so the BEAM threads ONE match
-  # context through the whole walk with zero per-step allocation (`bin_opt_info`-verified). A bare
-  # `(bin, 0, col)` termination clause silently defeats this — it makes the byte scan materialize a
-  # fresh sub-binary on every codepoint, which on real columns (~10 deep) was a 16× allocation
-  # blow-up over the `String.slice` this replaced. The single-byte (ASCII) clauses are the hot path;
-  # the `utf8` clause keeps the SKIP phase counting one column per codepoint on non-ASCII lines
-  # (matching the lexer's span columns). At `n == 0` we return on the first non-ws byte, so the
-  # classify phase needs no `utf8` clause (any non-ws lead byte is `:other`).
-  # ASCII source: codepoint column == byte offset, so the SKIP phase is O(1) — jump straight to byte
-  # `col - 1` and classify from there with O(1) `:binary.at` peeks (no per-codepoint walk, no slice).
-  # For `end_of_expression` `col` is a statement end (often column 60-80), so eliding that skip is the
-  # win. Returns the same `{class, tok_col}` as the walk (`tok_col` = byte offset + 1, 1-based column).
-  defp line_probe(text, col, :all), do: line_classify_ascii(text, col - 1, byte_size(text))
-
-  # Mixed line: if the scan start is within the leading-ASCII prefix, classify with O(1) :binary.at
-  # peeks (the ws it skips is ASCII, so it stays within byte==codepoint territory; a non-ASCII byte at
-  # the prefix boundary classifies as :other with the correct column). Past the prefix, walk.
-  defp line_probe(text, col, prefix) when col - 1 >= 0 and col - 1 <= prefix,
-    do: line_classify_ascii(text, col - 1, byte_size(text))
-
-  defp line_probe(text, col, _prefix), do: line_walk(text, col - 1, col)
-
-  defp line_classify_ascii(_text, off, size) when off >= size, do: {:eol, off + 1}
-
-  defp line_classify_ascii(text, off, size) do
-    case :binary.at(text, off) do
-      c when c == ?\s or c == ?\t -> line_classify_ascii(text, off + 1, size)
-      ?# -> {:hash, off + 1}
-      ?; -> {:semi, off + 1}
-      _ -> {:other, off + 1}
+  # Positioning is `col_byte/3` (shared with every other source read), so a fully-ASCII line / the
+  # leading-ASCII prefix of a mixed line is O(1) and a long mixed line goes through the sparse
+  # grapheme index instead of re-walking from the line start. Past the line end the walk's `:past`
+  # is the classifier's own end-of-line answer, so both report `{:eol, col}`.
+  defp line_probe(text, col, desc) do
+    case col_byte(text, col, desc) do
+      :past -> {:eol, col}
+      off -> line_classify(text, off, col, byte_size(text))
     end
   end
 
-  # The skip phase counts GRAPHEME CLUSTERS, matching the lexer's content columns (the ASCII fast
-  # path applies only while the next byte is ASCII too, so a combining mark rides with its base).
-  defp line_walk(<<c, nb, _::binary>> = bin, n, col) when n > 0 and c < 128 and nb < 128,
-    do: line_walk(binary_part(bin, 1, byte_size(bin) - 1), n - 1, col)
+  # Skip space/tab from byte offset `off` / column `col` (both ASCII-wide, so they advance in step),
+  # then classify. Any non-ws lead byte — including a non-ASCII one — is `:other`, so no utf8 clause.
+  defp line_classify(_text, off, col, size) when off >= size, do: {:eol, col}
 
-  defp line_walk(<<c>>, n, col) when n > 0 and c < 128, do: line_walk(<<>>, n - 1, col)
-
-  defp line_walk(<<_::utf8, _::binary>> = bin, n, col) when n > 0 do
-    w = gc_head_bytes(bin)
-    line_walk(binary_part(bin, w, byte_size(bin) - w), n - 1, col)
+  defp line_classify(text, off, col, size) do
+    case :binary.at(text, off) do
+      c when c == ?\s or c == ?\t -> line_classify(text, off + 1, col + 1, size)
+      ?# -> {:hash, col}
+      ?; -> {:semi, col}
+      _ -> {:other, col}
+    end
   end
-
-  defp line_walk(<<_, rest::binary>>, n, col) when n > 0, do: line_walk(rest, n - 1, col)
-
-  defp line_walk(<<c, rest::binary>>, 0, col) when c == ?\s or c == ?\t,
-    do: line_walk(rest, 0, col + 1)
-
-  defp line_walk(<<?#, _::binary>>, 0, col), do: {:hash, col}
-  defp line_walk(<<?;, _::binary>>, 0, col), do: {:semi, col}
-  defp line_walk(<<>>, _n, col), do: {:eol, col}
-  defp line_walk(<<_, _::binary>>, 0, col), do: {:other, col}
 
   # Count the newlines in the source from `{line, col}` up to the next real token, with the same
   # comment-reset rule as `end_of_expression` (a comment line zeroes the run). Used for the
@@ -426,11 +453,12 @@ defmodule Toxic2.Lower do
     end
   end
 
+  # `meta` is built INSIDE the three branches that consume it: the numeric / literal / atom branches
+  # are the bulk of the leaves and never look at it, and the BEAM otherwise constructs its line and
+  # column cons cells before the `select_val` dispatch.
   defp lower_token(cst, view, opts, acc, nid) do
     idx = ctoki(cst)
     val = tv(view, idx)
-    # Leaf nodes are fresh (no passthrough), so the token's own span IS the range.
-    meta = tmeta(view, idx) |> maybe_token_range(view, idx, opts)
 
     case tk(view, idx) do
       :int -> lit(val, view, idx, opts, acc, nid, tm_token(view, idx, opts))
@@ -438,13 +466,16 @@ defmodule Toxic2.Lower do
       :char -> lit(val, view, idx, opts, acc, nid, tm_token(view, idx, opts))
       :literal -> lit(val, view, idx, opts, acc, nid)
       # `&N` (capture argument): the whole token is the capture `{:&, _, [N]}` (see Precedence).
-      :capture_int -> {{:&, meta, [val]}, acc, nid}
+      :capture_int -> {{:&, token_meta(view, idx, opts), [val]}, acc, nid}
       :atom -> lower_atom_literal(cst, view, idx, opts, val, acc, nid)
-      :identifier -> atomize(cst, view, opts, acc, nid, val, &{&1, meta, nil})
-      :alias -> atomize(cst, view, opts, acc, nid, val, &{:__aliases__, meta, [&1]})
+      :identifier -> atomize_var(cst, view, idx, opts, acc, nid, val)
+      :alias -> atomize_alias(cst, view, idx, opts, acc, nid, val)
       _ -> {error_ast(cst, view), acc, nid}
     end
   end
+
+  # Leaf nodes are fresh (no passthrough), so the token's own span IS the range.
+  defp token_meta(view, idx, opts), do: tmeta(view, idx) |> maybe_token_range(view, idx, opts)
 
   defp lower_atom_literal(cst, view, idx, opts, val, acc, nid) do
     case to_atom(val, opts) do
@@ -1013,59 +1044,98 @@ defmodule Toxic2.Lower do
   # the line's ASCII region (whole line `:all`, or the operator found within the leading-ASCII prefix)
   # the codepoint gap equals the byte gap — skip `cp_between`'s `binary_part` + codepoint count.
   defp scan_gap(_text, boff, moff, :all), do: moff - boff
-  defp scan_gap(_text, boff, moff, prefix) when moff <= prefix, do: moff - boff
-  defp scan_gap(text, boff, moff, _prefix), do: cp_between(text, boff, moff)
 
-  # Byte offset of codepoint column `col` in `text` (i.e. after `col - 1` codepoints), or `:past`
-  # past the line end. Scalar return — never a tail binary — so the BEAM threads one match context
-  # with zero per-step allocation (every clause has a binary head; the `0` terminal matches
-  # `<<_::binary>>`, not a bare variable, which would silently de-opt the whole scan).
-  # O(1) when the whole source is ASCII: codepoint column == byte offset, no walk at all. `:past`
+  defp scan_gap(text, boff, moff, desc) do
+    if moff <= ascii_prefix(desc), do: moff - boff, else: cp_between(text, boff, moff)
+  end
+
+  # Byte offset of the grapheme-cluster column `col` in `text` (i.e. after `col - 1` clusters), or
+  # `:past` past the line end. Scalar return — never a tail binary.
+  # Fully-ASCII line: cluster column == byte offset everywhere, O(1), no walk at all. `:past`
   # mirrors the walk's "column beyond the line" result (strictly past the last byte).
-  # Fully-ASCII line: codepoint col == byte offset everywhere, O(1). (Degenerate col < 1 from an
-  # inferred/unclosed delimiter → :past, no byte offset.)
   defp col_byte(text, col, :all) do
     o = col - 1
     if o < 0 or o > byte_size(text), do: :past, else: o
   end
 
   # Degenerate column (< 1, from an inferred/unclosed delimiter) — checked HERE so `col_byte_walk`
-  # never sees a negative count and every one of its clauses can begin with a binary match (a bare
-  # `(_text, n, _off) when n < 0` head there silently de-opted the walk to per-step sub-binary
-  # materialization on non-ASCII lines — `bin_opt_info`-confirmed).
+  # never sees a negative count.
   defp col_byte(_text, col, _any) when col < 1, do: :past
 
-  # Mixed line: a column within the leading-ASCII prefix is O(1) (byte offset == codepoint col there);
-  # past the prefix, walk codepoints (the walk's ASCII fast-path keeps the leading run cheap anyway).
-  defp col_byte(_text, col, prefix) when col - 1 <= prefix, do: col - 1
-  defp col_byte(text, col, _prefix), do: col_byte_walk(text, col - 1, 0)
+  # Mixed line: a column within the leading-ASCII prefix is O(1) (byte offset == column there).
+  # `is_integer` matters — a `{prefix, index}` descriptor would compare GREATER than any integer in
+  # Erlang term order and silently take this clause.
+  defp col_byte(_text, col, prefix) when is_integer(prefix) and col - 1 <= prefix, do: col - 1
 
-  # Non-ASCII source: walk GRAPHEME CLUSTERS from a non-negative count — one cluster is one
-  # column (matching the lexer's content scanners and upstream's `unicode_util:gc` walk: `é` as
-  # `e` + U+0301 is one column). The ASCII fast path is taken only while the NEXT byte is ASCII
-  # too, so a trailing combining mark still rides with its base.
-  defp col_byte_walk(<<c, nb, _::binary>> = bin, n, off) when n > 0 and c < 128 and nb < 128,
-    do: col_byte_walk(binary_part(bin, 1, byte_size(bin) - 1), n - 1, off + 1)
+  defp col_byte(text, col, prefix) when is_integer(prefix), do: col_byte_walk(text, col - 1, 0)
 
-  defp col_byte_walk(<<c>>, n, off) when n > 0 and c < 128,
-    do: col_byte_walk(<<>>, n - 1, off + 1)
+  defp col_byte(_text, col, {prefix, _index}) when col - 1 <= prefix, do: col - 1
 
-  defp col_byte_walk(<<c, _::binary>> = bin, n, off) when n > 0 and c < 0x80,
-    do: col_byte_walk_gc(bin, n, off)
+  # Long mixed line: jump to the nearest indexed column at or before `col`, then walk the remainder
+  # (< `@gc_index_step` clusters). An index that stops short of `col` means the line has fewer
+  # columns than that — `:past`, exactly as the full walk would report.
+  defp col_byte(text, col, {_prefix, index}) do
+    d = col - 1
+    i = div(d, @gc_index_step)
 
-  defp col_byte_walk(<<_::utf8, _::binary>> = bin, n, off) when n > 0,
-    do: col_byte_walk_gc(bin, n, off)
+    if i < tuple_size(index) do
+      start = elem(index, i)
 
-  defp col_byte_walk(<<_, rest::binary>>, n, off) when n > 0,
-    do: col_byte_walk(rest, n - 1, off + 1)
-
-  defp col_byte_walk(<<>>, n, _off) when n > 0, do: :past
-  defp col_byte_walk(<<_::binary>>, _n, off), do: off
-
-  defp col_byte_walk_gc(bin, n, off) do
-    w = gc_head_bytes(bin)
-    col_byte_walk(binary_part(bin, w, byte_size(bin) - w), n - 1, off + w)
+      case col_byte_walk(
+             binary_part(text, start, byte_size(text) - start),
+             rem(d, @gc_index_step),
+             0
+           ) do
+        :past -> :past
+        o -> start + o
+      end
+    else
+      :past
+    end
   end
+
+  # Walk GRAPHEME CLUSTERS from a non-negative count — one cluster is one column (matching the
+  # lexer's content scanners and upstream's `unicode_util:gc` walk: `é` as `e` + U+0301 is one
+  # column). A run of ASCII bytes is counted by `ascii_span/3` through ONE reused match context;
+  # only a cluster that a non-ASCII byte extends needs a sub-binary. The old per-byte
+  # `binary_part(bin, 1, byte_size(bin) - 1)` materialized a fresh sub-binary on EVERY step
+  # (`bs_get_tail` + `gc_bif binary_part` in the disassembly) because its 2-byte lookahead clause
+  # could not hand its own tail to the recursive call.
+  defp col_byte_walk(bin, n, off) when n > 0 do
+    case ascii_span(bin, 0, n + 1) do
+      # `n + 1` ASCII bytes ahead: each of the first `n` is followed by ASCII, so each is a cluster.
+      {a, _tail} when a > n -> off + n
+      # The run reaches the line end: every one of its bytes is its own cluster.
+      {a, <<>>} -> if a == n, do: off + n, else: :past
+      # A non-ASCII byte cut the run short — it extends the cluster the LAST ASCII byte starts.
+      {a, _tail} -> col_byte_gc(bin, a, n, off)
+    end
+  end
+
+  defp col_byte_walk(_bin, _n, off), do: off
+
+  defp col_byte_gc(bin, a, n, off) do
+    skip = if a > 0, do: a - 1, else: 0
+    base = if skip == 0, do: bin, else: binary_part(bin, skip, byte_size(bin) - skip)
+
+    case base do
+      <<_::utf8, _::binary>> ->
+        w = gc_head_bytes(base)
+        col_byte_walk(binary_part(base, w, byte_size(base) - w), n - skip - 1, off + skip + w)
+
+      # invalid UTF-8 lead byte: one byte, one column
+      <<_, rest::binary>> ->
+        col_byte_walk(rest, n - skip - 1, off + skip + 1)
+    end
+  end
+
+  # Count leading ASCII bytes, at most `max`. BOTH clauses start with a binary match, so the BEAM
+  # keeps one match context across the loop (`bs_start_match4 :resume` + `call_only`) and builds the
+  # returned tail sub-binary once, at termination. A bare-variable head here de-opts the whole loop.
+  defp ascii_span(<<c, rest::binary>>, k, max) when c < 128 and k < max,
+    do: ascii_span(rest, k + 1, max)
+
+  defp ascii_span(<<_::binary>> = bin, k, _max), do: {k, bin}
 
   # Byte width of the grapheme cluster at `bin`'s head (>= 1, total over invalid UTF-8).
   # Fast path: no cluster extender exists below U+0300, so a sub-U+0300 head followed by ASCII
@@ -1319,11 +1389,21 @@ defmodule Toxic2.Lower do
 
   defp put_node_range(ast, _cst, _opts), do: ast
 
-  # Atomize a source-derived name via `build`, or — under `existing_atoms_only` for a missing
+  # Atomize a source-derived name into its leaf node, or — under `existing_atoms_only` for a missing
   # atom — emit a lowerer diagnostic and an error node (never raise).
-  defp atomize(cst, view, opts, acc, nid, val, build) do
+  # Two specialised builders instead of one `atomize/7` taking a `fun`: the shared version made the
+  # caller `make_fun3` a closure capturing `meta` and `atomize` `call_fun2` it, 87 k times per
+  # stdlib pass. Here the variable / alias node is built directly at its leaf.
+  defp atomize_var(cst, view, idx, opts, acc, nid, val) do
     case to_atom(val, opts) do
-      {:ok, atom} -> {build.(atom), acc, nid}
+      {:ok, atom} -> {{atom, token_meta(view, idx, opts), nil}, acc, nid}
+      :error -> nonexistent_atom(cst, view, val, acc, nid)
+    end
+  end
+
+  defp atomize_alias(cst, view, idx, opts, acc, nid, val) do
+    case to_atom(val, opts) do
+      {:ok, atom} -> {{:__aliases__, token_meta(view, idx, opts), [atom]}, acc, nid}
       :error -> nonexistent_atom(cst, view, val, acc, nid)
     end
   end
@@ -1954,7 +2034,7 @@ defmodule Toxic2.Lower do
       # operator — the common case — does no eol scan at all. `after_n` (a newline between op and rhs)
       # can only exist if the rhs starts on a later line than the op ends; the before-count only if
       # the op starts on a later line than the lhs ends. On operator-dense files these scans
-      # (`gap_newlines` → `line_classify_ascii`) were ~4% of tm CPU.
+      # (`gap_newlines` → `line_classify`) were ~4% of tm CPU.
       rhs_sl =
         case child_span(rhs, view) do
           {sl, _, _, _} -> sl
@@ -2516,52 +2596,70 @@ defmodule Toxic2.Lower do
   defp quoted_key_delimiter(_span, _opts), do: []
 
   # Call arguments: a trailing run of keyword pairs is collected into one keyword-list arg
-  # (`f(1, a: 2)` => `[1, [a: 2]]`); regular args lower normally. Most arg lists have NO keyword
-  # tail — checking the LAST child first keeps that case free of the reverse → split_while →
-  # reverse round-trip (two full list copies + a closure per call).
+  # (`f(1, a: 2)` => `[1, [a: 2]]`); regular args lower normally.
+  #
+  # ONE `:lists.last` decides the shape. The overwhelmingly common case — no keyword tail, no
+  # do-block — then lowers the list as it stands: no peel, no reverse, no concat, no allocation
+  # beyond the result. Only a list that actually HAS a tail pays for the peel, and it pays once:
+  # the old shape ran `:lists.last` twice (`pop_do_block` + `lower_args`, 110 k calls per stdlib
+  # pass) plus `drop_last`, `reverse`, `split_while`, two more reverses and `Enum.concat`.
   defp lower_args([], _view, _opts, acc, nid), do: {[], acc, nid}
 
   defp lower_args(children, view, opts, acc, nid) do
-    if kw_pair?(:lists.last(children)) do
-      {kw_rev, regular_rev} = Enum.split_while(:lists.reverse(children), &kw_pair?/1)
-      {reg, acc, nid} = lower_each(:lists.reverse(regular_rev), view, opts, acc, nid)
-      {kw_list, acc, nid} = lower_each(:lists.reverse(kw_rev), view, opts, acc, nid)
-      {Enum.concat(reg, [kw_list]), acc, nid}
-    else
-      lower_each(children, view, opts, acc, nid)
-    end
+    if kw_pair?(:lists.last(children)),
+      do: lower_peeled(:lists.reverse(children), nil, view, opts, acc, nid),
+      else: lower_each(children, view, opts, acc, nid)
   end
 
   defp kw_pair?(cst), do: ctag(cst) == :node and ckind(cst) == :kw_pair
 
   # Call args, where a trailing `:do_block` child becomes the final `[do: ..., else: ...]` arg.
+  defp lower_call_args([], _view, _opts, acc, nid), do: {[], acc, nid}
+
   defp lower_call_args(children, view, opts, acc, nid) do
-    {plain, do_block} = pop_do_block(children)
-    {args, acc, nid} = lower_args(plain, view, opts, acc, nid)
-
-    case do_block do
-      nil ->
-        {args, acc, nid}
-
-      db ->
-        {kw, acc, nid} = lower_do_block(db, view, opts, acc, nid)
-        {Enum.concat(args, [kw]), acc, nid}
-    end
-  end
-
-  # Check the LAST child first (alloc-free walk): the no-do_block case returns `children` as-is
-  # with no reverse; the do_block case rebuilds all-but-last forward (one pass, not two reverses).
-  defp pop_do_block([]), do: {[], nil}
-
-  defp pop_do_block(children) do
     case :lists.last(children) do
-      {:node, :do_block, _sp, _ch, _f, _d} = db -> {drop_last(children), db}
-      _ -> {children, nil}
+      {:node, :do_block, _sp, _ch, _f, _d} = db ->
+        [_db | plain_rev] = :lists.reverse(children)
+        lower_peeled(plain_rev, db, view, opts, acc, nid)
+
+      last ->
+        if kw_pair?(last),
+          do: lower_peeled(:lists.reverse(children), nil, view, opts, acc, nid),
+          else: lower_each(children, view, opts, acc, nid)
     end
   end
 
-  defp drop_last([_last]), do: []
-  defp drop_last([c | rest]), do: [c | drop_last(rest)]
+  # `rev_children` is the arg list reversed (do-block already off the front), so peeling the
+  # trailing keyword run off its HEAD hands the pairs back in source order for free.
+  defp lower_peeled(rev_children, db, view, opts, acc, nid) do
+    {kw, reg_rev} = peel_kw(rev_children, [])
+    {rev, acc, nid} = lower_rev(:lists.reverse(reg_rev), view, opts, acc, nid, [])
+    {rev, acc, nid} = lower_kw_arg(kw, view, opts, acc, nid, rev)
+    {rev, acc, nid} = lower_do_arg(db, view, opts, acc, nid, rev)
+    {:lists.reverse(rev), acc, nid}
+  end
+
+  defp peel_kw([c | rest] = rev, kw) do
+    if kw_pair?(c), do: peel_kw(rest, [c | kw]), else: {kw, rev}
+  end
+
+  defp peel_kw([], kw), do: {kw, []}
+
+  # Both push onto the REVERSED result accumulator, so `lower_peeled`'s single `:lists.reverse`
+  # replaces the `Enum.concat(args, [kw])` copy of the whole arg list.
+  defp lower_kw_arg([], _view, _opts, acc, nid, rev), do: {rev, acc, nid}
+
+  defp lower_kw_arg(kw, view, opts, acc, nid, rev) do
+    {kw_list, acc, nid} = lower_each(kw, view, opts, acc, nid)
+    {[kw_list | rev], acc, nid}
+  end
+
+  defp lower_do_arg(nil, _view, _opts, acc, nid, rev), do: {rev, acc, nid}
+
+  defp lower_do_arg(db, view, opts, acc, nid, rev) do
+    {kw, acc, nid} = lower_do_block(db, view, opts, acc, nid)
+    {[kw | rev], acc, nid}
+  end
 
   # `do ... else ... end` => keyword list `[do: body, else: body, ...]`. A trailing `:missing`
   # (recovered missing `end`) is skipped — its diagnostic was already emitted by the parser.
@@ -2991,6 +3089,17 @@ defmodule Toxic2.Lower do
   end
 
   defp lower_each([], _view, _opts, acc, nid, asts), do: {:lists.reverse(asts), acc, nid}
+
+  # `lower_each` that stops at the REVERSED accumulator, so the arg-list path can push the keyword
+  # and do-block args on and reverse once — instead of `Enum.concat(args, [kw])` re-copying the
+  # whole arg list. Kept as its own loop rather than a wrapper around a shared one: a wrapper would
+  # add a return tuple per `lower_each` call, and `lower_each` runs on every container node.
+  defp lower_rev([child | rest], view, opts, acc, nid, asts) do
+    {ast, acc, nid} = lower(child, view, opts, acc, nid)
+    lower_rev(rest, view, opts, acc, nid, [ast | asts])
+  end
+
+  defp lower_rev([], _view, _opts, acc, nid, asts), do: {asts, acc, nid}
 
   # --- error nodes (invalid CST; never raises) ---------------------------
 
