@@ -42,6 +42,52 @@ defmodule Toxic2.ParserTest do
       assert CST.tag(atom) == :token
       assert CST.node_kind(alias_node) == :alias
     end
+
+    # `dot/7` takes a whole `.Alias` run at once (one node, one child list) instead of extending
+    # the chain per segment. These pin the run's boundaries: what ends it, and what does not.
+    test "a `.Alias` run builds ONE flat alias node, whatever its length" do
+      {_view, [a], []} = exprs("A.B.C.D.E")
+      assert CST.node_kind(a) == :alias
+      assert length(CST.children(a)) == 5
+      assert CST.span(a) == {1, 1, 1, 10}
+
+      long = Enum.map_join(1..300, ".", fn _ -> "A" end)
+      {_view, [big], []} = exprs(long)
+      assert length(CST.children(big)) == 300
+    end
+
+    test "the alias run stops where postfix would take over" do
+      # a newline after the dot still continues the run
+      {_view, [a], []} = exprs("A.\nB.C")
+      assert length(CST.children(a)) == 3
+
+      # `[` wins over the dot, so the run ends at `B`; the access node then starts a fresh
+      # (non-alias-node) first segment for the `.C` that follows.
+      {_view, [outer], []} = exprs("A.B[0].C")
+      assert CST.node_kind(outer) == :alias
+      [acc, _c] = CST.children(outer)
+      assert CST.node_kind(acc) == :access
+      assert length(CST.children(child(acc, 0))) == 2
+
+      # a remote member / dot-tuple after the run is not a segment
+      {_view, [rc], []} = exprs("A.B.c")
+      assert CST.node_kind(rc) == :remote_call
+      assert length(CST.children(child(rc, 0))) == 2
+
+      {_view, [dt], []} = exprs("A.B.{C, D}")
+      assert CST.node_kind(dt) == :dot_tuple
+      assert length(CST.children(child(dt, 0))) == 2
+    end
+
+    test "a long absorbed keyword run is appended in one pass" do
+      pairs = Enum.map_join(1..200, ", ", fn i -> "k#{i}: #{i}" end)
+      {_view, [call], []} = exprs("f(a: g " <> pairs <> ")")
+      # `f` has one kw arg whose value is `g(k1: 1, …, k200: 200)`
+      [kw_pair] = tl(CST.children(call))
+      inner = child(kw_pair, 1)
+      assert CST.node_kind(inner) == :np_call
+      assert length(CST.children(inner)) == 201
+    end
   end
 
   describe "infix operators + precedence (pinned to elixir_parser.yrl)" do
