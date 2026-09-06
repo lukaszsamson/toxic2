@@ -89,9 +89,16 @@ suppressing nested-no-parens warning), K15 (duplicate outdent warnings), K11 (`f
 newlines placement), K9 (`not x in y` meta without token_metadata), K12 (`:true` `format: :atom`),
 R19 (stab-parens meta attribution).
 
-**P5 — fuzzer token soup, completeness only:** K2 (`%&1{}`/`%..{}`), R20 (`+//2`),
-F2 (`foo.//1` dot-context operator split), F7 (`fn x -> ; end`), the `%+&f/1{}`-style
-struct-base soup, and the 14 catalogued FUZZER_GAPS residuals.
+**P5 — fuzzer token soup (all still open), ranked within the tier by real-code / mid-edit
+likelihood (2026-09-06):**
+
+| Rank | Finding | Why |
+|---|---|---|
+| 1 | F7 `fn x -> ; end` (missed empty-clause warning + literal/eoe metadata) | The one soup input a human plausibly produces mid-edit — deleting a clause body leaves `-> ;`. Valid source; the gap is a missing warning plus encoder metadata, so an IDE shows slightly wrong diagnostics, never a wrong tree. |
+| 2 | F2 `foo.//1` / `foo.->1` dot-context operator split (false errors) | Valid code falsely rejected, and remote operator references DO occur in generated/metaprogrammed code — but only the space-free adjacent spelling trips it; `foo.++(1, 2)` and `Kernel.+1` already work. |
+| 3 | K2 `%&1{}` / `%..{}` struct bases (false errors) | Valid inputs rejected, but capture-int / nullary-range struct bases only arise in quoted/macro-generated ASTs rendered back to source. Same `struct_base_start?` one-liner family as rank 4 — fix together. |
+| 4 | `%...{}` / `%fn -> 1 end{}` struct bases (false errors; the audit harness's 2 residuals) | Pure fuzzer shapes; kept above rank 5 only because they are false errors on valid input rather than missed diagnostics. |
+| 5 | R20 `+//2` / `f +//2` / `%{m | //x}` and `%+&f/1{}`-style admissions (missed errors) | Inputs nobody types AND the failure is only a missing diagnostic on invalid source — the lowest stakes in the file. |
 
 ## Follow-up findings (2026-07-18)
 
