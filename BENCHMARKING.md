@@ -13,7 +13,7 @@ How to reproduce every measurement used in the perf work, plus the current numbe
   (bump the version if the asdf erlang install changes)
 - Always build/run in prod for perf: `MIX_ENV=prod`
 
-## Current numbers (HEAD `0ff99fc`, 2026-06-14)
+## Current numbers (HEAD `perf/audit-20260906`, 2026-09-06)
 
 Ratio = toxic2 wall / live-oracle wall, **matched output**, fresh process per iteration, median.
 "default" = `[line, column]` meta (oracle `Code.string_to_quoted/1`); "tm" = full token_metadata
@@ -21,17 +21,17 @@ Ratio = toxic2 wall / live-oracle wall, **matched output**, fresh process per it
 
 | corpus            | default | token_metadata |
 |-------------------|---------|----------------|
-| Elixir stdlib     | 1.29x   | 1.44x          |
-| Wide OSS (sample) | 1.32x   | 1.59x          |
+| Elixir stdlib     | 1.04x   | 1.38x          |
 
-Allocation (tprof words, toxic2 / oracle): **default 0.98x** (below oracle); **tm ~1.12x** (above).
-The AST (incl. metadata keyword lists) is byte-identical to oracle, so the lists are NOT the cause —
-the extra is toxic2's intermediate **green CST + the lowering pass + `source_lines` line-split**,
-which oracle's direct yecc build doesn't pay (architectural, not waste). CPU/reductions is the binding
-constraint, not allocation.
+(2026-06-14, HEAD `0ff99fc`, for reference: 1.29x / 1.44x stdlib, 1.32x / 1.59x wide OSS sample.)
 
-Official stage breakdown (`mix toxic2.bench`, stdlib, default): t2_lex ~0.60x, t2_parse ~0.95x,
-t2_full ~1.30x oracle; alloc ~0.98x. Stage split ~45% lex / 26% parse / 29% lower.
+Allocation (`mix toxic2.bench` proxy, toxic2 / oracle): **default 0.78x** (283 MB vs 363 MB on the
+stdlib corpus). The AST (incl. metadata keyword lists) is byte-identical to oracle in tm mode.
+
+Official stage breakdown (`mix toxic2.bench --reps 10`, stdlib, default): t2_lex ~0.47x,
+t2_parse ~0.84x, t2_full **~1.07–1.10x** oracle (217 ms vs 198 ms; was 262 ms / 1.39x at `c924fcf`);
+alloc 0.78x. Stage split ~43% lex / 33% parse / 23% lower. See `PERF.md` (2026-09-06) for what
+changed and `PERF_AUDIT_20260906*.md` for the audits behind it.
 
 Dense test/data files (witchcraft benches, decimal/string/enum tests, gen_lsp enums) sit at the
 ~2.4-2.8x tm "plateau" — no single hotspot left; it's the shared lex/parse floor + per-node tm meta.

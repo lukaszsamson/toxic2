@@ -1,3 +1,72 @@
+# 2026-09-06 — Audit pass: constant factors on the token path + the quadratic tails
+
+(Supersedes the 2026-06-13 numbers below. Branch `perf/audit-20260906` on top of `c924fcf`.)
+
+Two audits (`PERF_AUDIT_20260906.md`: quadratic paths; `PERF_AUDIT_20260906_pass2.md`: BEAM-level
+constant factors, with A/B prototypes) and one implementation round, split by file across three
+parallel agents plus follow-ups. Every change was A/B'd against the previous module (renamed copy,
+fresh process per pass, shuffled arms) with output equality on the stdlib corpus, the test files,
+2000 random token-soup inputs and — for the parser — the 8910-entry imported corpus.
+
+## Result (`MIX_ENV=prod mix toxic2.bench`, stdlib, same machine, same session)
+
+| stage    | `c924fcf` (main)      | branch head           | alloc proxy       |
+|----------|-----------------------|-----------------------|-------------------|
+| t2_lex   | 140 ms                | 91–94 ms              | 193 → 136 MB      |
+| t2_parse | 211 ms                | 154–167 ms            | 304 → 228 MB      |
+| t2_full  | 262 ms, **1.39x**     | 192–217 ms, **1.07–1.10x** | 362 → 283 MB (0.78x oracle) |
+
+Matched-output ratios (fresh process, 10 rounds): default `[line, column]` **1.04x**, token_metadata
+**1.38x** (was 2.12x on 2026-06-13). Beam sizes: Lexer +2.2%, Parser +3.3%, Lower +2.3%.
+
+## What changed, by commit
+
+- **lexer** (`8912a4a`): the identifier path re-created a binary match state five times per token
+  (`read_name`, the utf8 peek, `kw_suffix`, the `@` clause, `bang_before_eq_notice`) — now one
+  `case` over the boundary bytes, name sliced once at the leaf; same for the alias clause. Operator
+  path: `atom_op_kw_len` / `too_many_same_char_notice` gated on `len`/`kind` instead of re-matching
+  every operator. Heredoc line start fused into one scan. Unicode content readers no longer rebuild
+  `<<c::utf8, rest::binary>>` (was quadratic: 32k `👩‍💻` 794 ms → 10 ms). Confusable-lint gate is a
+  marker set when a unicode name is emitted, not a whole-token rescan. `tokenize/2` skips building
+  comment tuples it would discard. Lex −33%, lex allocation −30%.
+- **parser** (`5e98c64`): alias chains built once per run (4000 segments 37 ms → 0.08 ms); the
+  no-op `check_*` helpers return a pending descriptor instead of a fresh `{diags, nid}` tuple;
+  position predicates compare token fields instead of building span tuples; keyword-run absorption
+  appends once (800 pairs 2.3 ms → 0.16 ms). Parse −15%.
+- **lower** (`6e2f9e9`, `45a05ea`, `bff712c`): mixed-Unicode column mapping uses a sparse cluster
+  index + match-context recursion (4000 stmts on one line, tm: 1031 ms → 1.6 ms); call args lowered
+  in one pass; leaf meta built only in the branches that use it, no closure into `atomize`; per-line
+  ASCII index from one cursor over the source. The `(;)` vs `()` distinction is now a CST flag set
+  by the parser (`CST.has_semicolon?/1`), so default lowering never reads the source (8000 `(;)`
+  lines: 1665 ms → 0.9 ms) — and `( # ;\n)` now warns like upstream.
+- **parser correctness** (`4e40535`): the 7 imported-freeze regressions (paren-head `when` guards
+  are a full `expr`; `-> ;e -> 1` splits clauses) — `mix toxic2.check.imported` is green again.
+
+## Measured and rejected (do not retry without a new idea)
+
+- Map-based keyword dispatch in `lower_token`: +10.8% slower than the clause trie.
+- One 13-clause boundary `case` instead of the two-stage match: +5.7% slower.
+- `to_atom` via direct `:erlang.binary_to_atom/2` without `rescue`: noise (+1%).
+- `@compile {:inline, skip_eols: 2}`: +0.2% (noise), +2.5 KB beam.
+- `ascii_lines` single-cursor rewrite: real but small (−1.8% tm) — the index is ~10 ms/pass, of
+  which the per-line `:binary.match` was ~2 ms, not the 30 ms first estimated.
+
+## Gates at branch head
+
+`mix toxic2.check.full` (format, guard, credo --strict, warnings-as-errors, 1109 tests, conformance
+gate 521 frozen, dialyzer) green; `mix toxic2.check.imported` green (parser 7601/7615, lexer
+774/774); `mix test --include imported` 1111 passed; `mix toxic2.conformance.oss` 5343 conformant +
+50 tolerated / 5393; OSS tm byte-equality 5518/5519 (the one mismatch, `closing:` on a call whose
+string arg is Hebrew combining marks in `elixir/test/elixir/string_test.exs:1048`, is pre-existing
+on `c924fcf`).
+
+## Known remaining
+
+- Default-mode `->` clause meta is `[]` while the oracle with `columns: true` gives `[line, column]`
+  (by design; default parity is against `Code.string_to_quoted/1`).
+- The pre-existing tm `closing:` column mismatch above (combining marks inside a string argument).
+- `Tokens.has_cont?/1` and the lexer's list→tuple hand-off are the remaining per-token passes.
+
 # 2026-06-13 — Fair (apples-to-apples) measurement + arch-change verdict + representation survey
 
 (Everything below this dated header supersedes the older notes further down, which predate the

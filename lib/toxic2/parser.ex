@@ -1810,7 +1810,8 @@ defmodule Toxic2.Parser do
       # after the guard means this `when` is NOT trailing — it binds only the pattern before it
       # (`{:when, _, [a, b]}` stays a plain first arg) and more patterns follow. Only a TRAILING
       # `when` becomes the multi-arg clause guard (`a, b when c` => `when(a, b, c)`).
-      if tk(t, jj) == :"," and rev_patterns != [] do
+      # `head_patterns` always yields at least one pattern, so `rev_patterns` is never empty.
+      if tk(t, jj) == :"," do
         [last | rev_init] = rev_patterns
 
         when_pat =

@@ -2347,7 +2347,10 @@ defmodule Toxic2.Lexer do
   defp gc_step(rest, c, buf), do: gc_step_slow(c, rest, buf_last_cp(buf))
 
   # `[prev, c | rest]` / `[c | rest]` are chardata: `unicode_util:gc/1` walks the leading integers
-  # and only decodes into `rest` if the cluster continues there, so the tail is never copied.
+  # and only decodes into `rest` if the cluster continues there, so the tail is never copied. The
+  # binary tail makes them improper lists on purpose (`unicode:chardata()` allows it) — tell
+  # dialyzer so it does not flag the cons.
+  @dialyzer {:no_improper_lists, gc_step_slow: 3}
   # The consumed byte count is `byte_size(cluster) - byte_size(c)`, because the returned cluster
   # always starts with `c` (in the `prev` case, with `prev` stripped off first).
   defp gc_step_slow(c, rest, prev) do
