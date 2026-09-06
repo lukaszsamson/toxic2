@@ -114,8 +114,7 @@ defmodule Toxic2.Lower do
     # on demand (see its lazy clause) — avoiding the whole-source split+scan per file on the hot path.
     {lines, ascii} =
       if tm or range or encoder != nil do
-        l = source_lines(source)
-        {l, ascii_lines(source, l)}
+        line_index(source)
       else
         {{:lazy, source}, {:lazy, source}}
       end
@@ -132,25 +131,64 @@ defmodule Toxic2.Lower do
     }
   end
 
-  defp ascii_lines(source, lines) do
-    case :binary.match(source, high_byte_pattern()) do
-      :nomatch -> :all
-      _ -> lines |> Tuple.to_list() |> Enum.map(&line_prefix/1) |> List.to_tuple()
+  # The line tuple plus the per-line ASCII descriptors, from ONE split. The descriptors come from a
+  # single cursor over the SOURCE: `:binary.match` (Boyer–Moore, C) jumps to the next high byte and
+  # the walk hands out `:all` to every line before it — one match call per line that actually has a
+  # non-ASCII byte, instead of one per line (that per-line call was ~30 ms per stdlib pass, most of
+  # the tm/range index cost, for files where a single docstring holds the only non-ASCII text).
+  # Offsets are tracked on the RAW split lines (before `\r` chomping) so they line up with the
+  # source; a high byte is never `\r`, so its offset within the chomped line is the same.
+  defp line_index(source) do
+    raw = String.split(source, "\n")
+
+    lines =
+      case :binary.match(source, "\r") do
+        :nomatch -> raw
+        _ -> Enum.map(raw, &chomp_cr/1)
+      end
+
+    pat = high_byte_pattern()
+
+    ascii =
+      case :binary.match(source, pat) do
+        :nomatch -> :all
+        {pos, _} -> raw |> ascii_descriptors(lines, 0, pos, source, pat, []) |> rev_tuple()
+      end
+
+    {List.to_tuple(lines), ascii}
+  end
+
+  # `next` is the source offset of the next high byte at or after `lo` (the current raw line's
+  # start), or `nil` once the source has no more.
+  defp ascii_descriptors([raw | raws], [line | lines], lo, next, source, pat, acc) do
+    hi = lo + byte_size(raw) + 1
+
+    if next != nil and next < hi do
+      d = line_descriptor(line, next - lo)
+      ascii_descriptors(raws, lines, hi, next_high_byte(source, hi, pat), source, pat, [d | acc])
+    else
+      ascii_descriptors(raws, lines, hi, next, source, pat, [:all | acc])
     end
   end
 
-  # Per-line ASCII descriptor: `:all` (fully ASCII) or an integer = the byte offset of the first
-  # non-ASCII byte = the count of LEADING ASCII codepoints. A line that's only non-ASCII in a trailing
-  # string/comment still has a long ASCII prefix where delimiters/operators live, so positioning there
-  # stays O(1) even though the line isn't fully ASCII (col_byte_walk on such lines was ~3% of tm CPU
-  # on the unicode-heavy worst-ratio OSS files).
-  defp line_prefix(line) do
-    case :binary.match(line, high_byte_pattern()) do
-      :nomatch -> :all
-      {pos, _} when byte_size(line) - pos <= @gc_index_min -> pos
-      {pos, _} -> {pos, gc_index(line)}
+  defp ascii_descriptors([], [], _lo, _next, _source, _pat, acc), do: acc
+
+  defp next_high_byte(source, from, pat) when from < byte_size(source) do
+    case :binary.match(source, pat, scope: {from, byte_size(source) - from}) do
+      :nomatch -> nil
+      {pos, _} -> pos
     end
   end
+
+  defp next_high_byte(_source, _from, _pat), do: nil
+
+  # Per-line ASCII descriptor for a line whose first non-ASCII byte sits at `pos`: an integer = the
+  # byte offset of the first non-ASCII byte = the count of LEADING ASCII codepoints (a line that's
+  # only non-ASCII in a trailing string/comment still has a long ASCII prefix where delimiters and
+  # operators live, so positioning there stays O(1)), or `{pos, index}` with a sparse cluster index
+  # when the non-ASCII tail is long (see `gc_index/1`).
+  defp line_descriptor(line, pos) when byte_size(line) - pos <= @gc_index_min, do: pos
+  defp line_descriptor(line, pos), do: {pos, gc_index(line)}
 
   # Sparse cluster→byte-offset index for a long mixed line: entry `i` is the byte offset of column
   # `i * @gc_index_step + 1`. Without it, N metadata queries at increasing columns on the same line
@@ -204,22 +242,11 @@ defmodule Toxic2.Lower do
     end
   end
 
-  # Split into lines for codepoint-column scanning. A CRLF file leaves a trailing `\r` on each line;
-  # strip it so an end-of-line scan sees the line end where the `\r\n` begins (matching Elixir, which
-  # treats `\r\n` as the newline). The actual column numbers come from the lexer, not from here.
-  # The trim is gated on the SOURCE containing a `\r` at all (one C-level scan): for an LF-only file
-  # — the common case — the per-line `String.trim_trailing` pass was ~8% of the whole lower stage
-  # (eprof: `String.replace_trailing/6` + `binary:copy/2` per line). `chomp_cr/1` keeps the exact
-  # trim_trailing semantics (strips ALL trailing `\r`s) via a direct byte check, no String machinery.
-  defp source_lines(source) do
-    lines = String.split(source, "\n")
-
-    case :binary.match(source, "\r") do
-      :nomatch -> List.to_tuple(lines)
-      _ -> lines |> Enum.map(&chomp_cr/1) |> List.to_tuple()
-    end
-  end
-
+  # A CRLF file leaves a trailing `\r` on each split line; strip it so an end-of-line scan sees the
+  # line end where the `\r\n` begins (matching Elixir, which treats `\r\n` as the newline). The trim
+  # is gated on the SOURCE containing a `\r` at all (one C-level scan, see `line_index/1`): for an
+  # LF-only file — the common case — a per-line `String.trim_trailing` pass was ~8% of the whole
+  # lower stage. `chomp_cr/1` keeps the exact trim_trailing semantics (strips ALL trailing `\r`s).
   defp chomp_cr(line) when byte_size(line) > 0 do
     case :binary.last(line) do
       ?\r -> chomp_cr(binary_part(line, 0, byte_size(line) - 1))
@@ -243,8 +270,7 @@ defmodule Toxic2.Lower do
         {lines, ascii}
 
       _ ->
-        lines = source_lines(source)
-        ascii = ascii_lines(source, lines)
+        {lines, ascii} = line_index(source)
         :erlang.put(@src_index_key, {source, lines, ascii})
         {lines, ascii}
     end
