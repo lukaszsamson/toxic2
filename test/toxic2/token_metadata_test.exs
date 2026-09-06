@@ -586,4 +586,17 @@ end|)
       assert_key_order("a[\n  key\n]")
     end
   end
+
+  describe "closing: is token-derived" do
+    # A `"` directly followed by combining marks is ONE grapheme cluster for a whole-line walk but
+    # two columns for the lexer (the delimiter is its own token), so a source-byte probe at the
+    # `)` column missed it and `closing:` was dropped (OSS: elixir string_test.exs:1048).
+    test "paren call whose string arg starts with combining marks keeps closing:" do
+      src = ~S|String.normalize("ֱָֹ֑׃ְ֬֟", :nfc)|
+      {ast, []} = Toxic2.parse_to_ast(src, token_metadata: true)
+      assert ast == Code.string_to_quoted!(src, token_metadata: true, columns: true)
+      assert {{:., _, _}, meta, _} = ast
+      assert meta[:closing] == [line: 1, column: 28]
+    end
+  end
 end

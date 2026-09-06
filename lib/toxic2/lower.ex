@@ -736,14 +736,59 @@ defmodule Toxic2.Lower do
 
   # The position just past the `(` following child `idx` (the callee / member name) — or `nil` when
   # the next char is not `(` (a paren-less call, which has no open-delimiter newlines).
+  # The source-byte probe is O(1) on ASCII lines, but a whole-line column→byte mapping cannot
+  # reproduce the lexer's context-dependent clusters (a `"` followed by combining marks is ONE
+  # cluster for a line walk but two columns for the lexer), so when the probe misses, ask the token
+  # view — the lexer's own positions — before concluding there is no `(`.
   defp after_open_paren(cst, idx, view, opts) do
     with child when not is_nil(child) <- child_at(cchildren(cst), idx),
          {_, _, el, ec} <- child_span(child, view),
-         ?( <- src_byte_at(opts, el, ec) do
+         true <- src_byte_at(opts, el, ec) == ?( or token_kind_starting_at(view, el, ec) == :"(" do
       {el, ec + 1}
     else
       _ -> nil
     end
+  end
+
+  # Kind of the token that starts exactly at `{line, col}`, or `nil`. Tokens are position-sorted,
+  # so this is a binary search over the view — O(log n), no source read, no CST walk.
+  defp token_kind_starting_at({toks, size, _cont}, line, col) when size > 0 do
+    i = token_search(toks, 0, size - 1, line, col)
+
+    case elem(toks, i) do
+      {kind, ^line, ^col, _, _, _} -> kind
+      _ -> nil
+    end
+  end
+
+  defp token_kind_starting_at(_view, _line, _col), do: nil
+
+  # Kind of the token that ENDS exactly at `{line, col}` (its start is the greatest start before
+  # that position), or `nil`.
+  defp token_kind_ending_at({toks, size, _cont}, line, col) when size > 0 do
+    i = token_search(toks, 0, size - 1, line, col)
+    # `token_search` lands on the last token starting at or before `{line, col}`; a token ending
+    # there starts strictly before it, so step back over any token starting AT the position.
+    i = if match?({_, ^line, ^col, _, _, _}, elem(toks, i)) and i > 0, do: i - 1, else: i
+
+    case elem(toks, i) do
+      {kind, _, _, ^line, ^col, _} -> kind
+      _ -> nil
+    end
+  end
+
+  defp token_kind_ending_at(_view, _line, _col), do: nil
+
+  # Index of the last token whose start is <= `{line, col}` (or 0).
+  defp token_search(_toks, lo, hi, _line, _col) when lo >= hi, do: lo
+
+  defp token_search(toks, lo, hi, line, col) do
+    mid = div(lo + hi + 1, 2)
+    {_, sl, sc, _, _, _} = elem(toks, mid)
+
+    if sl < line or (sl == line and sc <= col),
+      do: token_search(toks, mid, hi, line, col),
+      else: token_search(toks, lo, mid - 1, line, col)
   end
 
   # `foo.(…)` / `Foo.{…}` — the open delimiter is the char one past the base's `.` (two past the base
@@ -1265,13 +1310,18 @@ defmodule Toxic2.Lower do
       after_open_paren(cst, callee_idx(k), view, opts) == nil ->
         if k == :remote_call and remote_zero_arity?(cst), do: [no_parens: true], else: []
 
-      src_byte_at(opts, el, ec - 1) == ?) ->
+      closes_with_paren?(view, opts, el, ec) ->
         [closing: [line: el, column: ec - 1]]
 
       true ->
         close_paren_before_do(cst, opts)
     end
   end
+
+  # A paren call (no do-block) ends at the `)`: source probe first (O(1) on ASCII lines), token
+  # view when the probe misses (see `after_open_paren`).
+  defp closes_with_paren?(view, opts, el, ec),
+    do: src_byte_at(opts, el, ec - 1) == ?) or token_kind_ending_at(view, el, ec) == :")"
 
   defp callee_idx(:call), do: 0
   defp callee_idx(:remote_call), do: 1

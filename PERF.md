@@ -56,15 +56,15 @@ Matched-output ratios (fresh process, 10 rounds): default `[line, column]` **1.0
 `mix toxic2.check.full` (format, guard, credo --strict, warnings-as-errors, 1109 tests, conformance
 gate 521 frozen, dialyzer) green; `mix toxic2.check.imported` green (parser 7601/7615, lexer
 774/774); `mix test --include imported` 1111 passed; `mix toxic2.conformance.oss` 5343 conformant +
-50 tolerated / 5393; OSS tm byte-equality 5518/5519 (the one mismatch, `closing:` on a call whose
-string arg is Hebrew combining marks in `elixir/test/elixir/string_test.exs:1048`, is pre-existing
-on `c924fcf`).
+50 tolerated / 5393; OSS tm byte-equality **5519/5519** (the last mismatch — `closing:` dropped on
+a call whose string arg starts with combining marks, `elixir/test/elixir/string_test.exs:1048`,
+pre-existing on `c924fcf` — is fixed: the `(`/`)` probes fall back to the token view when the
+whole-line column→byte mapping cannot reproduce the lexer's context-dependent clusters).
 
 ## Known remaining
 
 - Default-mode `->` clause meta is `[]` while the oracle with `columns: true` gives `[line, column]`
   (by design; default parity is against `Code.string_to_quoted/1`).
-- The pre-existing tm `closing:` column mismatch above (combining marks inside a string argument).
 - `Tokens.has_cont?/1` and the lexer's list→tuple hand-off are the remaining per-token passes.
 
 # 2026-06-13 — Fair (apples-to-apples) measurement + arch-change verdict + representation survey
