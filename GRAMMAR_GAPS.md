@@ -34,10 +34,10 @@ outrank missed diagnostics; fuzzer token soup is bottom-tier regardless of class
 
 > **FIX STATUS (2026-09-06): all P0–P4 findings below are FIXED** — P0/P1: R3, R18, R1+R2, K1,
 > R4, R5, OX4, R17 (2026-09-05); P2: OX1, R6, R14, K4, F3+K8, K7, R16, OX2, K6; P3: K14, K10;
-> P4: R8, R9, R10, R11, R12, R13, R19, K3, K5, K9, K11, K12, K13, K15, OX3, R7, R15, F4
-> (2026-09-06). Only P5 token soup remains open: K2, R20, F2, F7, the %-soup struct bases, and
-> the two catalogued audit-harness residuals (`%...{}`, `%fn -> 1 end{}`). The review harness
-> agrees on 160/164 comparisons (the 4 R20 rows remain). Regression tests live in `test/toxic2/yrl_edge_cases_test.exs`,
+> P4: R8, R9, R10, R11, R12, R13, R19, K3, K5, K9, K11, K12, K13, K15, OX3, R7, R15, F4;
+> P5 (partial): F7 and F2 (2026-09-06). Still open, by deliberate choice ("not interesting"):
+> K2, R20, the %-soup struct bases, and the two catalogued audit-harness residuals (`%...{}`,
+> `%fn -> 1 end{}`). The review harness agrees on 160/164 comparisons (the 4 R20 rows remain). Regression tests live in `test/toxic2/yrl_edge_cases_test.exs`,
 > `test/toxic2/parser_test.exs`, and `test/toxic2/token_metadata_test.exs`; the review harness
 > (`grammar_review_20260905.exs`) reflects the remaining P3+ backlog, and the old audit harness
 > (`mix run grammar_audit.exs`) is down to the two %-soup struct-base residuals (4 rows).
@@ -94,8 +94,8 @@ likelihood (2026-09-06):**
 
 | Rank | Finding | Why |
 |---|---|---|
-| 1 | F7 `fn x -> ; end` (missed empty-clause warning + literal/eoe metadata) | The one soup input a human plausibly produces mid-edit — deleting a clause body leaves `-> ;`. Valid source; the gap is a missing warning plus encoder metadata, so an IDE shows slightly wrong diagnostics, never a wrong tree. |
-| 2 | F2 `foo.//1` / `foo.->1` dot-context operator split (false errors) | Valid code falsely rejected, and remote operator references DO occur in generated/metaprogrammed code — but only the space-free adjacent spelling trips it; `foo.++(1, 2)` and `Kernel.+1` already work. |
+| 1 | ~~F7~~ FIXED 2026-09-06 — `fn x -> ; end` (missed empty-clause warning + literal/eoe metadata) | The one soup input a human plausibly produces mid-edit — deleting a clause body leaves `-> ;`. Valid source; the gap is a missing warning plus encoder metadata, so an IDE shows slightly wrong diagnostics, never a wrong tree. |
+| 2 | ~~F2~~ FIXED 2026-09-06 — `foo.//1` / `foo.->1` dot-context operator split (false errors) | Valid code falsely rejected, and remote operator references DO occur in generated/metaprogrammed code — but only the space-free adjacent spelling trips it; `foo.++(1, 2)` and `Kernel.+1` already work. |
 | 3 | K2 `%&1{}` / `%..{}` struct bases (false errors) | Valid inputs rejected, but capture-int / nullary-range struct bases only arise in quoted/macro-generated ASTs rendered back to source. Same `struct_base_start?` one-liner family as rank 4 — fix together. |
 | 4 | `%...{}` / `%fn -> 1 end{}` struct bases (false errors; the audit harness's 2 residuals) | Pure fuzzer shapes; kept above rank 5 only because they are false errors on valid input rather than missed diagnostics. |
 | 5 | R20 `+//2` / `f +//2` / `%{m | //x}` and `%+&f/1{}`-style admissions (missed errors) | Inputs nobody types AND the failure is only a missing diagnostic on invalid source — the lowest stakes in the file. |
@@ -147,7 +147,7 @@ spaces or parentheses, so these forms are uncommon in formatted projects. They a
 ordinary valid syntax and can occur in macro DSLs, generated code, or unformatted editor buffers;
 `f!x`/`f?x` and adjacent sigil/map arguments are considerably less fuzzer-like than the old `%` soup.
 
-### F2. False errors from missing dot-context operator tokenization
+### F2. FIXED 2026-09-06 — False errors from missing dot-context operator tokenization
 
 The upstream tokenizer has a dedicated `handle_dot` path: only operators legal as remote member
 names are emitted as one `op_identifier`; excluded multi-character sequences are split and then
@@ -266,7 +266,7 @@ keyword-only, and nested-pattern heads.
 **Real-code likelihood: medium for token-metadata consumers.** Multiline anonymous-function heads
 are less common than multiline access but are reasonable for long patterns or generated code.
 
-### F7. Leading-semicolon stab bodies still miss warning and literal metadata
+### F7. FIXED 2026-09-06 — Leading-semicolon stab bodies missed warning and literal metadata
 
 ```elixir
 fn x -> ; end
