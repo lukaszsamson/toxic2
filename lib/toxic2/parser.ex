@@ -3176,6 +3176,11 @@ defmodule Toxic2.Parser do
     end
   end
 
+  defp semicolon_between?(_t, i, close) when i >= close, do: false
+
+  defp semicolon_between?(t, i, close),
+    do: tk(t, i) == :";" or semicolon_between?(t, i + 1, close)
+
   # A single parenthesised expression. Multi-statement parens `(a; b)` are deferred; here a `;`
   # before `)` is reported as a missing `)` and recovered by the expr-list loop.
   # A paren resets to a fresh `:matched` context, so the caller's `ctx` is not threaded inside.
@@ -3201,7 +3206,16 @@ defmodule Toxic2.Parser do
   defp close_paren(t, open, close, children, diags, nid, fuel) do
     if tk(t, close) == :")" do
       span = merge_tt(t, open, close)
-      {CST.node(:paren, span, children, :matched, nil), close + 1, diags, nid, fuel}
+      node = CST.node(:paren, span, children, :matched, nil)
+
+      # `(;)` vs `()`: only an EMPTY paren needs the distinction (the lowerer's empty-paren warning
+      # and tm `closing:` shape), and its interior is nothing but eol/`;` tokens — a short scan.
+      node =
+        if children == [] and semicolon_between?(t, open + 1, close),
+          do: CST.mark_semicolon(node),
+          else: node
+
+      {node, close + 1, diags, nid, fuel}
     else
       {id, diags, nid} =
         Diagnostics.emit(diags, nid, :parser, :error, :expected_rparen, tok_span(t, close))

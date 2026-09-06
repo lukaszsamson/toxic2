@@ -19,9 +19,6 @@ defmodule Toxic2.Lower do
 
   alias Toxic2.{CST, Diagnostics, Tokens}
 
-  # Process-dictionary key for the default-mode source line index memo (see `lazy_index/1`).
-  @src_index_key {__MODULE__, :src_index}
-
   # Sparse grapheme index (see `gc_index/1`): one entry per `@gc_index_step` columns, built only for
   # mixed lines whose non-ASCII tail exceeds `@gc_index_min` bytes.
   @gc_index_step 32
@@ -94,8 +91,6 @@ defmodule Toxic2.Lower do
   def to_ast(cst, view, source, opts, start_id)
       when is_binary(source) and is_list(opts) and is_integer(start_id) do
     {ast, acc, _nid} = lower(cst, view, resolve_opts(opts, source), [], start_id)
-    # Drop the default-mode line-index memo (see `lazy_index/1`) so it can't outlive this call.
-    :erlang.erase(@src_index_key)
     {ast, Diagnostics.to_list(acc)}
   end
 
@@ -108,15 +103,15 @@ defmodule Toxic2.Lower do
     range = Keyword.get(opts, :range, false)
     encoder = Keyword.get(opts, :literal_encoder)
 
-    # `source_lines` (a `String.split` + per-line ASCII scan) is only needed when we slice the source:
-    # always for token_metadata / range / literal_encoder, but in DEFAULT lowering only for the rare
-    # empty-paren `;` check. So default mode keeps a `{:lazy, source}` marker and `src_slice` splits
-    # on demand (see its lazy clause) — avoiding the whole-source split+scan per file on the hot path.
+    # `source_lines` (a `String.split` + per-line ASCII scan) is only needed when we slice the source
+    # — token_metadata / range / literal_encoder. DEFAULT lowering never reads the source (the one
+    # source-derived fact it needs, `(;)` vs `()`, is a CST flag set by the parser), so it skips the
+    # whole-source split+scan and `src_slice` answers `nil`.
     {lines, ascii} =
       if tm or range or encoder != nil do
         line_index(source)
       else
-        {{:lazy, source}, {:lazy, source}}
+        {nil, nil}
       end
 
     %{
@@ -256,34 +251,6 @@ defmodule Toxic2.Lower do
 
   defp chomp_cr(line), do: line
 
-  # `opts` is an immutable value threaded DOWNWARD through the traversal: an index resolved inside
-  # this call can never reach the SIBLING nodes that need it next, so every `(;)`/empty-paren check
-  # re-split and re-scanned the whole source — quadratic (8 000 `(;)` lines: 1.66 s). Threading the
-  # resolved opts back up would mean returning it from every one of ~200 lowering functions.
-  # The index is a pure function of `source`, so memoize it in the process dictionary — the one
-  # mutable cell available without that refactor — for the duration of one `to_ast/5`, which erases
-  # it on the way out. Keying on `source` keeps a stale entry (a raising literal_encoder, a nested
-  # `to_ast`) merely a cache miss, never a wrong answer.
-  defp lazy_index(source) do
-    case :erlang.get(@src_index_key) do
-      {^source, lines, ascii} ->
-        {lines, ascii}
-
-      _ ->
-        {lines, ascii} = line_index(source)
-        :erlang.put(@src_index_key, {source, lines, ascii})
-        {lines, ascii}
-    end
-  end
-
-  # Default lowering stored a `{:lazy, source}` marker instead of splitting (the lines/ascii are only
-  # needed here, for the rare empty-paren `;` check). Resolve it, then recurse with eager opts so
-  # every downstream read (`col_byte`, `line_ascii_prefix`) sees the real tuple.
-  defp src_slice(%{source_lines: {:lazy, source}} = opts, from, to) do
-    {lines, ascii} = lazy_index(source)
-    src_slice(%{opts | source_lines: lines, ascii_lines: ascii}, from, to)
-  end
-
   # Raw source text spanning `{sl,sc}`..`{el,ec}` (codepoint columns, end-exclusive), or `nil`.
   # Single-line (the hot case — `token:` text, `(`/`)` delimiter checks): map the codepoint columns
   # to byte offsets with `col_byte` and take ONE `binary_part`, instead of `String.slice`'s
@@ -350,8 +317,8 @@ defmodule Toxic2.Lower do
 
   defp src_line(_opts, _n), do: nil
 
-  # `source_lines` is always a forced line tuple here: every caller runs only under
-  # `token_metadata: true`, where `resolve_opts` splits eagerly (never the `{:lazy, _}` marker).
+  # `source_lines` is always a line tuple here: every caller runs only under `token_metadata: true`,
+  # where `resolve_opts` builds the index eagerly (default mode carries `nil`).
   defp src_line_count(%{source_lines: lines}) when is_tuple(lines), do: tuple_size(lines)
 
   # --- end_of_expression (token_metadata) --------------------------------------------------------
@@ -1924,12 +1891,11 @@ defmodule Toxic2.Lower do
 
   # `()` (also `( )`, `(\n)`) is an empty parenthesised expression — Elixir warns it's invalid; pass
   # a value like `nil` instead. But `(;)` is a `;`-block (a different grammar production) and does
-  # NOT warn, so check the source between the delimiters for a `;`. Scoped to paren EXPRESSIONS:
-  # stab-clause-head `()` (`fn () -> …`) is lowered elsewhere, not through here.
-  defp maybe_empty_paren_warn({:__block__, _meta, []}, cst, opts, acc, nid) do
-    {sl, sc, el, ec} = cspan(cst)
-
-    if String.contains?(src_slice(opts, {sl, sc + 1}, {el, ec}) || "", ";") do
+  # NOT warn; the parser records that `;` token as a CST flag (`( # ;\n)` has no `;` token and
+  # warns, as upstream). Scoped to paren EXPRESSIONS: stab-clause-head `()` (`fn () -> …`) is
+  # lowered elsewhere, not through here.
+  defp maybe_empty_paren_warn({:__block__, _meta, []}, cst, _opts, acc, nid) do
+    if CST.has_semicolon?(cst) do
       {acc, nid}
     else
       {_id, acc, nid} =
@@ -1943,14 +1909,14 @@ defmodule Toxic2.Lower do
 
   # Empty parens. `()` is Elixir's `empty_paren` → `{:__block__, [parens: …], []}`; `(;)` is the
   # `open_paren ';' close_paren` rule → `{:__block__, [closing: …, line, column], []}`. Both lower to
-  # an empty block here, so the `;` is detected from the source (only meaningful under token_metadata,
-  # where `source_lines` is available; otherwise the empty block stays bare, matching `()` no-tm).
+  # an empty block here; the parser's `has_semicolon` flag tells them apart (only meaningful under
+  # token_metadata; otherwise the empty block stays bare, matching `()` no-tm).
   defp add_parens_meta({:__block__, _meta, []}, [], cst, opts) do
     with true <- tm?(opts),
          {sl, sc, el, ec} <- cspan(cst) do
       closing = [line: el, column: ec - 1]
 
-      if String.contains?(src_slice(opts, {sl, sc + 1}, {el, ec - 1}) || "", ";"),
+      if CST.has_semicolon?(cst),
         do: {:__block__, [closing: closing, line: sl, column: sc], []},
         else: {:__block__, [parens: [closing: closing, line: sl, column: sc]], []}
     else

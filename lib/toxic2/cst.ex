@@ -38,6 +38,10 @@ defmodule Toxic2.CST do
   @flag_matched 16
   @flag_unmatched 32
   @flag_no_parens 64
+  # Node-local (never inherited): an EMPTY `:paren` whose interior holds a `;` token — `(;)` is
+  # upstream's `open_paren ';' close_paren` production (a `;`-block), not the `()` empty paren
+  # that warns. Recorded here from the tokens so the lowerer never has to re-read the source.
+  @flag_has_semicolon 128
 
   # Flags that propagate from children to parent at construction.
   @inheritable @flag_has_error ||| @flag_contains_eol ||| @flag_has_comments
@@ -161,6 +165,15 @@ defmodule Toxic2.CST do
 
   @spec contains_eol?(t()) :: boolean()
   def contains_eol?(cst), do: flag?(cst, @flag_contains_eol)
+
+  @doc "`true` for an empty `:paren` built from `(;)` (a `;` token between the delimiters)."
+  @spec has_semicolon?(t()) :: boolean()
+  def has_semicolon?(cst), do: flag?(cst, @flag_has_semicolon)
+
+  @doc "Mark a node as `(;)`-shaped (see `has_semicolon?/1`)."
+  @spec mark_semicolon(node_t()) :: node_t()
+  def mark_semicolon({:node, kind, sp, ch, f, d}),
+    do: {:node, kind, sp, ch, f ||| @flag_has_semicolon, d}
 
   @doc "Expression class, or `nil` if unclassified."
   @spec category(t()) :: category() | nil

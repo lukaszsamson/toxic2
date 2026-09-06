@@ -352,6 +352,9 @@ defmodule Toxic2.DiagnosticsConformanceTest do
       assert Enum.map(warnings("()"), &Diagnostic.code/1) == [:empty_paren]
       assert Enum.map(warnings("( )"), &Diagnostic.code/1) == [:empty_paren]
       assert warnings("(;)") == []
+      assert warnings("(\n;\n)") == []
+      # the `;` must be a TOKEN: one inside a comment leaves a plain empty paren, as upstream
+      assert Enum.map(warnings("( # ;\n)"), &Diagnostic.code/1) == [:empty_paren]
       assert warnings("fn () -> 1 end") == []
       assert warnings("fn () when node() == x -> true end") == []
     end
