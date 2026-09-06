@@ -1068,7 +1068,20 @@ defmodule Toxic2.Lower do
   end
 
   # Byte width of the grapheme cluster at `bin`'s head (>= 1, total over invalid UTF-8).
-  defp gc_head_bytes(bin) do
+  # Fast path: no cluster extender exists below U+0300, so a sub-U+0300 head followed by ASCII
+  # or another sub-U+0300 codepoint is its own cluster — no `unicode_util:gc` call.
+  defp gc_head_bytes(<<c::utf8, rest::binary>> = bin) when c < 0x0300 do
+    case rest do
+      <<n, _::binary>> when n < 0xCC -> byte_size(bin) - byte_size(rest)
+      <<>> -> byte_size(bin) - byte_size(rest)
+      <<n::utf8, _::binary>> when n < 0x0300 -> byte_size(bin) - byte_size(rest)
+      _ -> gc_head_bytes_slow(bin)
+    end
+  end
+
+  defp gc_head_bytes(bin), do: gc_head_bytes_slow(bin)
+
+  defp gc_head_bytes_slow(bin) do
     case :unicode_util.gc(bin) do
       [gc | _] -> max(byte_size(:unicode.characters_to_binary(List.wrap(gc))), 1)
       _ -> 1

@@ -699,17 +699,16 @@ defmodule Toxic2.Lexer do
         lex_unicode(bin, line, col, acc, w, st)
 
       _ ->
-        case kw_name(bin) do
-          {:kw, klen, kname, rest, nospace?} ->
-            acc = if nospace?, do: kw_nospace_error(kname, line, col, klen, acc), else: acc
-            cont(rest, {:kw_identifier, line, col, line, col + klen + 1, kname}, acc, w, st)
+        case kw_suffix(after_name) do
+          {:kw, rest} ->
+            cont(rest, {:kw_identifier, line, col, line, col + len + 1, name}, acc, w, st)
+
+          {:kw_nospace, rest} ->
+            acc = kw_nospace_error(name, line, col, len, acc)
+            cont(rest, {:kw_identifier, line, col, line, col + len + 1, name}, acc, w, st)
 
           :no ->
-            # `foo@bar` / `not@bar` — upstream reads the whole word and rejects the `@` (R15);
-            # a `!`/`?` suffix is a real token boundary (`foo!@x` is a call with an `@x` arg).
-            acc = at_in_name_error(name, after_name, line, col, len, acc)
-            w = bang_before_eq_notice(name, after_name, line, col, len, w)
-            cont(after_name, lower_token(name, line, col, len), acc, w, st)
+            lex_lower_no_kw(bin, name, after_name, len, line, col, acc, w, st)
         end
     end
   end
@@ -724,13 +723,16 @@ defmodule Toxic2.Lexer do
         lex_unicode(bin, line, col, acc, w, st)
 
       _ ->
-        case kw_name(bin) do
-          {:kw, klen, kname, rest, nospace?} ->
-            acc = if nospace?, do: kw_nospace_error(kname, line, col, klen, acc), else: acc
-            cont(rest, {:kw_identifier, line, col, line, col + klen + 1, kname}, acc, w, st)
+        case kw_suffix(after_name) do
+          {:kw, rest} ->
+            cont(rest, {:kw_identifier, line, col, line, col + len + 1, name}, acc, w, st)
+
+          {:kw_nospace, rest} ->
+            acc = kw_nospace_error(name, line, col, len, acc)
+            cont(rest, {:kw_identifier, line, col, line, col + len + 1, name}, acc, w, st)
 
           :no ->
-            cont(after_name, {:alias, line, col, line, col + len, name}, acc, w, st)
+            lex_upper_no_kw(bin, name, after_name, len, line, col, acc, w, st)
         end
     end
   end
@@ -1129,6 +1131,44 @@ defmodule Toxic2.Lexer do
   defp kw_suffix(<<?:, _::binary>> = bin), do: {:kw_nospace, rest_at(bin, 1)}
   defp kw_suffix(_), do: :no
 
+  # Not a plain keyword key. An `@` boundary may still make one (`foo@bar:` — the FULL atom-shaped
+  # name is the key, R5); otherwise `word@` is an invalid identifier (R15; a `!`/`?` suffix is a
+  # real token boundary — `foo!@x` is a call with an `@x` arg). The extended re-scan runs only on
+  # this rare `@` path, keeping the per-identifier fast path single-scan.
+  defp lex_lower_no_kw(bin, name, <<?@, _::binary>> = after_name, len, line, col, acc, w, st) do
+    case kw_name(bin) do
+      {:kw, klen, kname, rest, nospace?} ->
+        acc = if nospace?, do: kw_nospace_error(kname, line, col, klen, acc), else: acc
+        cont(rest, {:kw_identifier, line, col, line, col + klen + 1, kname}, acc, w, st)
+
+      :no ->
+        acc = at_in_name_error(name, after_name, line, col, len, acc)
+        cont(after_name, lower_token(name, line, col, len), acc, w, st)
+    end
+  end
+
+  defp lex_lower_no_kw(_bin, name, after_name, len, line, col, acc, w, st) do
+    w = bang_before_eq_notice(name, after_name, line, col, len, w)
+    cont(after_name, lower_token(name, line, col, len), acc, w, st)
+  end
+
+  # `Foo!:` / `Foo?:` / `Foo@bar:` — the alias scanner stops before `!`/`?`/`@`, so only those
+  # boundaries can still form an atom-shaped keyword key (R5); everything else is a plain alias.
+  defp lex_upper_no_kw(bin, name, <<c, _::binary>> = after_name, len, line, col, acc, w, st)
+       when c in [?!, ??, ?@] do
+    case kw_name(bin) do
+      {:kw, klen, kname, rest, nospace?} ->
+        acc = if nospace?, do: kw_nospace_error(kname, line, col, klen, acc), else: acc
+        cont(rest, {:kw_identifier, line, col, line, col + klen + 1, kname}, acc, w, st)
+
+      :no ->
+        cont(after_name, {:alias, line, col, line, col + len, name}, acc, w, st)
+    end
+  end
+
+  defp lex_upper_no_kw(_bin, name, after_name, len, line, col, acc, w, st),
+    do: cont(after_name, {:alias, line, col, line, col + len, name}, acc, w, st)
+
   # A keyword key reads the FULL atom-shaped name — word chars and `@`, then an optional trailing
   # `?`/`!` — before checking for the colon, mirroring upstream's suffix check ordering: `foo@bar:`
   # and `Foo!:` are ordinary keyword keys even though `foo@bar` / `Foo!` are invalid bare names.
@@ -1286,7 +1326,7 @@ defmodule Toxic2.Lexer do
         read_quoted(rest, line, col + 1, [<<c::utf8>>], {line, col + 1}, acc, w, st, lit)
 
       true ->
-        {cbin, rest, dc} = gc_step(<<c::utf8, rest::binary>>, buf_last_cp(buf))
+        {cbin, rest, dc} = gc_step(<<c::utf8, rest::binary>>, buf)
         read_quoted(rest, line, col + dc, [cbin | buf], fs, acc, w, st, lit)
     end
   end
@@ -1632,7 +1672,7 @@ defmodule Toxic2.Lexer do
         acc = [{:error, line, col, line, col + 1, LexError.new(code, %{codepoint: c})} | acc]
         read_sigil(rest, line, col + 1, [<<c::utf8>>], {line, col + 1}, acc, w, st, sm)
       else
-        {cbin, rest, dc} = gc_step(<<c::utf8, rest::binary>>, buf_last_cp(buf))
+        {cbin, rest, dc} = gc_step(<<c::utf8, rest::binary>>, buf)
         read_sigil(rest, line, col + dc, [cbin | buf], fs, acc, w, st, sm)
       end
     end
@@ -1878,7 +1918,7 @@ defmodule Toxic2.Lexer do
       acc = [{:error, line, col, line, col + 1, LexError.new(code, %{codepoint: c})} | acc]
       read_heredoc(rest, line, col + 1, [<<c::utf8>>], {line, col + 1}, acc, w, st, hc)
     else
-      {cbin, rest, dc} = gc_step(<<c::utf8, rest::binary>>, buf_last_cp(buf))
+      {cbin, rest, dc} = gc_step(<<c::utf8, rest::binary>>, buf)
       read_heredoc(rest, line, col + dc, [cbin | buf], fs, acc, w, st, hc)
     end
   end
@@ -2196,7 +2236,22 @@ defmodule Toxic2.Lexer do
   # `{cluster_bytes, rest, col_delta}` for the cluster starting (or continuing) at `bin`'s head;
   # `col_delta` is 0 when the head codepoint extends the PREVIOUS char's cluster (`prev` = the
   # last codepoint already emitted into the fragment buffer, or nil).
-  defp gc_step(bin, prev) do
+  # FAST PATH: no cluster-extending codepoint (combining marks, ZWJ/ZWNJ, variation selectors,
+  # regional indicators, …) exists below U+0300, so when both the head codepoint and the next one
+  # are below it (ASCII included) no grapheme machinery is needed — one codepoint, one column.
+  # This keeps ordinary Latin-supplement text (é, ü, ñ …) off the `unicode_util:gc` path.
+  defp gc_step(<<c::utf8, rest::binary>> = bin, buf) when c < 0x0300 do
+    case rest do
+      <<n, _::binary>> when n < 0xCC -> {<<c::utf8>>, rest, 1}
+      <<>> -> {<<c::utf8>>, rest, 1}
+      <<n::utf8, _::binary>> when n < 0x0300 -> {<<c::utf8>>, rest, 1}
+      _ -> gc_step_slow(bin, buf_last_cp(buf))
+    end
+  end
+
+  defp gc_step(bin, buf), do: gc_step_slow(bin, buf_last_cp(buf))
+
+  defp gc_step_slow(bin, prev) do
     with false <- prev == nil,
          [[^prev | cont] | _] <- uu_gc(<<prev::utf8, bin::binary>>),
          cbin when is_binary(cbin) <- :unicode.characters_to_binary(cont) do
