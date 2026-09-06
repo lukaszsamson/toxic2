@@ -32,9 +32,12 @@ Ranked by how likely the input is to occur in valid or close-to-valid code as it
 edited (the IDE/LSP use case). Silent corruption of valid code outranks false errors, which
 outrank missed diagnostics; fuzzer token soup is bottom-tier regardless of class.
 
-> **FIX STATUS (2026-09-06): all P0, P1, P2, and P3 findings below are FIXED** — P0/P1: R3, R18,
-> R1+R2, K1, R4, R5, OX4, R17 (2026-09-05); P2: OX1, R6, R14, K4, F3+K8, K7, R16, OX2, K6;
-> P3: K14, K10 (2026-09-06). Regression tests live in `test/toxic2/yrl_edge_cases_test.exs`,
+> **FIX STATUS (2026-09-06): all P0–P4 findings below are FIXED** — P0/P1: R3, R18, R1+R2, K1,
+> R4, R5, OX4, R17 (2026-09-05); P2: OX1, R6, R14, K4, F3+K8, K7, R16, OX2, K6; P3: K14, K10;
+> P4: R8, R9, R10, R11, R12, R13, R19, K3, K5, K9, K11, K12, K13, K15, OX3, R7, R15, F4
+> (2026-09-06). Only P5 token soup remains open: K2, R20, F2, F7, the %-soup struct bases, and
+> the two catalogued audit-harness residuals (`%...{}`, `%fn -> 1 end{}`). The review harness
+> agrees on 160/164 comparisons (the 4 R20 rows remain). Regression tests live in `test/toxic2/yrl_edge_cases_test.exs`,
 > `test/toxic2/parser_test.exs`, and `test/toxic2/token_metadata_test.exs`; the review harness
 > (`grammar_review_20260905.exs`) reflects the remaining P3+ backlog, and the old audit harness
 > (`mix run grammar_audit.exs`) is down to the two %-soup struct-base residuals (4 rows).
@@ -78,7 +81,7 @@ outrank missed diagnostics; fuzzer token soup is bottom-tier regardless of class
 | 18 | K14 `->` inside a comment hijacks the arrow anchor | Comments like `# maps a -> b` are common. |
 | 19 | K10 `not`/`in` inside a comment hijacks `not in` anchor (+ missing `newlines:`) | Same root: `:binary.match` source scans; a token-driven scan fixes both. |
 
-**P4 — rare valid spellings, metadata/warning parity:** R8/R9 (attribute `@f()(1)`, `@@f[x]`
+**P4 — rare valid spellings, metadata/warning parity: FIXED 2026-09-06** (including R10, which the original ranking omitted): R8/R9 (attribute `@f()(1)`, `@@f[x]`
 grouping), R11 (ellipsis newline/`not in` boundaries), R12 (`f +..`), R13 (`&0x0A`/`&1_0`),
 K3 (`?\é`), R7 (escaped raw bidi/forbidden chars), R15 (`é@bar`/`not@bar` identifiers),
 OX3 (`%{a not in b}`), K5 (`%<do-block>{}`), F4 (parenthesised fn kw guard), K13 (encoder
