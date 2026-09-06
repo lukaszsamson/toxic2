@@ -200,6 +200,21 @@ defmodule Toxic2.YrlEdgeCasesTest do
     end
   end
 
+  describe "P4 lower gaps (K9, K13)" do
+    test "K9: the deprecated not-in rewrite keeps meta without token_metadata" do
+      assert {:not, [line: 1, column: 1], [{:in, [line: 1, column: 7], _}]} =
+               elem(Toxic2.parse_to_ast("not a in b", columns: true), 0)
+    end
+
+    test "K13: nested_no_parens_keyword is skipped under a literal_encoder" do
+      enc = [literal_encoder: fn value, meta -> {:ok, {:__lit__, meta, [value]}} end]
+      {_a, d1} = Toxic2.parse_to_ast("f k: bar a, b")
+      {_a, d2} = Toxic2.parse_to_ast("f k: bar a, b", enc)
+      assert Enum.any?(d1, &(elem(&1, 3) == :nested_no_parens_keyword))
+      refute Enum.any?(d2, &(elem(&1, 3) == :nested_no_parens_keyword))
+    end
+  end
+
   describe "P4 lexer gaps (R13, K3, R7, R15, K15)" do
     test "R13: capture ints use the full integer scanner" do
       assert {{:&, _, [10]}, []} = Toxic2.parse_to_ast("&1_0")

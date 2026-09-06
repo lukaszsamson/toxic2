@@ -1624,6 +1624,7 @@ defmodule Toxic2.Parser do
         close = skip_eols(t, j)
         after_close = if tk(t, close) == :")", do: close + 1, else: close
         k = skip_eols(t, after_close)
+        head = maybe_single_paren_pattern(t, i, close, head)
 
         if tk(t, k) == :when_op do
           clause_outer_guard(t, k, cchildren(head), diags, nid, fuel)
@@ -1633,6 +1634,22 @@ defmodule Toxic2.Parser do
 
       true ->
         head_with_guards(t, i, diags, nid, fuel)
+    end
+  end
+
+  # `fn (f a, b) -> 1 end` — the depth-0 comma belonged to the nested no-parens call, so the
+  # interior collapsed to ONE pattern: this is really a PARENTHESISED single pattern, and the
+  # parens meta belongs on the call, not on the `->` (R19). Rebuild it as a `:paren` pattern
+  # (the same shape the non-comma `(a)` head takes). Keyword-only (`(a: 1)`) and guarded
+  # (`(a, b when c)`) heads keep their `stab_parens_many` treatment.
+  defp maybe_single_paren_pattern(t, open, close, head) do
+    with :")" <- tk(t, close),
+         {:node, :stab_args, _sp, [single], _f, _d} <- head,
+         {:node, kind, _ssp, _ch, _sf, _sd} when kind not in [:kw_pair, :stab_when] <- single do
+      paren = CST.node(:paren, merge_tt(t, open, close), [single], :matched, nil)
+      CST.node(:stab_args, cst_span(t, paren), [paren], :matched, nil)
+    else
+      _ -> head
     end
   end
 
@@ -2202,6 +2219,9 @@ defmodule Toxic2.Parser do
   # First non-keyword segment: an update base (`base | ...`) or the first `=>` assoc entry.
   defp map_lead(t, i, span_start, diags, nid, fuel) do
     {key, j, diags, nid, fuel} = parse_expr(t, i, @map_key_bp, :matched, diags, nid, fuel - 1)
+    # A map KEY may end in a kw-only no-parens call that absorbs the trailing keyword run
+    # (`%{f a: 1, b: 2 => 1}` — upstream permits a matched_expr on BOTH sides of `=>`, R10).
+    {key, j, diags, nid, fuel} = absorb_kw_run(t, key, j, diags, nid, fuel)
     jj = skip_eols(t, j)
 
     cond do
@@ -2437,6 +2457,9 @@ defmodule Toxic2.Parser do
       {node, j, diags, nid, fuel}
     else
       {key, j, diags, nid, fuel} = parse_expr(t, i, @map_key_bp, :matched, diags, nid, fuel - 1)
+      # A map KEY may also end in a kw-only no-parens call that absorbs the trailing keyword run
+      # (`%{f a: 1, b: 2 => 1}` — upstream permits a matched_expr on BOTH sides of `=>`, R10).
+      {key, j, diags, nid, fuel} = absorb_kw_run(t, key, j, diags, nid, fuel)
       jj = skip_eols(t, j)
 
       cond do

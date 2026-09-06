@@ -96,6 +96,32 @@ defmodule Toxic2.TokenMetadataTest do
   describe "from_brackets: / from_interpolation:" do
     test "access uses from_brackets:", do: Enum.each(["foo[bar]", "a[b][c]"], &assert_parity/1)
 
+    test "P4 metadata parity: K11, K12, R10, R19" do
+      Enum.each(
+        [
+          # K11: empty-first-head fn attaches the eol to the arrow
+          "fn\n-> 1 end",
+          "fn # c\n-> 1 end",
+          "fn\n\n-> 1 end",
+          "a = fn\n-> 1\nend",
+          "fn\nx -> 1 end",
+          # K12: :true/:false/:nil carry format: :atom through the encoder
+          ":true",
+          ":false",
+          ":nil",
+          "[k: :true]",
+          # R10: keyword-only no-parens calls absorb in map-KEY position
+          "%{f a: 1, b: 2 => 1}",
+          "%{+f a: 1, b: 2 => 1}",
+          # R19: parens around a single no-parens call belong to the call
+          "fn (f a, b) -> 1 end",
+          "case x do (f a, b) -> 1 end",
+          "fn (a: 1) -> 1 end"
+        ],
+        &assert_parity/1
+      )
+    end
+
     test "operator words inside gap comments never hijack anchors (K14/K10)" do
       Enum.each(
         [

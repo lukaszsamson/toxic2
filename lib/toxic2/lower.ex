@@ -448,8 +448,16 @@ defmodule Toxic2.Lower do
 
   defp lower_atom_literal(cst, view, idx, opts, val, acc, nid) do
     case to_atom(val, opts) do
-      {:ok, atom} -> lit(atom, view, idx, opts, acc, nid)
-      :error -> nonexistent_atom(cst, view, val, acc, nid)
+      # `:true` / `:false` / `:nil` — upstream's atom_colon_meta adds `format: :atom` for exactly
+      # these three, so an encoder can tell `:true` from bare `true` (K12).
+      {:ok, atom} when atom in [true, false, nil] ->
+        lit(atom, view, idx, opts, acc, nid, format: :atom)
+
+      {:ok, atom} ->
+        lit(atom, view, idx, opts, acc, nid)
+
+      :error ->
+        nonexistent_atom(cst, view, val, acc, nid)
     end
   end
 
@@ -625,6 +633,14 @@ defmodule Toxic2.Lower do
   # `newlines:` for a container / call / `fn`: the (comment-aware) newline count between the open
   # delimiter and the first inner element. `foo(\n a)` / `{\n a}` / `%{\n a: 1}` / `fn\n x -> …` → 1;
   # a newline only *between* later elements does not count. A struct carries it on its inner map.
+  # `fn\n-> 1 end` — when the FIRST clause head is empty, upstream attaches the eol to the
+  # ARROW (`stab_op_eol`), not to `fn` (K11); with a pattern (`fn\n x -> …`) it stays on `fn`.
+  defp open_newlines(:fn, cst, view, opts) do
+    if fn_empty_first_head?(cchildren(cst)),
+      do: [],
+      else: open_newlines_scan(:fn, cst, view, opts)
+  end
+
   defp open_newlines(kind, cst, view, opts)
        when kind in [
               :call,
@@ -635,9 +651,13 @@ defmodule Toxic2.Lower do
               :map,
               :map_update,
               :bitstring,
-              :list,
-              :fn
-            ] do
+              :list
+            ],
+       do: open_newlines_scan(kind, cst, view, opts)
+
+  defp open_newlines(_kind, _cst, _view, _opts), do: []
+
+  defp open_newlines_scan(kind, cst, view, opts) do
     case open_scan_pos(kind, cst, view, opts) do
       {line, col} ->
         case gap_newlines(opts, line, col) do
@@ -650,7 +670,10 @@ defmodule Toxic2.Lower do
     end
   end
 
-  defp open_newlines(_kind, _cst, _view, _opts), do: []
+  defp fn_empty_first_head?([{:node, :stab, _sp, [args, _body], _f, _d} | _rest]),
+    do: cchildren(args) == []
+
+  defp fn_empty_first_head?(_children), do: false
 
   # Where to start scanning for the post-open-delimiter newlines: just past `(`/`{`/`[`/`<<`/`%{`/`fn`.
   # For a (local) call the `(` follows the callee (child 0); for a remote call it follows the member
@@ -749,6 +772,22 @@ defmodule Toxic2.Lower do
       meta
     end
   end
+
+  # The counterpart of open_newlines/4's empty-first-head rule (K11): the eol run after `fn`
+  # lands as `newlines:` on the first ARROW (`fn\n-> 1 end` => `{:->, [newlines: 1, …], …}`).
+  defp fn_first_arrow_newlines([{:->, m, a} | rest], ch, cst, opts) do
+    with true <- tm?(opts),
+         true <- fn_empty_first_head?(ch),
+         false <- Keyword.has_key?(m, :newlines),
+         {sl, sc, _, _} <- cspan(cst),
+         n when is_integer(n) and n > 0 <- gap_newlines(opts, sl, sc + 2) do
+      [{:->, [{:newlines, n} | m], a} | rest]
+    else
+      _ -> [{:->, m, a} | rest]
+    end
+  end
+
+  defp fn_first_arrow_newlines(clauses, _ch, _cst, _opts), do: clauses
 
   # A stab clause anchors at its `->` operator (not the clause start), matching Elixir, and records
   # `newlines:` when its body starts on a later line than the `->`.
@@ -1371,9 +1410,9 @@ defmodule Toxic2.Lower do
   defp lower_kind(:not_in_op, ch, _cst, view, opts, acc, nid),
     do: lower_not_in(ch, view, opts, acc, nid)
 
-  defp lower_kind(:fn, ch, _cst, view, opts, acc, nid) do
+  defp lower_kind(:fn, ch, cst, view, opts, acc, nid) do
     {clauses, acc, nid} = lower_each(ch, view, opts, acc, nid)
-    {{:fn, [], clauses}, acc, nid}
+    {{:fn, [], fn_first_arrow_newlines(clauses, ch, cst, opts)}, acc, nid}
   end
 
   defp lower_kind(:stab, [args_node, body_node], _cst, view, opts, acc, nid) do
@@ -1978,10 +2017,10 @@ defmodule Toxic2.Lower do
       Diagnostics.emit(acc, nid, :lowerer, :warning, :deprecated_not_in, span, %{})
 
     # `not x in y` (deprecated): since Elixir 1.20 the outer `not`/`!` keeps its OWN meta (the
-    # `not`/`!` token), while the inner `in` is anchored at the `in` operator.
-    not_m = if tm?(opts), do: op_meta(neg_leaf, view), else: []
-    in_m = if tm?(opts), do: op_meta(op_leaf, view), else: []
-    {{neg, not_m, [{:in, in_m, [o, r]}]}, acc, nid}
+    # `not`/`!` token), while the inner `in` is anchored at the `in` operator. Upstream's
+    # rearrange_uop keeps these UNCONDITIONALLY (line always, column per `columns:`) — not only
+    # under token_metadata (K9), like every neighbouring operator lowering.
+    {{neg, op_meta(neg_leaf, view), [{:in, op_meta(op_leaf, view), [o, r]}]}, acc, nid}
   end
 
   # `not a in b` / `!a in b` — a bare `not`/`!` left of `in` is the membership-negation form
@@ -2333,7 +2372,7 @@ defmodule Toxic2.Lower do
 
   # A keyword pair `k: v` => `{key_atom, lowered_value}`. (Keyword key atoms are not gated.)
   defp lower_kw_pair([key, val], view, opts, acc, nid) do
-    {acc, nid} = maybe_nested_no_parens_warn(val, view, acc, nid)
+    {acc, nid} = maybe_nested_no_parens_warn(val, view, opts, acc, nid)
     {v, acc, nid} = lower(val, view, opts, acc, nid)
     kw_key(ctag(key), key, v, view, opts, acc, nid)
   end
@@ -2341,7 +2380,14 @@ defmodule Toxic2.Lower do
   # `foo a: bar b` / `f(a: bar b)` — a keyword whose VALUE is a no-parens call is ambiguous (do the
   # following commas belong to the inner or outer call?); Elixir warns to add parentheses. The
   # CST still carries the `:no_parens` category here (the AST erases it).
-  defp maybe_nested_no_parens_warn(val, view, acc, nid) do
+  # Upstream's warn_nested_no_parens_keyword SKIPS the warning under a literal_encoder — the
+  # encoded key is a 3-tuple, not an atom, so its guard never matches (K13); formatter-grade
+  # tooling relies on that.
+  defp maybe_nested_no_parens_warn(_val, _view, %{literal_encoder: enc}, acc, nid)
+       when enc != nil,
+       do: {acc, nid}
+
+  defp maybe_nested_no_parens_warn(val, view, _opts, acc, nid) do
     if no_parens_call_cst?(val) do
       {_id, acc, nid} =
         Diagnostics.emit(
