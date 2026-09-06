@@ -1571,8 +1571,9 @@ defmodule Toxic2.Parser do
         {:lists.reverse([CST.missing(:end, i, diag: id) | acc]), i, diags, nid, fuel}
 
       true ->
+        paren_head? = stab_parens_head?(t, i)
         {clause, j, diags, nid, fuel} = parse_clause(t, i, :end, diags, nid, fuel)
-        {diags, nid} = check_fn_head_strict(t, clause, diags, nid)
+        {diags, nid} = check_fn_head_strict(t, clause, paren_head?, diags, nid)
         j = if j > i, do: j, else: i + 1
         parse_clauses(t, j, [clause | acc], diags, nid, fuel)
     end
@@ -1585,13 +1586,23 @@ defmodule Toxic2.Parser do
   # the absorption is the meaning (`fn bar 2, c -> x end` = one `bar(2, c)` pattern) — and
   # do-block clause heads (`case … do y when bar 2, c -> 1 end`) are NOT strict upstream, which is
   # why this runs in `parse_clauses` (fn) and not `parse_block_clauses`.
-  defp check_fn_head_strict(t, {:node, :stab, _sp, [head, _body], _f, _d}, diags, nid) do
+  defp check_fn_head_strict(
+         t,
+         {:node, :stab, _sp, [head, _body], _f, _d},
+         paren_head?,
+         diags,
+         nid
+       ) do
     case head do
       # `stab_when` children are patterns ++ [guard]; the guard belongs to the LAST pattern's
       # comma-item, so a SINGLE-pattern head (`fn a when bar 2, c -> x end`) is ONE item — first
       # position, absorption allowed. With ≥2 patterns, items 2..n (and the guard) are strict.
+      # A PAREN head's outer guard (`stab_parens_many when_op expr`) is a full `expr` — any
+      # no-parens call or `x when k: v` is fine there (`fn (a, b) when bar 2, c -> x end`), so
+      # only the patterns inside the parens are strict.
       {:node, :stab_args, _s, [{:node, :stab_when, _sw, [_, _, _ | _] = parts, _fw, _dw}], _f2,
        _d2} ->
+        parts = if paren_head?, do: Enum.drop(parts, -1), else: parts
         check_fn_head_parts(t, parts, diags, nid)
 
       {:node, :stab_args, _s, [{:node, :stab_when, _sw, _parts, _fw, _dw}], _f2, _d2} ->
@@ -1605,7 +1616,7 @@ defmodule Toxic2.Parser do
     end
   end
 
-  defp check_fn_head_strict(_t, _clause, diags, nid), do: {diags, nid}
+  defp check_fn_head_strict(_t, _clause, _paren_head?, diags, nid), do: {diags, nid}
 
   # `parts` is the pattern list (for a `when` head: patterns ++ [guard]) — everything but the
   # first pattern is strict.
@@ -1784,9 +1795,13 @@ defmodule Toxic2.Parser do
           when_kw_rhs(t, guard_start, diags, nid, fuel)
         else
           # `:no_parens_arg`: a guard that is a no-parens call still takes several args
-          # (`when baz a, b`), but a do-block cannot attach — upstream stab heads derive from
-          # `call_args_no_parens_all`, which admits no block_expr (K4).
-          parse_expr(t, guard_start, 0, :no_parens_arg, diags, nid, fuel - 1)
+          # (`when baz a, b`), but a do-block cannot attach — a non-paren head is upstream's
+          # `call_args_no_parens_all`, whose `when` is an ordinary operator inside a no-parens
+          # arg, which admits no block_expr (K4). The `()` head is the exception: upstream's
+          # `empty_paren when_op expr` takes a full `expr` guard (`fn () when if a do b end ->`),
+          # like the `stab_parens_many` guard in `clause_outer_guard`.
+          ctx = if empty_paren_head?(rev_patterns), do: :no_parens, else: :no_parens_arg
+          parse_expr(t, guard_start, 0, ctx, diags, nid, fuel - 1)
         end
 
       jj = skip_eols(t, j)
@@ -1830,6 +1845,9 @@ defmodule Toxic2.Parser do
 
   # The outer guard of a parenthesised head (`(a, b) when g -> …`, `stab_parens_many when_op
   # expr`) — no comma continuation exists in that production.
+  defp empty_paren_head?([{:node, :paren, _sp, [], _f, _d}]), do: true
+  defp empty_paren_head?(_rev_patterns), do: false
+
   defp clause_outer_guard(t, i, patterns, diags, nid, fuel) do
     guard_start = skip_eols(t, i + 1)
 
@@ -1853,7 +1871,10 @@ defmodule Toxic2.Parser do
 
         {guard, j, diags, nid, fuel}
       else
-        parse_expr(t, guard_start, 0, :no_parens_arg, diags, nid, fuel - 1)
+        # `:no_parens`: upstream's paren-head guard is a full `expr` (`stab_parens_many when_op
+        # expr` / `empty_paren when_op expr`), so a no-parens call guard takes several args AND a
+        # do-block attaches (`fn () when if a do :ok end -> b end`). A non-paren head cannot (K4).
+        parse_expr(t, guard_start, 0, :no_parens, diags, nid, fuel - 1)
       end
 
     build_stab_when(t, patterns, guard, skip_eols(t, j), diags, nid, fuel)
@@ -1953,7 +1974,11 @@ defmodule Toxic2.Parser do
     # separators handled by `body_boundary`/`skip_eoe`.
     if acc == [] and tk(t, skip_eols(t, i)) == :";" do
       semi = skip_eols(t, i)
-      parse_clause_body(t, semi + 1, [empty_stmt(t, semi)], stop, diags, nid, fuel)
+      # The `;` IS a crossed boundary: `-> ;e -> 1` ends the (nil) body before the next clause
+      # head, exactly like `-> y; e -> 1` does after a statement.
+      j = skip_eoe(t, semi + 1)
+      {diags, nid} = check_bare_arrow(t, j, diags, nid)
+      parse_clause_body_cont(t, j, [empty_stmt(t, semi)], stop, true, diags, nid, fuel)
     else
       j = skip_eoe(t, i)
       {diags, nid} = check_bare_arrow(t, j, diags, nid)

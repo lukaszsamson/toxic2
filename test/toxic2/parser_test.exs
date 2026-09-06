@@ -690,6 +690,48 @@ defmodule Toxic2.ParserTest do
                Toxic2.parse_to_ast("fn x -> y = x\n y end")
     end
 
+    test "a paren head's outer `when` guard is a full expr: do-blocks and no-parens calls attach" do
+      # `stab_parens_many when_op expr` / `empty_paren when_op expr` — unlike a non-paren head,
+      # whose `when` is an operator inside a no-parens arg and admits no block_expr (K4).
+      assert {{:fn, _, [{:->, _, [[{:when, _, [{:if, _, [{:a, _, nil}, [do: :ok]]}]}], _]}]}, []} =
+               Toxic2.parse_to_ast("fn () when if a do :ok end -> foo() end")
+
+      assert {{:fn, _, [{:->, _, [[{:when, _, [[a: 1], {:if, _, [_, [do: :ok]]}]}], _]}]}, []} =
+               Toxic2.parse_to_ast("fn (a: 1) when if z do\n:ok\nend -> foo() end")
+
+      assert {[{:->, _, [[{:when, _, [{:if, _, [_, [do: :ok]]}]}], _]}], []} =
+               Toxic2.parse_to_ast("(() when if a do\n:ok\nend -> foo())")
+
+      assert {{:fn, _, [{:->, _, [[{:when, _, [_, _, {:bar, _, [2, {:c, _, nil}]}]}], _]}]}, []} =
+               Toxic2.parse_to_ast("fn (a, b) when bar 2, c -> x end")
+
+      assert {{:fn, _,
+               [{:->, _, [[{:when, _, [_, _, {:when, _, [{:x, _, nil}, [y: _, z: _]]}]}], 0]}]},
+              []} = Toxic2.parse_to_ast("fn (a, b) when x when y: z, z: w -> 0 end")
+
+      # the non-paren shapes stay errors, as upstream
+      for src <- [
+            "fn x when foo do y end -> 1 end",
+            "fn (a) when foo do y end -> 1 end",
+            "fn a, b when bar 2, c -> x end",
+            "fn a, b when x when y: z, z: w -> 0 end"
+          ] do
+        assert {_, [_ | _]} = Toxic2.parse_to_ast(src), src
+      end
+    end
+
+    test "`-> ;` followed by a clause head ends the (nil) body before the next clause" do
+      assert {{:fn, _,
+               [
+                 {:->, _, [[{:when, _, [{:x, _, nil}, {:e, _, nil}]}], nil]},
+                 {:->, _, [[{:e, _, nil}], 1]}
+               ]}, [_empty_stab_warning]} = Toxic2.parse_to_ast("fn x when e->;e -> 1 end")
+
+      # a leading `;` before a statement is still an empty first statement
+      assert {{:fn, _, [{:->, _, [[{:x, _, nil}], {:__block__, _, [nil, 1]}]}]}, [_warn]} =
+               Toxic2.parse_to_ast("fn x -> ; 1 end")
+    end
+
     test "a trailing keyword run in the head groups into one keyword-list arg" do
       assert {{:fn, _, [{:->, _, [[{:x, _, nil}, [a: 1]], {:y, _, nil}]}]}, []} =
                Toxic2.parse_to_ast("fn x, a: 1 -> y end")
