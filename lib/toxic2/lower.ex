@@ -3192,7 +3192,11 @@ defmodule Toxic2.Lower do
       {:ok, String.to_atom(bin)}
     end
   rescue
+    # `String.to_atom/1` raises `SystemLimitError` for names over 255 characters (and
+    # `ArgumentError` when `to_existing_atom` misses). Both mean "not convertible": callers route
+    # `:error` to the same diagnostic/fallback path as any other unconvertible atom.
     ArgumentError -> :error
+    SystemLimitError -> :error
   end
 
   # Totality helper (P5): `String.to_charlist` RAISES on invalid UTF-8, but a tolerant lexer/parser

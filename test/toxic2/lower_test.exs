@@ -88,4 +88,42 @@ defmodule Toxic2.LowerTest do
       assert diags != []
     end
   end
+
+  describe "names over the 255-character atom limit do not raise" do
+    # `String.to_atom/1` raises SystemLimitError past 255 chars; to_atom/2 must map that to the
+    # same :error path as any unconvertible name (an __error__ node + :nonexistent_atom diagnostic).
+    @long String.duplicate("b", 300)
+
+    defp assert_degrades_to_error(source, opts \\ []) do
+      {ast, diags} = Toxic2.parse_to_ast(source, opts)
+
+      assert inspect(ast) =~ "__error__", "expected an __error__ node in #{inspect(ast)}"
+
+      assert Enum.any?(diags, &(elem(&1, 2) == :error and elem(&1, 3) == :nonexistent_atom))
+    end
+
+    test "over-long alias segment" do
+      assert_degrades_to_error("Foo.A" <> @long)
+    end
+
+    test "over-long alias inside a module body (reported repro)" do
+      assert_degrades_to_error("defmodule X do\n  alias Foo.A" <> @long <> "\nend\n")
+    end
+
+    test "over-long plain identifier" do
+      assert_degrades_to_error("x" <> @long)
+    end
+
+    test "over-long atom literal" do
+      assert_degrades_to_error(":" <> @long)
+    end
+
+    test "over-long keyword key" do
+      assert_degrades_to_error("[" <> @long <> ": 1]")
+    end
+
+    test "over-long names also degrade under existing_atoms_only" do
+      assert_degrades_to_error("Foo.A" <> @long, existing_atoms_only: true)
+    end
+  end
 end
