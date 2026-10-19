@@ -87,7 +87,8 @@ defmodule Toxic2.MixProject do
     [
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
       {:dialyxir, "~> 1.4", only: [:dev, :test], runtime: false},
-      {:ex_doc, "~> 0.34", only: :dev, runtime: false}
+      {:ex_doc, "~> 0.34", only: :dev, runtime: false},
+      {:spec_lint, "~> 0.1", only: [:dev, :test], runtime: false}
     ]
   end
 
